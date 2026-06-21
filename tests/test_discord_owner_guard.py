@@ -2,10 +2,11 @@ from forven import bot
 from forven import reporter
 
 
-def test_owner_guard_disabled_allows_any_operator(monkeypatch):
+def test_owner_guard_disabled_denies_all_operators(monkeypatch):
     monkeypatch.setattr(bot, "OWNER_ID", 0)
     assert bot._owner_guard_enabled() is False
-    assert bot._is_authorized_operator(123456789) is True
+    # Fail closed: with no discord_owner_id configured, nobody is the operator.
+    assert bot._is_authorized_operator(123456789) is False
 
 
 def test_owner_guard_enabled_requires_matching_operator(monkeypatch):

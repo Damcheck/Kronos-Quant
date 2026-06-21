@@ -22,6 +22,10 @@ Past, simulated, backtested, and paper-traded performance does **not** predict f
 
 You are solely responsible for obtaining, funding, securing, and using your own exchange accounts, API keys, and model / LLM credentials, and for complying with all laws and regulations that apply to you — including securities, derivatives, and tax law in your jurisdiction.
 
+## Eligibility & jurisdiction
+
+Crypto and crypto-derivatives trading is restricted or prohibited for some persons and in some jurisdictions. You are solely responsible for determining whether you are legally eligible to use any exchange you connect, and for complying with all applicable laws, sanctions, and regulations (including those of your country of residence) and with each exchange's terms of service. Do not use Forven where doing so would be unlawful.
+
 ## No warranty / no liability
 
 To the maximum extent permitted by law, Forven is provided **WITHOUT WARRANTY OF ANY KIND**, express or implied (see sections 15–16 of the AGPL-3.0 text in [`LICENSE`](LICENSE)). The authors and contributors accept **no liability** for any loss or damage of any kind arising from your use of the software. This file is an additional notice under AGPL-3.0 section 7(a); it does not modify the license itself.

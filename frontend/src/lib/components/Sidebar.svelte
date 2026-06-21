@@ -221,6 +221,16 @@
 		</a>
 	</div>
 
+	<div class="px-3 pb-2 text-center">
+		<a
+			href="https://github.com/judder659/Forven"
+			target="_blank"
+			rel="noopener noreferrer"
+			class="text-[10px] text-gray-600 hover:text-gray-400 transition-colors"
+			title="Forven source code (AGPL-3.0)"
+		>Source · AGPL-3.0</a>
+	</div>
+
 	<div class="px-2 py-3 border-t border-[#222] flex items-center justify-center">
 		<div class="flex items-center">
 			<div

@@ -10,9 +10,10 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from forven.api_security import require_operator_access
 from forven import brain_lessons as brain_lessons_mod
 from forven import recall as recall_mod
 from forven.brain_decisions import get_decision
@@ -30,7 +31,7 @@ from forven.model_routing import (
     update_model_routing,
 )
 
-router = APIRouter(prefix="/api/brain", tags=["brain"])
+router = APIRouter(prefix="/api/brain", tags=["brain"], dependencies=[Depends(require_operator_access)])
 
 
 # --------------------------------------------------------------------------- #

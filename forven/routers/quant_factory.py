@@ -1,13 +1,14 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from typing import Dict, Any
 import json
 import logging
+from forven.api_security import require_operator_access
 from forven.db import get_db, kv_get
 from forven.config import get_execution_mode
 
 log = logging.getLogger("forven.quant_factory")
 
-router = APIRouter(tags=["quant_factory"], prefix="/api/quant-factory")
+router = APIRouter(tags=["quant_factory"], prefix="/api/quant-factory", dependencies=[Depends(require_operator_access)])
 
 
 def _safe_json(raw, fallback=None):

@@ -25,9 +25,10 @@ import textwrap
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from forven.api_security import require_operator_access
 from forven.db import get_db
 from forven.sandbox.ast_guard import scan_file
 from forven.sandbox.strategy_adapter import get_sandbox_config
@@ -38,7 +39,7 @@ from forven.sandbox.subprocess_runner import (
 
 log = logging.getLogger("forven.routers.sandbox")
 
-router = APIRouter(prefix="/api/sandbox", tags=["sandbox"])
+router = APIRouter(prefix="/api/sandbox", tags=["sandbox"], dependencies=[Depends(require_operator_access)])
 
 
 # In-memory registry of currently-active subprocess runs. Maps row id →

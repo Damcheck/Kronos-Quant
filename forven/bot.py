@@ -152,14 +152,15 @@ def _owner_guard_enabled() -> bool:
 
 
 def _is_authorized_operator(author_id: int) -> bool:
-    """Validate operator identity when owner guard is configured.
+    """Validate operator identity for actionable Discord commands.
 
-    If discord_owner_id is not configured, allow operators so the bot remains
-    responsive in default setups.
+    Fail closed: if discord_owner_id is not configured, NO Discord user is
+    treated as the operator, so the bot won't act on commands from an
+    unauthenticated channel. Set discord_owner_id to enable operator commands.
     """
     if _owner_guard_enabled():
         return int(author_id) == int(OWNER_ID)
-    return True
+    return False
 
 
 def _stale_recovery_minutes() -> int:

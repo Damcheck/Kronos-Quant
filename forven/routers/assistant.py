@@ -3,10 +3,11 @@
 import json
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from forven.api_security import require_operator_access
 from forven.assistant_db import (
     archive_thread,
     create_or_get_active_thread,
@@ -15,7 +16,7 @@ from forven.assistant_db import (
 )
 from forven.assistant_session import confirm_action, run_turn
 
-router = APIRouter(tags=["assistant"])
+router = APIRouter(tags=["assistant"], dependencies=[Depends(require_operator_access)])
 
 
 class CreateThreadBody(BaseModel):

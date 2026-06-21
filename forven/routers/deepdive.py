@@ -2,10 +2,11 @@
 
 import json
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from forven.api_security import require_operator_access
 from forven.deepdive_db import (
     archive_thread,
     create_or_get_active_thread,
@@ -14,7 +15,7 @@ from forven.deepdive_db import (
 )
 from forven.deepdive_session import run_turn
 
-router = APIRouter(tags=["deepdive"])
+router = APIRouter(tags=["deepdive"], dependencies=[Depends(require_operator_access)])
 
 
 class CreateThreadBody(BaseModel):
