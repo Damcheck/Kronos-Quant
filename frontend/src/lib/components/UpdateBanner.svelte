@@ -13,7 +13,7 @@
 	let dismissed = false;
 	let pollTimer: ReturnType<typeof setInterval> | null = null;
 	const SESSION_KEY = 'forven.update_banner.dismissed';
-	const POLL_MS = 60 * 60 * 1000; // re-check hourly
+	const POLL_MS = 24 * 60 * 60 * 1000; // re-check daily
 
 	function handleDismiss() {
 		dismissed = true;
@@ -36,9 +36,9 @@
 	}
 
 	onMount(() => {
-		// Startup check, then re-check hourly so a newly pushed update surfaces
-		// without a manual reload. Each call is one git fetch; errors are swallowed
-		// by the store.
+		// Startup check, then re-check daily so a newly pushed update surfaces
+		// without a manual reload (kept infrequent so frequent pushes don't spam
+		// users). Each call is one git fetch; errors are swallowed by the store.
 		void refreshUpdateStatus(true);
 		pollTimer = setInterval(() => void refreshUpdateStatus(true), POLL_MS);
 	});
