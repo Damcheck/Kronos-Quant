@@ -1057,6 +1057,33 @@ class TogetherProvider(_OpenAICompatProvider):
 
 
 # ---------------------------------------------------------------------------
+# OpenCode Zen / OpenCode GO — OpenAI-compatible coding-model gateways
+# ---------------------------------------------------------------------------
+
+class OpenCodeZenProvider(_OpenAICompatProvider):
+    """OpenCode Zen — pay-per-use curated coding-model gateway.
+
+    OpenAI-compatible Chat Completions at ``{base}/chat/completions``. Models
+    are live-discoverable via ``{base}/models``. Key from https://opencode.ai/auth.
+    """
+
+    PROVIDER = "opencode-zen"
+    DEFAULT_BASE_URL = "https://opencode.ai/zen/v1"
+
+
+class OpenCodeGoProvider(_OpenAICompatProvider):
+    """OpenCode GO — flat-rate subscription coding-model gateway.
+
+    Same OpenAI-compatible Chat Completions shape as Zen but a distinct,
+    usage-limited subscription endpoint. GO exposes ONLY /chat/completions
+    (no /models discovery), so its catalog is curated in ``api_core``.
+    """
+
+    PROVIDER = "opencode-go"
+    DEFAULT_BASE_URL = "https://opencode.ai/zen/go/v1"
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -1123,6 +1150,10 @@ def _construct_provider(name: str) -> ToolCallProvider:
         return XAIProvider()
     if name == "together":
         return TogetherProvider()
+    if name == "opencode-zen":
+        return OpenCodeZenProvider()
+    if name == "opencode-go":
+        return OpenCodeGoProvider()
     if name in ("openai", "codex", "openai-codex"):
         return OpenAIProvider()
     # Refuse to silently default an unknown provider to OpenAI — that is a

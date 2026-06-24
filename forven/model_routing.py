@@ -25,6 +25,8 @@ _SUPPORTED_PROVIDERS: tuple[str, ...] = (
     "mistral",
     "xai",
     "together",
+    "opencode-zen",
+    "opencode-go",
 )
 _MODEL_ROUTING_STORAGE_KEY = "forven:model-routing"
 _LEGACY_MODEL_ALIASES: dict[str, dict[str, str]] = {}
@@ -46,6 +48,9 @@ _ZAI_PRIMARY_PROVIDER_PRIORITY = [
     "mistral",
     "xai",
     "together",
+    # Paid coding-model gateways — below the free tiers by default.
+    "opencode-zen",
+    "opencode-go",
 ]
 
 # Auxiliary task kinds — small/cheap helper models that run *outside* the
@@ -116,6 +121,8 @@ _DEFAULT_MODEL_ROUTING = {
         "mistral": "mistral-small-latest",
         "xai": "grok-3-mini",
         "together": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        "opencode-zen": "grok-code",
+        "opencode-go": "glm-5.2",
     },
     "fallback_chains": {
         "openai": [
@@ -173,6 +180,12 @@ _DEFAULT_MODEL_ROUTING = {
         ],
         "together": [
             {"provider": "together", "model_id": "meta-llama/Llama-3.3-70B-Instruct-Turbo"},
+        ],
+        "opencode-zen": [
+            {"provider": "opencode-zen", "model_id": "grok-code"},
+        ],
+        "opencode-go": [
+            {"provider": "opencode-go", "model_id": "glm-5.2"},
         ],
     },
     "auxiliary": copy.deepcopy(_DEFAULT_AUXILIARY_ROUTING),

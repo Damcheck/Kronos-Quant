@@ -369,15 +369,24 @@
 	}
 
 	function providerLabel(provider: AgentProvider): string {
-		if (provider === 'openai') return 'OpenAI';
-		if (provider === 'minimax') return 'MiniMax';
-		if (provider === 'zai') return 'Z.AI';
-		if (provider === 'openrouter') return 'OpenRouter';
-		if (provider === 'anthropic') return 'Anthropic';
-		if (provider === 'deepseek') return 'DeepSeek';
-		if (provider === 'groq') return 'Groq';
-		if (provider === 'gemini') return 'Google Gemini';
-		return 'LM Studio';
+		const labels: Record<string, string> = {
+			openai: 'OpenAI',
+			minimax: 'MiniMax',
+			zai: 'Z.AI',
+			openrouter: 'OpenRouter',
+			anthropic: 'Anthropic',
+			deepseek: 'DeepSeek',
+			groq: 'Groq',
+			gemini: 'Google Gemini',
+			cerebras: 'Cerebras',
+			mistral: 'Mistral',
+			xai: 'xAI (Grok)',
+			together: 'Together AI',
+			'opencode-zen': 'OpenCode Zen',
+			'opencode-go': 'OpenCode GO',
+			lmstudio: 'LM Studio'
+		};
+		return labels[provider] ?? provider;
 	}
 
 	function resolveDefaultModelId(provider: AgentProvider): string {

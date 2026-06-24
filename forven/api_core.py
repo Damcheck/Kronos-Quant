@@ -252,7 +252,7 @@ def _parse_int_query(value: str | None, default: int = 0) -> int:
         return default
 
 
-_SUPPORTED_AUTH_PROVIDERS: list[str] = ["openai", "minimax", "lmstudio", "zai", "openrouter", "anthropic", "deepseek", "groq", "gemini", "cerebras", "mistral", "xai", "together"]
+_SUPPORTED_AUTH_PROVIDERS: list[str] = ["openai", "minimax", "lmstudio", "zai", "openrouter", "anthropic", "deepseek", "groq", "gemini", "cerebras", "mistral", "xai", "together", "opencode-zen", "opencode-go"]
 _AUTH_PROVIDER_ENV_VARS = {
     "openai": "OPENAI_API_KEY",
     "minimax": "MINIMAX_API_KEY",
@@ -267,6 +267,8 @@ _AUTH_PROVIDER_ENV_VARS = {
     "mistral": "MISTRAL_API_KEY",
     "xai": "XAI_API_KEY",
     "together": "TOGETHER_API_KEY",
+    "opencode-zen": "OPENCODE_ZEN_API_KEY",
+    "opencode-go": "OPENCODE_GO_API_KEY",
 }
 _AUTH_OAUTH_SESSIONS: dict[str, dict[str, dict[str, object]]] = {}
 _AUTH_OAUTH_CALLBACKS: dict[str, dict[str, str]] = {}
@@ -304,6 +306,10 @@ _MODEL_DISCOVERY_ALT_ENDPOINTS = {
     "cerebras": ["https://api.cerebras.ai/v1/models"],
     "mistral": ["https://api.mistral.ai/v1/models"],
     "xai": ["https://api.x.ai/v1/models"],
+    # OpenCode Zen exposes an OpenAI-compatible /models route (curated catalog).
+    # OpenCode GO has NO /models endpoint (chat-completions only), so it is not
+    # listed here — its models are curated in _AGENT_MODEL_CATALOG instead.
+    "opencode-zen": ["https://opencode.ai/zen/v1/models"],
     # Together is a large gateway; its models are curated in the catalog rather
     # than discovered, to avoid flooding the picker.
 }
@@ -340,6 +346,9 @@ _MODEL_DISCOVERY_HEADERS = {
     "xai": {
         "Authorization": "Bearer {token}",
     },
+    "opencode-zen": {
+        "Authorization": "Bearer {token}",
+    },
 }
 
 # Endpoints used by the connection "Test" to verify a key is actually valid
@@ -369,6 +378,8 @@ _MODEL_PROVIDER_DISPLAY_NAMES = {
     "mistral": "Mistral",
     "xai": "xAI (Grok)",
     "together": "Together AI",
+    "opencode-zen": "OpenCode Zen",
+    "opencode-go": "OpenCode GO",
 }
 _LOCAL_PROVIDER_DEFAULT_BASE_URLS = {
     "lmstudio": "http://127.0.0.1:1234",
@@ -458,6 +469,28 @@ _AGENT_MODEL_CATALOG = [
     {"provider": "together", "model_id": "Qwen/Qwen2.5-72B-Instruct-Turbo", "label": "Together Qwen 2.5 72B Turbo"},
     {"provider": "together", "model_id": "deepseek-ai/DeepSeek-V3", "label": "Together DeepSeek V3"},
     {"provider": "together", "model_id": "mistralai/Mixtral-8x7B-Instruct-v0.1", "label": "Together Mixtral 8x7B"},
+    # OpenCode Zen: live-discovered via /v1/models; these seed sensible defaults
+    # and a fallback when discovery is unavailable.
+    {"provider": "opencode-zen", "model_id": "grok-code", "label": "OpenCode Zen Grok Code Fast"},
+    {"provider": "opencode-zen", "model_id": "big-pickle", "label": "OpenCode Zen Big Pickle"},
+    {"provider": "opencode-zen", "model_id": "claude-sonnet-4-5", "label": "OpenCode Zen Claude Sonnet 4.5"},
+    {"provider": "opencode-zen", "model_id": "gpt-5", "label": "OpenCode Zen GPT-5"},
+    {"provider": "opencode-zen", "model_id": "qwen3-coder", "label": "OpenCode Zen Qwen3 Coder"},
+    {"provider": "opencode-zen", "model_id": "kimi-k2", "label": "OpenCode Zen Kimi K2"},
+    # OpenCode GO: flat-rate subscription with NO /models discovery, so the full
+    # tool-capable catalog is curated here from the GO docs.
+    {"provider": "opencode-go", "model_id": "glm-5.2", "label": "OpenCode GO GLM-5.2"},
+    {"provider": "opencode-go", "model_id": "glm-5.1", "label": "OpenCode GO GLM-5.1"},
+    {"provider": "opencode-go", "model_id": "kimi-k2.7", "label": "OpenCode GO Kimi K2.7 Code"},
+    {"provider": "opencode-go", "model_id": "kimi-k2.6", "label": "OpenCode GO Kimi K2.6"},
+    {"provider": "opencode-go", "model_id": "deepseek-v4-pro", "label": "OpenCode GO DeepSeek V4 Pro"},
+    {"provider": "opencode-go", "model_id": "deepseek-v4-flash", "label": "OpenCode GO DeepSeek V4 Flash"},
+    {"provider": "opencode-go", "model_id": "minimax-m3", "label": "OpenCode GO MiniMax M3"},
+    {"provider": "opencode-go", "model_id": "minimax-m2.7", "label": "OpenCode GO MiniMax M2.7"},
+    {"provider": "opencode-go", "model_id": "mimo-v2.5-pro", "label": "OpenCode GO MiMo V2.5 Pro"},
+    {"provider": "opencode-go", "model_id": "mimo-v2.5", "label": "OpenCode GO MiMo V2.5"},
+    {"provider": "opencode-go", "model_id": "qwen3.7-max", "label": "OpenCode GO Qwen3.7 Max"},
+    {"provider": "opencode-go", "model_id": "qwen3.7-plus", "label": "OpenCode GO Qwen3.7 Plus"},
     # OpenRouter: free tool-capable models are auto-discovered; these curated
     # entries are reliable fallbacks (always selectable even if discovery fails).
     {"provider": "openrouter", "model_id": "openrouter/free", "label": "OpenRouter Auto (free, tool-capable router)"},
@@ -561,6 +594,12 @@ def _looks_like_mistral_discovery_model(model: str) -> bool:
     return True
 
 
+def _looks_like_opencode_discovery_model(model: str) -> bool:
+    # OpenCode Zen's /models route lists only curated chat/coding models;
+    # accept any non-empty id.
+    return bool(str(model or "").strip())
+
+
 def _looks_like_xai_discovery_model(model: str) -> bool:
     lowered = model.lower().strip()
     # Keep generative grok chat models; drop image-generation variants.
@@ -623,6 +662,8 @@ def _discovery_model_should_belong(provider: str, model_id: str) -> bool:
         return _looks_like_mistral_discovery_model(model_id)
     if provider == "xai":
         return _looks_like_xai_discovery_model(model_id)
+    if provider == "opencode-zen":
+        return _looks_like_opencode_discovery_model(model_id)
     return False
 
 
