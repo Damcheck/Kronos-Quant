@@ -225,7 +225,7 @@ def test_validation_optimization_uses_best_sweep_timeframe(forven_db, monkeypatc
     assert seen["timeframe"] == "4h"
 
 
-def test_apply_optimized_defaults_updates_strategy_params_and_records_artifact(forven_db):
+def test_apply_optimized_defaults_updates_strategy_params_and_records_artifact(forven_db, monkeypatch):
     strategy_id = _created_strategy_for_workflow()
     workflow = create_or_get_workflow(strategy_id=strategy_id, created_by="pytest", settings_snapshot=build_settings_snapshot())
     detail = get_workflow_detail(workflow["id"])
@@ -235,6 +235,21 @@ def test_apply_optimized_defaults_updates_strategy_params_and_records_artifact(f
         opt_step["id"],
         "passed",
         output={"result_id": "OPT-1", "timeframe": "4h", "best_params": {"rsi_period": 21, "rsi_entry": 35}},
+    )
+
+    # Apply is now gated by the optimization-acceptance chokepoint (the gate's
+    # accept/reject logic is covered by test_optimization_acceptance.py). Force a
+    # positive decision here so this test stays focused on the gauntlet's WRITE
+    # mechanics (params/timeframe/metrics/artifact) on the accept path.
+    from forven.strategies.optimization_acceptance import AcceptanceDecision
+
+    def _force_accept(*, write_fn, **_kwargs):
+        decision = AcceptanceDecision(accepted=True, code="accepted", reason="forced for apply-mechanics test")
+        write_fn(decision)
+        return {"applied": True, "code": "accepted", "reason": "forced", "decision": decision.as_record()}
+
+    monkeypatch.setattr(
+        "forven.strategies.optimization_acceptance.apply_optimized_params_if_accepted", _force_accept
     )
 
     from forven.gauntlet.tasks import run_apply_optimized_defaults
