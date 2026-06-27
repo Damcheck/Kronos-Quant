@@ -3712,13 +3712,20 @@ def _open_trade_db(
     size: float, risk_pct: float, leverage: float, signal_data: dict,
     execution_type: str = "live",
     book: str | None = None,
+    opened_at: str | None = None,
 ) -> str:
     """Record a new trade in SQLite. Returns trade ID.
 
     book is the direction sub-account label ("long"/"short"/"main") for live
     routing (Approach C). NULL for paper/simulation and legacy single-wallet
     live, which resolve to the master wallet.
+
+    ``opened_at`` is the time the position actually OPENED (the kernel's entry-bar
+    timestamp for kernel-managed paper trades). When omitted it falls back to now.
+    ``created_at`` (the row's recording time) is set automatically by the column
+    default, so the audit trail of WHEN-recorded is preserved separately.
     """
+    resolved_opened_at = (str(opened_at).replace(" ", "T") if opened_at else get_now().isoformat())
     with get_db() as conn:
         # The "E" counter can fall behind the real trade ids when a row is inserted
         # out-of-band (e.g. exchange-recovery) without bumping container_counters.
@@ -3740,7 +3747,7 @@ def _open_trade_db(
                     (
                         trade_id, strat_id, strat_id, asset, direction, entry, entry, size,
                         risk_pct, leverage, execution_type, book,
-                        json.dumps(_clean_signal_data(signal_data)), get_now().isoformat(),
+                        json.dumps(_clean_signal_data(signal_data)), resolved_opened_at,
                     ),
                 )
                 return trade_id
@@ -5254,6 +5261,7 @@ def _kernel_open_paper_trade(strat_id: str, strat: dict, action, *, sizing_equit
     trade_id = _open_trade_db(
         strat_id, asset, direction, entry_price, units,
         float(alloc_risk), float(leverage), signal_data, execution_type="paper",
+        opened_at=action.entry_time,  # the kernel's entry-BAR time, not wall-clock scan time
     )
     try:
         register(trade_id, asset, direction, strat_id, float(alloc_risk), entry_price, execution_type="paper")
@@ -5280,12 +5288,23 @@ def _kernel_close_recorded(strat_id: str, strat: dict, row: dict, trade: dict, d
         extra_signal_data={"kernel_exit_time": trade.get("exit_time"), "kernel_managed": True},
     )
     # Override with the kernel's NET values (close_trade_record computes a gross,
-    # position-return pnl; the kernel pnl_pct is net-of-drag, size-scaled equity impact).
+    # position-return pnl; the kernel pnl_pct is net-of-drag, size-scaled equity impact),
+    # and stamp closed_at with the kernel's actual EXIT-bar time (close_trade_record
+    # records wall-clock; the trade really closed on the bar the kernel exited on, so the
+    # recorded trade lands on the correct bars instead of the scan moment).
+    _exit_time = trade.get("exit_time")
+    _closed_at = str(_exit_time).replace(" ", "T") if _exit_time else None
     with get_db() as conn:
-        conn.execute(
-            "UPDATE trades SET pnl_pct=?, net_pnl_pct=?, pnl=?, pnl_usd=? WHERE id=?",
-            (round(pnl_pct_net, 8), round(pnl_pct_net, 8), pnl_usd, pnl_usd, trade_id),
-        )
+        if _closed_at:
+            conn.execute(
+                "UPDATE trades SET pnl_pct=?, net_pnl_pct=?, pnl=?, pnl_usd=?, closed_at=? WHERE id=?",
+                (round(pnl_pct_net, 8), round(pnl_pct_net, 8), pnl_usd, pnl_usd, _closed_at, trade_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE trades SET pnl_pct=?, net_pnl_pct=?, pnl=?, pnl_usd=? WHERE id=?",
+                (round(pnl_pct_net, 8), round(pnl_pct_net, 8), pnl_usd, pnl_usd, trade_id),
+            )
     return f"KERNEL-CLOSE {strat.get('asset')} {direction} @ {exit_price:.6g} pnl={pnl_pct_net * 100:.2f}% ({exit_reason})"
 
 
