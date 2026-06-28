@@ -1149,6 +1149,9 @@ def _record_strategy_handoff_event(
                 "controller": "brain",
             },
             idempotency_key=f"brain-handoff:{strategy_id}:{from_owner}:{to_owner}:{to_status}",
+            # Canonical lifecycle path: authorized to record a stage-change event
+            # (the out-of-band tripwire in append_strategy_event refuses unauthorized ones).
+            _lifecycle_authorized=True,
         )
     except Exception as exc:
         log.warning("Failed to append strategy handoff event for %s: %s", strategy_id, exc)

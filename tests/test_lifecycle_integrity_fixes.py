@@ -479,3 +479,54 @@ def test_quick_screen_data_quality_hold_survives_testing_mode(forven_db):
 
     assert can_proceed is False
     assert reason.startswith(DATA_QUALITY_HOLD_PREFIX)
+
+
+def test_append_strategy_event_blocks_out_of_band_stage_change(forven_db):
+    """SECURITY (S01601 post-mortem, 2026-06-28): a stage CHANGE recorded outside
+    the approval-gated transition_stage path — e.g. the autonomous risk-manager
+    agent flipping a strategy out of live_graduated without operator approval —
+    must be REFUSED and surfaced, not silently written as a forged transition."""
+    from forven.db import append_strategy_event, get_strategy_events
+
+    sid = "S-OOB-1"
+    _insert_strategy(sid, stage="live_graduated")  # satisfy strategy_events FK
+
+    # Out-of-band stage change (from != to) WITHOUT authorization -> rejected.
+    blocked = append_strategy_event(
+        sid,
+        from_state="live_graduated",
+        to_state="paper",
+        actor="risk-manager",
+        reason="MAXDD_BREACH: improvised demotion",
+    )
+    assert blocked is None
+    events = get_strategy_events(sid)
+    assert not any(
+        e["from_state"] == "live_graduated" and e["to_state"] == "paper" for e in events
+    ), "out-of-band stage-change event must not be recorded"
+
+    # The canonical, approval-gated path (authorized) records it normally.
+    ok = append_strategy_event(
+        sid,
+        from_state="live_graduated",
+        to_state="paper",
+        actor="brain",
+        reason="operator-approved demotion",
+        _lifecycle_authorized=True,
+    )
+    assert ok is not None
+    events = get_strategy_events(sid)
+    assert any(
+        e["from_state"] == "live_graduated" and e["to_state"] == "paper" for e in events
+    )
+
+    # SAME-stage annotation events (from == to) are never a transition and must
+    # NOT be blocked, regardless of actor.
+    annotation = append_strategy_event(
+        sid,
+        from_state="paper",
+        to_state="paper",
+        actor="risk-manager",
+        reason="params annotation",
+    )
+    assert annotation is not None

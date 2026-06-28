@@ -5305,8 +5305,19 @@ def append_strategy_event(
     owner_to: str | None = None,
     idempotency_key: str | None = None,
     details: object | None = None,
+    _lifecycle_authorized: bool = False,
 ) -> int | None:
-    """Append a lifecycle event for a strategy and return event id when created."""
+    """Append a lifecycle event for a strategy and return event id when created.
+
+    ``_lifecycle_authorized`` is an INTERNAL flag set only by the canonical,
+    approval-gated ``brain.transition_stage`` path. A stage CHANGE (``from`` !=
+    ``to``) recorded WITHOUT it is an out-of-band write (e.g. an autonomous agent
+    flipping a strategy out of ``live_graduated`` without operator approval — see
+    the S01601 post-mortem, 2026-06-28). Such writes are refused and surfaced as a
+    security alert rather than silently forging a transition. (All legitimate
+    callers either go through ``transition_stage`` or record SAME-stage annotation
+    events where ``from == to``, so this never blocks a real flow.)
+    """
     normalized_id = str(strategy_id).strip()
     if not normalized_id or not to_state:
         return None
@@ -5314,6 +5325,34 @@ def append_strategy_event(
     normalized_from = str(from_state or "").strip() or None
     normalized_to = str(to_state).strip()
     normalized_actor = str(actor or "").strip() or None
+    normalized_reason_preview = str(reason).strip() if reason is not None else None
+
+    # SECURITY tripwire: reject out-of-band stage changes (see docstring).
+    if normalized_from and normalized_to and normalized_from != normalized_to and not _lifecycle_authorized:
+        log.error(
+            "BLOCKED out-of-band stage-change event for %s: %s -> %s by actor=%r "
+            "(not routed through the approval-gated transition_stage)",
+            normalized_id, normalized_from, normalized_to, normalized_actor,
+        )
+        try:
+            log_activity(
+                "error",
+                "security",
+                f"BLOCKED out-of-band stage change for {normalized_id}: "
+                f"{normalized_from} -> {normalized_to} by {normalized_actor or 'unknown'} "
+                f"— not routed through the operator-approval lifecycle.",
+                {
+                    "strategy_id": normalized_id,
+                    "from_state": normalized_from,
+                    "to_state": normalized_to,
+                    "actor": normalized_actor,
+                    "attempted_reason": normalized_reason_preview,
+                    "blocked": "out_of_band_stage_change",
+                },
+            )
+        except Exception:
+            pass
+        return None
     normalized_owner_from = str(owner_from or "").strip() or None
     normalized_owner_to = str(owner_to or "").strip() or None
     normalized_reason = str(reason).strip() if reason is not None else None
