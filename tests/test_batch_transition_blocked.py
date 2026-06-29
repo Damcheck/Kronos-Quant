@@ -92,6 +92,26 @@ def test_blocked_ids_land_in_failed_and_noop_reports_success(monkeypatch):
     assert resp["ok"] is False
 
 
+def test_operator_batch_forces_bypass(monkeypatch):
+    """An operator's Forge batch transitions with force=True and a user actor, so an
+    explicit Archive/Move bypasses the dethrone-approval gate (like the single-row
+    Move Stage) instead of silently queuing approvals."""
+    captured: dict = {}
+
+    def fake_transition_stage(*, strategy_id, target_stage, reason, actor, force):
+        captured["actor"] = actor
+        captured["force"] = force
+        return {"strategy_id": strategy_id, "to": target_stage}
+
+    monkeypatch.setattr(brain, "transition_stage", fake_transition_stage)
+
+    resp = batch_transition_strategies(BatchTransitionBody(ids=["a"], stage="archived"))
+
+    assert resp["ok"] is True
+    assert captured["force"] is True
+    assert captured["actor"] == "ui"
+
+
 def test_all_success_reports_ok_true(monkeypatch):
     """When every transition succeeds (or is a no-op), ok is True and failed empty."""
 

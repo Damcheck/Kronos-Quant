@@ -506,18 +506,30 @@
 	// write transaction and the promotion gate holds the WAL writer lock; firing
 	// them concurrently serializes/stalls server-side and loses per-row results.
 	// Sequential execution keeps writes orderly and reports partial failures.
-	async function runSequential(ids: string[], op: (id: string) => Promise<unknown>): Promise<{ succeeded: number; failed: number }> {
+	async function runSequential(
+		ids: string[],
+		op: (id: string) => Promise<unknown>
+	): Promise<{ succeeded: number; failed: number; errors: string[] }> {
 		let succeeded = 0;
-		let failed = 0;
+		const errors: string[] = [];
 		for (const id of ids) {
 			try {
 				await op(id);
 				succeeded += 1;
-			} catch {
-				failed += 1;
+			} catch (e) {
+				// Capture the per-id reason instead of swallowing it — a blocked
+				// transition (invalid stage move, ghost-container protection, …) must
+				// be visible, not silently counted as "N failed".
+				errors.push(`${id}: ${e instanceof Error ? e.message : 'failed'}`);
 			}
 		}
-		return { succeeded, failed };
+		return { succeeded, failed: errors.length, errors };
+	}
+
+	function summarizeReasons(reasons: string[], max = 3): string {
+		if (reasons.length === 0) return '';
+		const head = reasons.slice(0, max).join(' · ');
+		return reasons.length > max ? `${head} (+${reasons.length - max} more)` : head;
 	}
 
 	async function runBatchAction(action: 'trash' | 'archive' | 'recover' | 'recover_parked' | 'delete') {
@@ -530,9 +542,12 @@
 		try {
 			if (action === 'trash') {
 				if (!confirm(`Move ${ids.length} containers to graveyard?`)) return;
-				const { succeeded, failed } = await runSequential(ids, (id) => transitionStage(id, 'graveyard', 'User moved to graveyard from Lab Manager', 'manual'));
+				const { succeeded, failed, errors } = await runSequential(ids, (id) => transitionStage(id, 'graveyard', 'User moved to graveyard from Lab Manager', 'manual'));
 				actionMsg = `Moved ${succeeded} container${succeeded === 1 ? '' : 's'} to graveyard.`;
-				if (failed > 0) actionMsg += ` ${failed} failed.`;
+				if (failed > 0) {
+					actionMsg += ` ${failed} failed.`;
+					error = summarizeReasons(errors);
+				}
 			} else if (action === 'archive') {
 				if (!confirm(`Archive ${ids.length} strategies? They can be recovered later.`)) return;
 				const result = await batchTransitionStrategies(ids, 'archived', 'Batch archived from Lab Manager');
@@ -540,17 +555,28 @@
 				actionMsg = `Archived ${count} strateg${count === 1 ? 'y' : 'ies'}.`;
 				if (result.failed.length > 0) {
 					actionMsg += ` ${result.failed.length} failed.`;
+					error = summarizeReasons(
+						result.failed.map(
+							(f) => `${f.id}: ${f.error}${f.approval_id ? ` (approval #${f.approval_id})` : ''}`
+						)
+					);
 				}
 			} else if (action === 'recover') {
-				const { succeeded, failed } = await runSequential(ids, (id) => reviveFromGraveyard(id));
+				const { succeeded, failed, errors } = await runSequential(ids, (id) => reviveFromGraveyard(id));
 				actionMsg = `Recovered ${succeeded} container${succeeded === 1 ? '' : 's'} from graveyard.`;
-				if (failed > 0) actionMsg += ` ${failed} failed.`;
+				if (failed > 0) {
+					actionMsg += ` ${failed} failed.`;
+					error = summarizeReasons(errors);
+				}
 			} else if (action === 'recover_parked') {
 				// Parked (research_only) recovery is a stage transition back to the active
 				// pipeline — NOT a graveyard revive (which is reviveFromGraveyard).
-				const { succeeded, failed } = await runSequential(ids, (id) => transitionStage(id, 'researching', 'User batch-recovered research_only container from Lab Manager', 'manual'));
+				const { succeeded, failed, errors } = await runSequential(ids, (id) => transitionStage(id, 'researching', 'User batch-recovered research_only container from Lab Manager', 'manual'));
 				actionMsg = `Recovered ${succeeded} container${succeeded === 1 ? '' : 's'} to the active pipeline.`;
-				if (failed > 0) actionMsg += ` ${failed} failed.`;
+				if (failed > 0) {
+					actionMsg += ` ${failed} failed.`;
+					error = summarizeReasons(errors);
+				}
 			} else if (action === 'delete') {
 				if (!confirm(`Permanently delete ${ids.length} strategies? This cannot be undone.`)) return;
 				const result = await batchDeleteStrategies(ids);
@@ -635,9 +661,12 @@
 		actionMsg = null;
 
 		try {
-			const { succeeded, failed } = await runSequential(ids, (id) => transitionStage(id, stage, `User batch moved to ${stage} from Lab Manager`, 'manual'));
+			const { succeeded, failed, errors } = await runSequential(ids, (id) => transitionStage(id, stage, `User batch moved to ${stage} from Lab Manager`, 'manual'));
 			actionMsg = `Moved ${succeeded} container${succeeded === 1 ? '' : 's'} to ${stage}.`;
-			if (failed > 0) actionMsg += ` ${failed} failed.`;
+			if (failed > 0) {
+				actionMsg += ` ${failed} failed.`;
+				error = summarizeReasons(errors);
+			}
 			await loadData({ forceGraveyard: true });
 			clearSelection();
 		} catch (e) {

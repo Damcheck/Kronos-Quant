@@ -1620,7 +1620,7 @@ export async function scanStrategyIntake(opts?: { register?: boolean }): Promise
 export interface BatchTransitionResult {
 	ok: boolean;
 	transitioned: string[];
-	failed: Array<{ id: string; error: string }>;
+	failed: Array<{ id: string; error: string; approval_id?: string }>;
 }
 
 export async function batchTransitionStrategies(

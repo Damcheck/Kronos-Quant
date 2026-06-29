@@ -393,7 +393,16 @@ class BatchTransitionBody(BaseModel):
 
 @router.post("/api/strategies/batch-transition")
 def batch_transition_strategies(body: BatchTransitionBody):
-    """Transition multiple strategies to a target stage in one call."""
+    """Transition multiple strategies to a target stage in one call.
+
+    This is an OPERATOR-initiated batch from the Forge, so it force-bypasses the
+    dethrone-approval / WIP / backtest-verification gates exactly like the single-row
+    Move Stage (which promotes with actor=api, force=True) — the operator's click IS
+    the approval. Without force, a bulk Archive of paper/live strategies only QUEUED
+    dethrone approvals and silently reported "failed", so nothing visibly happened.
+    Hard guards that force does NOT bypass (the VALID_TRANSITIONS graph, ghost-
+    container protection) still surface per-id in ``failed`` so the UI can show why.
+    """
     from forven.brain import transition_stage
 
     succeeded: list[str] = []
@@ -405,7 +414,7 @@ def batch_transition_strategies(body: BatchTransitionBody):
                 target_stage=body.stage,
                 reason=body.reason,
                 actor="ui",
-                force=False,
+                force=True,
             )
             # transition_stage never raises for a *blocked* move (WIP cap,
             # approval-required, gate failure, …); it returns a dict whose
