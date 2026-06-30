@@ -114,14 +114,22 @@ _CONTEXT_DEFAULT_DENY: dict[str, frozenset[str]] = {
     # and never arbitrary code execution (audit 2026-06-22, H4) — a prompt-injected
     # research page must not be able to reach run_code / raw-code writes.
     "research": frozenset({"catastrophic", "codegen"}),
+    # Code-authoring autonomous tasks (develop_candidate) legitimately need codegen
+    # (register_strategy) AND research (read the operator-seeded hypothesis
+    # artifact), so a full default-deny would break strategy authoring. But a
+    # prompt-injected develop task must never reach a catastrophic primitive
+    # (factory_reset wipes the pipeline DB), so deny that. The real containment for
+    # the inject→register→execute chain is the AST guard (P1.2) + out-of-process
+    # execution (Phase 2, see docs/security-hardening-plan.md). (audit P1.1)
+    "develop": frozenset({"catastrophic"}),
 }
 
-VALID_CONTEXTS: tuple[str, ...] = ("scheduled", "interactive", "recovery", "research")
+VALID_CONTEXTS: tuple[str, ...] = ("scheduled", "interactive", "recovery", "research", "develop")
 
 _CANONICAL_AGENT_ROLES = frozenset(
     {
         "brain",
-        "execution-trader",
+        # execution-trader retired 2026-06-30 (no LLM execution path).
         "full-stack-engineer",
         "quant-researcher",
         "risk-manager",
@@ -143,7 +151,6 @@ def _role_tokens_from_text(value: object) -> set[str]:
 
     alias_checks = {
         "brain": ("brain", "orchestrator"),
-        "execution-trader": ("execution trader", "execution-trader"),
         "full-stack-engineer": ("full stack engineer", "full-stack-engineer"),
         "quant-researcher": ("quant researcher", "quant-researcher"),
         "risk-manager": ("risk manager", "risk-manager"),
@@ -546,13 +553,19 @@ _DEFAULT_CATEGORY_PATTERNS: list[tuple[str, str]] = [
     ("get_market_data", "exchange"),
     ("get_ohlcv", "exchange"),
     ("get_ticker", "exchange"),
-    # Codegen: arbitrary-code-execution / raw-code-write tools (audit 2026-06-22,
-    # H4). Denied in research/scheduled/recovery so untrusted-content-driven
-    # agents cannot reach an arbitrary-Python primitive. register_strategy is
-    # deliberately NOT here — its own develop_candidate gate already blocks the
-    # research path, and tagging it would break the autonomous strategy-dev flow.
+    # Codegen: arbitrary-code-execution / raw-code-write / strategy-registration
+    # tools (audit 2026-06-22 H4; extended 2026-06-28 P1.1). Denied in
+    # research/scheduled/recovery so an untrusted-content-driven agent cannot reach
+    # an arbitrary-Python primitive. register_strategy / *_register_strategy_file
+    # take a raw `code`/file argument that is imported IN-PROCESS, so they ARE
+    # codegen. The autonomous develop_candidate flow runs in the 'develop' context
+    # (which does NOT deny codegen), so tagging them here closes the
+    # research/scheduled/recovery registration hole without breaking authoring.
     ("run_code", "codegen"),
     ("deepdive_write_strategy_code", "codegen"),
+    ("register_strategy", "codegen"),
+    ("forven_register_strategy_file", "codegen"),
+    ("assistant_register_strategy_file", "codegen"),
     # Catastrophic: tools with NO legitimate autonomous use. factory_reset
     # wipes the entire pipeline DB (strategies, trades, settings, logs) — it
     # must only ever run from an operator-interactive context. Kept separate

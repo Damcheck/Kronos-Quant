@@ -16,9 +16,11 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from forven.api_core import ForvenV1CompatMiddleware, _on_startup
 from forven.api_security import (
     ApiKeyMiddleware,
+    CsrfOriginMiddleware,
     assert_auth_keys_configured,
     assert_safe_bind_host,
     get_allowed_cors_origins,
+    is_cross_site_state_change,
 )
 from forven.async_utils import spawn
 from forven.correlation import CorrelationIdMiddleware, RequestIdLogFilter
@@ -62,7 +64,6 @@ from forven.routers.webhooks import router as webhooks_router
 from forven.routers.updates import router as updates_router
 from forven.routers.backtesting import router as backtesting_router
 from forven.routers.lifecycle import router as lifecycle_router
-from forven.routers.simulation import router as simulation_router, simulation_api_enabled
 from forven.routers.verdict import router as verdict_router
 from forven.routers.robustness import router as robustness_router
 from forven.routers.gauntlet import router as gauntlet_router
@@ -429,6 +430,15 @@ async def lifespan(_app: FastAPI):
             brain_limit = _env_int("FORVEN_HEADLESS_BRAIN_LIMIT", 2, minimum=1, maximum=8)
             runtime_thread_mode = _env_bool("FORVEN_API_RUNTIME_THREAD_MODE", True)
             runtime_start_delay = _env_float("FORVEN_API_RUNTIME_START_DELAY_SECONDS", 5.0, minimum=0.0, maximum=60.0)
+            # BOOT-1: close the startup-recovery gate BEFORE the scheduler/scanner thread
+            # can run a live execution scan, so a stale recovery_active=False persisted by
+            # a cleanly-exited prior run can't let a live entry through during the boot
+            # window before the daemon's boot reconcile re-verifies the exchange.
+            try:
+                from forven.daemon import mark_boot_recovery_pending
+                mark_boot_recovery_pending()
+            except Exception:
+                log.warning("Could not stamp boot recovery gate", exc_info=True)
             if runtime_thread_mode:
                 _runtime_threads.extend(
                     [
@@ -491,6 +501,14 @@ async def lifespan(_app: FastAPI):
                 )
             except Exception:
                 log.exception("Failed to start in-process daemon loop.")
+                # BOOT-1: no daemon will run its boot reconcile in this process, so
+                # release the startup-recovery gate we stamped above (else paper trading
+                # is wedged forever). Live still fails closed on missing real equity.
+                try:
+                    from forven.daemon import clear_boot_recovery_pending
+                    clear_boot_recovery_pending("daemon_unavailable")
+                except Exception:
+                    log.warning("Could not release boot recovery gate after daemon-start failure", exc_info=True)
                 log.info(
                     "API runtime worker started: scheduler + headless agent loop "
                     "(concurrency=%d) + headless brain loop (limit=%d) (daemon unavailable, thread_mode=%s, start_delay=%.1fs)",
@@ -584,6 +602,11 @@ app = FastAPI(
 
 app.add_middleware(ForvenV1CompatMiddleware)
 app.add_middleware(ApiKeyMiddleware)
+# Drive-by CSRF guard: reject cross-site state-changing requests. The local API
+# is reachable from a browser at 127.0.0.1, so a page the operator visits could
+# POST to it; CORS only hides the response, it does not stop the side effect.
+# Same-origin and CORS-allowlisted origins pass; no-Origin (launcher/CLI) passes.
+app.add_middleware(CsrfOriginMiddleware)
 # DNS rebinding guard. Even though uvicorn is bound to 127.0.0.1, a browser
 # page on the tester's machine that resolves attacker-controlled.com to
 # 127.0.0.1 can still reach us — the browser just dials the loopback socket
@@ -658,8 +681,6 @@ app.include_router(backtesting_router)
 app.include_router(lifecycle_router)
 app.include_router(deepdive_router)
 app.include_router(assistant_router)
-if simulation_api_enabled():
-    app.include_router(simulation_router)
 app.include_router(verdict_router)
 app.include_router(robustness_router)
 app.include_router(gauntlet_router)
@@ -678,6 +699,13 @@ async def shutdown(request: Request):
     client_host = request.client.host if request.client else ""
     if client_host not in ("127.0.0.1", "::1"):
         raise HTTPException(status_code=403, detail="localhost only")
+    # The loopback check alone is NOT enough: a malicious page the operator visits
+    # POSTs here from the browser's own loopback socket, so client_host is 127.0.0.1
+    # too. Reject anything carrying a cross-site browser Origin/Referer (the local
+    # launcher/controller sends neither). The global CsrfOriginMiddleware also blocks
+    # this; this is a local backstop on the highest-value drive-by target.
+    if is_cross_site_state_change(request):
+        raise HTTPException(status_code=403, detail="cross-origin shutdown rejected")
 
     async def _exit_soon():
         await asyncio.sleep(0.25)

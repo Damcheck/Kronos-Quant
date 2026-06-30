@@ -157,8 +157,11 @@ def _atr_wilder(df: pd.DataFrame, n: int) -> pd.Series:
 
 def _rsi(close: pd.Series, n: int) -> pd.Series:
     delta = close.diff()
-    gain = delta.where(delta > 0, 0.0).rolling(n).mean()
-    loss = (-delta.where(delta < 0, 0.0)).rolling(n).mean()
+    # Wilder's RSI: the average gain/loss are Wilder-smoothed (RMA), NOT a simple
+    # moving average. This matches TradingView/Binance `ta.rsi`; an SMA basis
+    # (Cutler's RSI) drifts the trigger bars away from what users see on the chart.
+    gain = _rma(delta.where(delta > 0, 0.0), n)
+    loss = _rma(-delta.where(delta < 0, 0.0), n)
     rs = gain / loss.clip(lower=1e-9)
     return 100 - (100 / (1 + rs))
 
@@ -262,7 +265,8 @@ def _f_natr(df, p, i):
 
 
 def _f_stddev(df, p, i):
-    return {i: _c(df).rolling(p["length"]).std()}
+    # Population std (ddof=0) to match TradingView `ta.stdev`.
+    return {i: _c(df).rolling(p["length"]).std(ddof=0)}
 
 
 def _f_hvol(df, p, i):
@@ -274,7 +278,9 @@ def _f_bollinger(df, p, i):
     close = _c(df)
     n, k = p["length"], p["num_std"]
     mid = close.rolling(n).mean()
-    sd = close.rolling(n).std()
+    # Population std (ddof=0): standard Bollinger Bands / TradingView `ta.stdev`.
+    # pandas' default ddof=1 makes the bands systematically too wide.
+    sd = close.rolling(n).std(ddof=0)
     return {i: mid, f"{i}_mid": mid, f"{i}_upper": mid + k * sd, f"{i}_lower": mid - k * sd}
 
 
@@ -282,7 +288,7 @@ def _f_bbwidth(df, p, i):
     close = _c(df)
     n, k = p["length"], p["num_std"]
     mid = close.rolling(n).mean()
-    sd = close.rolling(n).std()
+    sd = close.rolling(n).std(ddof=0)  # population std, matching _f_bollinger / TradingView
     return {i: _safe_div(2 * k * sd, mid) * 100.0}
 
 
@@ -471,12 +477,13 @@ def _f_supertrend(df, p, i):
             st[k] = upper[k]
             direction[k] = -1.0
             continue
-        final_upper[k] = (
-            upper[k] if (upper[k] < final_upper[k - 1] or close[k - 1] > final_upper[k - 1]) else final_upper[k - 1]
-        )
-        final_lower[k] = (
-            lower[k] if (lower[k] > final_lower[k - 1] or close[k - 1] < final_lower[k - 1]) else final_lower[k - 1]
-        )
+        # Seed the trailing bands from the prior bar, falling back to this bar's
+        # basic band when the prior is still NaN (the ATR warmup window). Without
+        # this, the NaN propagates forever and direction stays pinned at -1.
+        fu_prev = final_upper[k - 1] if np.isfinite(final_upper[k - 1]) else upper[k]
+        fl_prev = final_lower[k - 1] if np.isfinite(final_lower[k - 1]) else lower[k]
+        final_upper[k] = upper[k] if (upper[k] < fu_prev or close[k - 1] > fu_prev) else fu_prev
+        final_lower[k] = lower[k] if (lower[k] > fl_prev or close[k - 1] < fl_prev) else fl_prev
         prev_dir = direction[k - 1]
         if prev_dir == 1.0:
             direction[k] = -1.0 if close[k] < final_lower[k] else 1.0
@@ -557,6 +564,13 @@ def _f_vwap(df, p, i):
     if length > 0:
         num = (tp * vol).rolling(length).sum()
         den = vol.replace(0, np.nan).rolling(length).sum()
+    elif isinstance(df.index, pd.DatetimeIndex):
+        # Anchored VWAP resets each UTC day (an intraday VWAP), not a running
+        # cumulative-since-start-of-data number that drifts further from price the
+        # longer the loaded window.
+        day = df.index.normalize()
+        num = (tp * vol).groupby(day).cumsum()
+        den = vol.replace(0, np.nan).groupby(day).cumsum()
     else:
         num = (tp * vol).cumsum()
         den = vol.replace(0, np.nan).cumsum()
@@ -588,7 +602,9 @@ def _f_mfi(df, p, i):
     delta = tp.diff()
     pos = rmf.where(delta > 0, 0.0).rolling(n).sum()
     neg = rmf.where(delta < 0, 0.0).rolling(n).sum()
-    mfr = _safe_div(pos, neg)
+    # Clamp the denominator (like RSI) so an all-up window (neg == 0) yields MFI≈100,
+    # not NaN (_safe_div would null the 0 denominator).
+    mfr = pos / neg.clip(lower=1e-9)
     return {i: 100 - 100 / (1 + mfr)}
 
 
@@ -815,3 +831,42 @@ __all__ = [
     "compute_indicator",
     "metadata",
 ]
+# NOTE: the pure-indicator facade names (rsi/adx/atr/... — see __getattr__ below) are
+# intentionally NOT in __all__. They are provided lazily via the module __getattr__
+# hook and resolved by explicit ``from forven.strategies.indicators import rsi``;
+# listing them in __all__ would (a) trip F822 (no real module-level binding) and
+# (b) wrongly pull them into ``import *``.
+
+
+# ── Public indicator facade for untrusted strategies (R3) ──────────────────────
+# Untrusted (custom/imported) strategies may import ``forven.strategies.indicators``
+# (allowlisted) but NOT ``forven.scanner`` — which also re-exports get_db / kv_get /
+# _execute_direct, the confused-deputy surface (see
+# docs/strategy-share-security-audit-2026-06-29.md, R3). These names are the PURE,
+# stateless indicator helpers strategies legitimately need (df -> Series, no DB /
+# network / global state), re-exported from their canonical home in ``forven.scanner``
+# so there is a single implementation. The re-export is LAZY (PEP 562 module hook):
+# ``scanner`` is a heavy module and importing it eagerly at indicators-load time would
+# risk an import cycle, so it is pulled only when a facade name is first accessed.
+# ``from forven.strategies.indicators import rsi`` resolves through this hook.
+_FACADE_NAMES = frozenset(
+    {
+        "rsi",
+        "adx",
+        "atr",
+        "stochastic",
+        "williams_r",
+        "vwap",
+        "oi_price_divergence",
+        "funding_rate_zscore",
+        "ema_cross_thresholds",
+    }
+)
+
+
+def __getattr__(name: str):
+    if name in _FACADE_NAMES:
+        from forven import scanner
+
+        return getattr(scanner, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

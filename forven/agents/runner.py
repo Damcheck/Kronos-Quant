@@ -1045,30 +1045,26 @@ async def run_agent_task(agent: dict, task: dict) -> dict:
     task_id = task["id"]
     strategy_id = _extract_task_strategy_id(task)
     task_type = str(task.get("type") or "").strip().lower()
-    is_trade_execution_task = task_type == "trade_execution"
 
     log.info("Agent %s starting task %d: %s", agent_id, task_id, task.get("title", ""))
 
-    # Daily LLM cost cap. Trade-execution tasks are deterministic (no LLM spend)
-    # so they are never gated — risk/execution must not be blocked by a budget.
-    # Over-cap LLM tasks are requeued with backoff (not failed) so they resume
-    # tomorrow or when the operator raises the cap.
-    if not is_trade_execution_task:
-        from forven.billing_guard import check_daily_cost_cap
+    # Daily LLM cost cap. Over-cap tasks are requeued with backoff (not failed)
+    # so they resume tomorrow or when the operator raises the cap.
+    from forven.billing_guard import check_daily_cost_cap
 
-        cost_allowed, cost_reason = check_daily_cost_cap()
-        if not cost_allowed:
-            log.warning("Agent %s task %d gated by cost cap: %s", agent_id, task_id, cost_reason)
-            if _requeue_agent_task(
-                task_id,
-                agent_id,
-                task.get("title", ""),
-                cost_reason,
-                delay_minutes=60,
-                max_retries=10_000,  # effectively "wait, don't fail" — budget frees daily
-                exhausted_label="cost cap",
-            ):
-                return {"error": cost_reason, "cost_capped": True}
+    cost_allowed, cost_reason = check_daily_cost_cap()
+    if not cost_allowed:
+        log.warning("Agent %s task %d gated by cost cap: %s", agent_id, task_id, cost_reason)
+        if _requeue_agent_task(
+            task_id,
+            agent_id,
+            task.get("title", ""),
+            cost_reason,
+            delay_minutes=60,
+            max_retries=10_000,  # effectively "wait, don't fail" — budget frees daily
+            exhausted_label="cost cap",
+        ):
+            return {"error": cost_reason, "cost_capped": True}
 
     owner_error, can_run = _check_task_owner(agent_id, strategy_id, task_type=task_type)
     if not can_run:
@@ -1103,31 +1099,30 @@ async def run_agent_task(agent: dict, task: dict) -> dict:
 
     try:
         return await asyncio.wait_for(
-            _run_agent_task_inner(agent, task, agent_id, task_id, strategy_id, task_type, is_trade_execution_task),
+            _run_agent_task_inner(agent, task, agent_id, task_id, strategy_id, task_type),
             timeout=timeout_seconds,
         )
     except asyncio.TimeoutError:
         log.error("Agent %s task %d TIMED OUT after %ds", agent_id, task_id, timeout_seconds)
-        if not is_trade_execution_task:
-            detail = f"AI/provider timeout after {timeout_seconds}s"
-            if _requeue_agent_task(
-                task_id,
-                agent_id,
-                task.get("title", ""),
-                detail,
-                backoff_minutes=_TRANSIENT_PROVIDER_BACKOFF_MINUTES,
-                max_retries=_MAX_TRANSIENT_PROVIDER_RETRIES,
-                exhausted_label="Provider retries exhausted",
-            ):
-                if task_type == "phantom_repair" and strategy_id:
-                    from forven.phantom_recovery import mark_phantom_recovery_repair_pending
+        detail = f"AI/provider timeout after {timeout_seconds}s"
+        if _requeue_agent_task(
+            task_id,
+            agent_id,
+            task.get("title", ""),
+            detail,
+            backoff_minutes=_TRANSIENT_PROVIDER_BACKOFF_MINUTES,
+            max_retries=_MAX_TRANSIENT_PROVIDER_RETRIES,
+            exhausted_label="Provider retries exhausted",
+        ):
+            if task_type == "phantom_repair" and strategy_id:
+                from forven.phantom_recovery import mark_phantom_recovery_repair_pending
 
-                    mark_phantom_recovery_repair_pending(
-                        strategy_id,
-                        agent_task_id=int(task_id),
-                        reason=detail,
-                    )
-                return {"error": detail}
+                mark_phantom_recovery_repair_pending(
+                    strategy_id,
+                    agent_task_id=int(task_id),
+                    reason=detail,
+                )
+            return {"error": detail}
 
         if task_type == "phantom_repair" and strategy_id:
             from forven.phantom_recovery import mark_phantom_recovery_exhausted
@@ -1147,17 +1142,24 @@ async def run_agent_task(agent: dict, task: dict) -> dict:
 
 async def _run_agent_task_inner(
     agent: dict, task: dict, agent_id: str, task_id: int,
-    strategy_id: str | None, task_type: str, is_trade_execution_task: bool,
+    strategy_id: str | None, task_type: str,
 ) -> dict:
     """Inner task execution — wrapped by run_agent_task's timeout."""
     tool_context_tokens: tuple[Token, ...] | None = None
     try:
         # Set per-task tool context for permission gating and tool audit logging.
-        # Research tasks run in the 'research' context (which denies nothing by
-        # default but binds any per-agent research-context overrides); other
-        # agent task types stay ungated to preserve existing behavior.
+        # Research tasks ingest the most untrusted content → 'research' context
+        # (denies codegen + catastrophic). Code-authoring autonomous tasks need
+        # codegen + research, but a prompt-injected one must never reach a
+        # catastrophic primitive → 'develop' context (denies catastrophic only).
+        # Other task types stay ungated to preserve existing behavior. (audit P1.1)
         task_display_id = str(task.get("display_id") or "").strip()
-        task_tools_context = "research" if task_type == "research" else None
+        if task_type == "research":
+            task_tools_context = "research"
+        elif task_type in {"develop_candidate", "code_strategy"}:
+            task_tools_context = "develop"
+        else:
+            task_tools_context = None
         tool_context_tokens = set_tool_context(
             agent_id,
             task_display_id or format_prefixed_id("T", int(task_id)),
@@ -1165,29 +1167,6 @@ async def _run_agent_task_inner(
             tools_context=task_tools_context,
         )
         input_data = _coerce_task_input_data(task)
-
-        if is_trade_execution_task:
-            from forven.scanner import execute_trade_intent
-
-            execution_result = await asyncio.to_thread(execute_trade_intent, input_data)
-            output = {
-                "response": "Deterministic trade execution completed.",
-                "execution": execution_result,
-                "completed_at": datetime.now(timezone.utc).isoformat(),
-            }
-            completed_at = datetime.now(timezone.utc).isoformat()
-            with get_db() as conn:
-                conn.execute(
-                    "UPDATE agent_tasks SET status='done', output_data=?, completed_at=?, error=NULL WHERE id=?",
-                    (json.dumps(output), completed_at, task_id),
-                )
-            log_activity(
-                "info",
-                f"agent:{agent_id}",
-                "Completed deterministic trade execution: %s" % (task.get("title", "") or format_prefixed_id("T", int(task_id))),
-            )
-            log.info("Agent %s completed deterministic trade execution task %d", agent_id, task_id)
-            return output
 
         # Build context: role + memory + task details
         role_md = read_workspace(f"agents/{agent_id}/ROLE.md", optional=True) or agent.get("instructions", "")
@@ -1525,7 +1504,7 @@ async def _run_agent_task_inner(
         # inside _call_with_tools.
         from forven.model_selection import UnconfiguredRouteError
 
-        if isinstance(e, UnconfiguredRouteError) and not is_trade_execution_task:
+        if isinstance(e, UnconfiguredRouteError):
             _requeue_agent_task(
                 task_id,
                 agent_id,
@@ -1541,7 +1520,7 @@ async def _run_agent_task_inner(
         # checked BEFORE the generic rate-limit branch: it won't clear on a
         # minute-scale retry, so back off long and raise ONE deduped actionable
         # alert per provider instead of flooding the alerts panel per task.
-        if _is_quota_exhausted(e) and not is_trade_execution_task:
+        if _is_quota_exhausted(e):
             _requeue_agent_task(
                 task_id,
                 agent_id,
@@ -1555,7 +1534,7 @@ async def _run_agent_task_inner(
             _emit_provider_quota_alert(str(agent.get("model") or ""), error_summary)
             return {"error": error_summary}
 
-        if _is_rate_limit_exception(e) and not is_trade_execution_task:
+        if _is_rate_limit_exception(e):
             _requeue_agent_task(
                 task_id,
                 agent_id,
@@ -1567,7 +1546,7 @@ async def _run_agent_task_inner(
             )
             return {"error": error_summary}
 
-        if is_transient_provider_exception(e) and not is_trade_execution_task:
+        if is_transient_provider_exception(e):
             _requeue_agent_task(
                 task_id,
                 agent_id,
@@ -1589,8 +1568,7 @@ async def _run_agent_task_inner(
 
         # Missing/expired credentials: don't dead-letter — the operator can add a
         # key or an OAuth token can refresh, after which the task should resume.
-        # Trade-execution tasks still fail-safe (never auto-requeued).
-        if _is_missing_credentials_error(e) and not is_trade_execution_task:
+        if _is_missing_credentials_error(e):
             _requeue_agent_task(
                 task_id,
                 agent_id,
@@ -1617,9 +1595,6 @@ async def _run_agent_task_inner(
             f"Task failed: {task.get('title', '')} ({error_summary[:180]})",
         )
 
-        if is_trade_execution_task:
-            return {"error": error_summary}
-            
         # Notify Discord of failure
         try:
             from forven.reporter import broadcast_agent_task

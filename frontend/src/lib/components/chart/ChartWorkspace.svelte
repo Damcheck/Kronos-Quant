@@ -29,6 +29,11 @@
 	export let drawings: ChartDrawing[] = [];
 	export let activeTool: ChartDrawingTool = 'cursor';
 	export let fitContentToken = 0;
+	// Full-history strategy trigger points (entry/exit signals, incl. pre-live) —
+	// rendered as dim circles, distinct from the solid trade arrows.
+	export let triggerMarkers: SignalMarker[] = [];
+	// Active position levels (stop / take-profit / trailing) drawn as horizontal lines.
+	export let priceLines: Array<{ id: string; price: number; color?: string; title?: string; dashed?: boolean }> = [];
 
 	const dispatch = createEventDispatcher<{
 		drawingPoint: ChartDrawingPoint;
@@ -43,6 +48,7 @@
 	let subSeriesMap = new Map<string, ISeriesApi<'Line'>>();
 	let drawingSeriesMap = new Map<string, ISeriesApi<'Line'>>();
 	let priceLinesMap = new Map<string, IPriceLine>();
+	let positionLinesMap = new Map<string, IPriceLine>();
 
 	let resizeObserver: ResizeObserver | null = null;
 	let latestCandleData: Array<{ time: Time; open: number; high: number; low: number; close: number }> = [];
@@ -241,9 +247,10 @@
 
 	// React to changes
 	$: if (chart && data) updateData();
-	$: if (chart && (entryMarkers || exitMarkers)) updateMarkers();
+	$: if (chart && (entryMarkers || exitMarkers || triggerMarkers)) updateMarkers();
 	$: if (chart && (mainIndicators || subIndicators)) updateIndicators();
 	$: if (chart && drawings) updateDrawings();
+	$: if (chart && priceLines) updatePositionLines();
 	$: if (chart && fitContentToken !== appliedFitContentToken) {
 		appliedFitContentToken = fitContentToken;
 		// "Reset View" / session switch: resume following the most-recent window until
@@ -313,6 +320,7 @@
 		updateMarkers();
 		updateIndicators();
 		updateDrawings();
+		updatePositionLines();
 
 		// While following (initial mode), re-anchor to the most-recent window on every
 		// data update. This keeps the chart pinned to the current timeframe as bars
@@ -348,9 +356,42 @@
 		return String(marker.source || 'trade').toLowerCase() === 'signal' ? 'signal' : 'trade';
 	}
 
-	function markerText(marker: SignalMarker, fallback: string): string | undefined {
-		if (markerSource(marker) === 'signal') return undefined;
-		return marker.label || fallback;
+	function markerText(marker: SignalMarker): string | undefined {
+		// Real fills get a short label (BUY/SELL/SHORT/COVER) so the four otherwise-
+		// colliding pairs are tellable apart. Would-be triggers stay text-free —
+		// there can be many and the text would stack and overlap badly.
+		if (markerSource(marker) !== 'trade') return undefined;
+		return marker.label || undefined;
+	}
+
+	// One real-fill marker. Defaults derive the four distinct visuals from
+	// direction + entry/exit; the backend's self-describing fields (side → above/
+	// below bar, color, shape, label) override when present.
+	function buildTradeMarker(m: SignalMarker, leg: 'entry' | 'exit'): SeriesMarker<Time> | null {
+		const raw = parseTimestamp(m.timestamp);
+		if (isNaN(raw)) return null;
+		const t = snapToBar(raw);
+		if (t === null) return null;
+		const direction = markerDirection(m);
+		let position: 'aboveBar' | 'belowBar';
+		let color: string;
+		let shape: 'arrowUp' | 'arrowDown';
+		let label: string;
+		if (leg === 'entry') {
+			if (direction === 'short') { position = 'aboveBar'; color = '#f97316'; shape = 'arrowDown'; label = 'SHORT'; }
+			else { position = 'belowBar'; color = '#22c55e'; shape = 'arrowUp'; label = 'BUY'; }
+		} else if (direction === 'short') {
+			position = 'belowBar'; color = '#14b8a6'; shape = 'arrowUp'; label = 'COVER';
+		} else {
+			position = 'aboveBar'; color = '#ef4444'; shape = 'arrowDown'; label = 'SELL';
+		}
+		const side = String(m.side || '').toLowerCase();
+		if (side === 'bull') position = 'belowBar';
+		else if (side === 'bear') position = 'aboveBar';
+		if (m.color) color = m.color;
+		if (m.shape === 'arrowUp' || m.shape === 'arrowDown') shape = m.shape;
+		const text = markerText(m) ?? label;
+		return { time: t, position, color, shape, ...(text ? { text } : {}) };
 	}
 
 	function updateMarkers() {
@@ -358,41 +399,72 @@
 
 		const markers: SeriesMarker<Time>[] = [];
 
+		// Real fills → four DISTINCT labeled markers (BUY / SELL / SHORT / COVER) so
+		// the pairs that used to collide (BUY≡COVER, SELL≡SHORT) are tellable apart.
+		// Backend self-describing fields (side/color/shape/label) drive the visual when
+		// present; otherwise we derive from direction + entry/exit (backward-compatible).
 		for (const m of entryMarkers) {
-			const raw = parseTimestamp(m.timestamp);
-			if (isNaN(raw)) continue;
-			const t = snapToBar(raw);
-			if (t === null) continue;
-			const direction = markerDirection(m);
-			const text = markerText(m, direction === 'short' ? 'Short' : 'Buy');
-			markers.push({
-				time: t,
-				position: direction === 'short' ? 'aboveBar' : 'belowBar',
-				color: direction === 'short' ? '#ef4444' : '#22c55e',
-				shape: direction === 'short' ? 'arrowDown' : 'arrowUp',
-				...(text ? { text } : {}),
-			});
+			const mk = buildTradeMarker(m, 'entry');
+			if (mk) markers.push(mk);
+		}
+		for (const m of exitMarkers) {
+			const mk = buildTradeMarker(m, 'exit');
+			if (mk) markers.push(mk);
 		}
 
-		for (const m of exitMarkers) {
+		// Full-history strategy triggers — smaller, MUTED arrows (green up = entry,
+		// red down = exit) so they stay visually distinct from the solid trade arrows
+		// but still read as long/short signals. No text (there can be many).
+		for (const m of triggerMarkers) {
 			const raw = parseTimestamp(m.timestamp);
 			if (isNaN(raw)) continue;
 			const t = snapToBar(raw);
 			if (t === null) continue;
-			const direction = markerDirection(m);
-			const text = markerText(m, direction === 'short' ? 'Cover' : 'Sell');
-			markers.push({
-				time: t,
-				position: direction === 'short' ? 'belowBar' : 'aboveBar',
-				color: direction === 'short' ? '#22c55e' : '#ef4444',
-				shape: direction === 'short' ? 'arrowUp' : 'arrowDown',
-				...(text ? { text } : {}),
-			});
+			const isExit = m.type === 'exit';
+			let position: 'aboveBar' | 'belowBar' = isExit ? 'aboveBar' : 'belowBar';
+			let color = isExit ? '#f87171' : '#4ade80';
+			let shape: 'arrowUp' | 'arrowDown' = isExit ? 'arrowDown' : 'arrowUp';
+			const side = String(m.side || '').toLowerCase();
+			if (side === 'bull') position = 'belowBar';
+			else if (side === 'bear') position = 'aboveBar';
+			if (m.color) color = m.color;
+			if (m.shape === 'arrowUp' || m.shape === 'arrowDown') shape = m.shape;
+			markers.push({ time: t, position, color, shape, size: 0.7 });
 		}
 
 		// Lightweight charts requires markers to be sorted by time
 		markers.sort((a, b) => (a.time as number) - (b.time as number));
 		candleSeries.setMarkers(markers);
+	}
+
+	function updatePositionLines() {
+		if (!chart || !candleSeries) return;
+		const ids = new Set(priceLines.map((l) => l.id));
+		for (const [id, line] of positionLinesMap.entries()) {
+			if (!ids.has(id)) {
+				candleSeries.removePriceLine(line);
+				positionLinesMap.delete(id);
+			}
+		}
+		// Industry-standard active-order representation: a full-width price line with
+		// an axis price label (solid ENTRY, dashed SL/TP/Trail). lightweight-charts has
+		// no native entry-anchored ray; for a TRUE ray (segment from entry bar → now)
+		// draw a 2-point line series instead — see the trendLine pattern below
+		// (chart.addLineSeries(...).setData([{ time: start }, { time: now }])).
+		for (const level of priceLines) {
+			if (!Number.isFinite(level.price)) continue;
+			const options = {
+				price: level.price,
+				color: level.color || '#f59e0b',
+				lineWidth: 2 as const,
+				lineStyle: level.dashed ? LineStyle.Dashed : LineStyle.Solid,
+				axisLabelVisible: true,
+				title: level.title || `@ ${level.price.toFixed(2)}`,
+			};
+			const existing = positionLinesMap.get(level.id);
+			if (existing) existing.applyOptions(options);
+			else positionLinesMap.set(level.id, candleSeries.createPriceLine(options));
+		}
 	}
 
 	function updateIndicators() {

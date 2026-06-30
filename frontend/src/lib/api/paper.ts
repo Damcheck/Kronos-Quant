@@ -107,7 +107,7 @@ export interface PaperTradingSession {
 	replay_end?: string | null;
 	replay_speed?: number;
 	replay_state?: ReplayState;
-	initial_capital: number;
+	initial_capital: number | null;
 	position_size_pct: number;
 	stop_loss_pct: number | null;
 	take_profit_pct: number | null;
@@ -131,9 +131,19 @@ export interface PaperTradingSession {
 	indicators: Record<string, LiveIndicator>;
 	pending_signals: PendingSignal[];
 	last_signal: string;
-	capital: number;
+	capital: number | null;
+	// Real Hyperliquid balance (deployed/live sessions only). For paper sessions
+	// account_value is null and balance_source is 'simulated'. balance_source is
+	// 'unavailable' for a deployed session whose real balance hasn't synced yet —
+	// the UI must show "balance unavailable", never the simulated $10k base.
+	account_value?: number | null;
+	account_withdrawable?: number | null;
+	account_margin_used?: number | null;
+	balance_source?: 'exchange' | 'books_aggregate' | 'simulated' | 'unavailable' | string | null;
+	account_network?: string | null;
+	account_synced_at?: string | null;
 	total_pnl: number;
-	total_pnl_pct: number;
+	total_pnl_pct: number | null;
 	total_trades: number;
 	winning_trades: number;
 	performance?: PaperSessionPerformance;
@@ -528,6 +538,12 @@ export interface TradeMarker {
 	pnl?: number;
 	pnl_pct?: number;
 	is_open?: boolean;
+	// Self-describing visuals from the backend (industry-standard marker conventions).
+	side?: 'bull' | 'bear' | string;
+	action?: 'buy' | 'sell' | 'short' | 'cover' | 'long_signal' | 'short_signal' | 'exit_signal' | string;
+	shape?: 'arrowUp' | 'arrowDown' | string;
+	color?: string;
+	label?: string;
 }
 
 export interface TradeMarkersResponse {
@@ -575,6 +591,55 @@ export async function getTradeMarkers(
 	const query = params.toString();
 	return fetchApi(
 		`/paper/sessions/${sessionId}/markers${query ? `?${query}` : ''}`,
+		options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : undefined
+	);
+}
+
+// ============== Chart bundle (parity overhaul) ==============
+// One call returns everything the chart needs, driven by the real indicator
+// registry + the strategy's own signal function (no guessed reimplementation).
+
+export interface ChartIndicatorSeries {
+	name: string;
+	panel: 'main' | 'sub';
+	type: 'line';
+	color?: string;
+	data: IndicatorHistoryPoint[];
+}
+
+export interface ActiveLevel {
+	price: number;
+	direction?: string;
+	from_time?: string;
+	to_time?: string | null;
+	type?: 'stop' | 'take_profit' | 'trail' | 'entry' | string;
+	label?: string;
+	color?: string;
+}
+
+export interface PaperSessionChart {
+	session_id: string;
+	bars: OHLCVBar[];
+	main_indicators: ChartIndicatorSeries[];
+	sub_indicators: ChartIndicatorSeries[];
+	entry_markers: TradeMarker[];
+	exit_markers: TradeMarker[];
+	trigger_entries: TradeMarker[];
+	trigger_exits: TradeMarker[];
+	active_levels: { stop: ActiveLevel[]; take_profit: ActiveLevel[]; trail: ActiveLevel[]; entry?: ActiveLevel[] };
+	strategy_type: string;
+	warnings: string[];
+}
+
+export async function getPaperSessionChart(
+	sessionId: string,
+	options: { limit?: number; timeframe?: string; timeoutMs?: number } = {}
+): Promise<PaperSessionChart> {
+	const params = new URLSearchParams();
+	params.set('limit', String(options.limit ?? 2000));
+	if (options.timeframe) params.set('timeframe', options.timeframe);
+	return fetchApi(
+		`/paper/sessions/${sessionId}/chart?${params.toString()}`,
 		options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : undefined
 	);
 }

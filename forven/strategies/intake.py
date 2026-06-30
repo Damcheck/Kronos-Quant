@@ -645,6 +645,165 @@ def register_custom_strategy_file(
     return registration.to_dict()
 
 
+def register_imported_strategy_file(
+    *,
+    module_name: str,
+    source: str = "import",
+    source_id: str | None = None,
+) -> dict:
+    """Register an UNTRUSTED-ORIGIN (imported / shared) strategy as a SANDBOX-ONLY
+    container — WITHOUT importing the author's code into the trusted parent.
+
+    The module must already be written to ``forven/strategies/imported/<module>.py``.
+    Validation (import + __init__ + certify + lookahead) runs in the locked-down
+    worker subprocess; only JSON metadata returns. The DB row is flagged
+    ``sandbox_only=1`` with ``runtime_type=imported__<module>``, so every later
+    execution (gauntlet/backtest/scanner) is routed through the worker and the parent
+    never imports the module. See docs/strategy-share-security-audit-2026-06-29.md (R2).
+    """
+    from pathlib import Path
+
+    from forven.strategies import imported as imported_pkg
+    from forven.strategies.registry import imported_runtime_type
+    from forven.sandbox.strategy_worker import (
+        validate_custom_module_isolated,
+        _reset_worker,
+    )
+    from forven.db import create_strategy_container, get_db, log_activity
+
+    modname = str(module_name or "").strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", modname):
+        raise ValueError(f"invalid imported module name: {module_name!r}")
+
+    imported_dir = Path(imported_pkg.__file__).resolve().parent
+    target = imported_dir / f"{modname}.py"
+    if not target.exists():
+        raise ValueError(f"imported strategy file not found: {target}")
+
+    # Pre-spawn static checks in the parent (SCAN ONLY — never executes the code):
+    # banned-import gate + AST guard, so an obviously-unsafe module need not even
+    # reach the worker. The worker re-scans before importing (belt-and-suspenders).
+    banned = _file_uses_banned_imports(target)
+    if banned:
+        raise ValueError(
+            f"{modname}.py uses banned imports: {', '.join(banned)}. "
+            "Use native pandas/numpy."
+        )
+    from forven.sandbox.ast_guard import scan_source
+
+    report = scan_source(target.read_text(encoding="utf-8"))
+    if not report.ok:
+        findings = "; ".join(f"line {f.lineno}: {f.message}" for f in report.findings[:5])
+        raise ValueError(f"{modname}.py rejected by the security scan: {findings}")
+
+    # Validate OUT-OF-PROCESS — the worker imports + probes; the parent never does.
+    meta = validate_custom_module_isolated(modname, package="imported")
+    if not meta.get("ok"):
+        raise ValueError(
+            f"imported strategy validation failed: {meta.get('error') or 'unknown error'}"
+        )
+
+    # Fail-closed on cross-asset / multi-source imports. There is NO parent-side
+    # cross-asset enrichment, and the sandbox worker is network/DB-jailed (R3), so a
+    # strategy that needs a SECOND asset's series cannot be fed it — it would run on a
+    # single-asset frame and silently emit empty/garbage signals. Reject at import
+    # rather than register a strategy that can never produce correct signals. (The real
+    # class never reaches the parent; the worker captured data_requirements() for us.)
+    data_reqs = meta.get("data_requirements")
+    if isinstance(data_reqs, list):
+        distinct_assets = {
+            str(r.get("asset") or "").strip().upper()
+            for r in data_reqs
+            if isinstance(r, dict) and r.get("asset")
+        }
+        if len(distinct_assets) > 1:
+            raise ValueError(
+                f"{modname}.py declares a cross-asset data requirement "
+                f"({', '.join(sorted(distinct_assets))}). Cross-asset / multi-source "
+                "imported strategies are not supported: the sandbox cannot supply a "
+                "second asset's data, so the strategy would run on incomplete data. "
+                "Import a single-asset strategy instead."
+            )
+
+    runtime_type = imported_runtime_type(modname)
+    asset = str(meta.get("asset") or "BTC").strip() or "BTC"
+    certified = bool(meta.get("certified"))
+    cert_error = meta.get("cert_error")
+    lookahead_blocked = bool(meta.get("lookahead_blocked"))
+    if lookahead_blocked:
+        certified = False
+        if not cert_error:
+            cert_error = meta.get("lookahead_reason")
+    initial_stage = "research_only" if (lookahead_blocked or not certified) else "quick_screen"
+    stored_params = (
+        meta.get("canonical_params") if (certified and not lookahead_blocked) else meta.get("default_params")
+    ) or {}
+    if not isinstance(stored_params, dict):
+        stored_params = {}
+    # Carry the validated data requirements so the parent-side proxy reports the real
+    # (single-source) declaration instead of BaseStrategy's default — otherwise the
+    # proxy is silently wrong about what data the strategy needs.
+    if isinstance(data_reqs, list) and data_reqs:
+        stored_params.setdefault("_data_requirements", data_reqs)
+    # Carry the optimizable parameter space so the optimizer can tune the imported
+    # strategy (its real parameter_space() is in the absent class). Without this the
+    # optimizer returns {} for sandbox-only types and silently never tunes them.
+    param_space = meta.get("parameter_space")
+    if isinstance(param_space, dict) and param_space:
+        stored_params.setdefault("_parameter_space", param_space)
+
+    with get_db() as conn:
+        strategy_id, _display, _base = create_strategy_container(
+            conn=conn,
+            name=f"{asset}-{modname}-import",
+            type_=runtime_type,
+            symbol=asset.upper(),
+            timeframe=_intended_timeframe(stored_params),
+            params=stored_params,
+            stage=initial_stage,
+            source=source,
+            source_ref=str(target),
+            sandbox_only=True,
+        )
+
+    # A running persistent worker discovered imported/ at its startup; force a
+    # respawn so the next isolated execution call sees the newly-written module.
+    try:
+        _reset_worker()
+    except Exception:
+        pass
+
+    log_activity(
+        "info",
+        "strategy_intake",
+        f"Imported (sandbox-only) {modname} as {strategy_id}",
+        {
+            "mode": "import_sandbox",
+            "strategy_id": strategy_id,
+            "module_name": modname,
+            "runtime_type": runtime_type,
+            "certified": certified,
+            "sandbox_only": True,
+            "source_id": source_id,
+        },
+    )
+    log.info(
+        "Imported (sandbox-only) %s as %s (runtime_type=%s, certified=%s)",
+        modname, strategy_id, runtime_type, certified,
+    )
+    return {
+        "strategy_id": strategy_id,
+        "module_name": modname,
+        "runtime_type": runtime_type,
+        "asset": asset.upper(),
+        "certified": certified,
+        "certification_error": cert_error,
+        "stage": initial_stage,
+        "sandbox_only": True,
+        "lookahead_blocked": lookahead_blocked,
+    }
+
+
 def auto_intake_recent_files(*, max_age_minutes: int = 10) -> dict:
     """Register only recently-modified custom strategy files.
 

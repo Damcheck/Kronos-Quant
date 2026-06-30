@@ -51,60 +51,77 @@ class BollingerS00120Strategy(BaseStrategy):
             f"or RSI > {p['rsi_entry_short']}."
         )
 
-    def generate_signal(self, df: pd.DataFrame) -> Signal:
-        from forven.scanner import rsi as compute_rsi, atr
-        
+    def generate_signals(self, df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+        """Vectorized twin of ``generate_signal`` — the SINGLE source of entry/exit
+        logic so the backtest and the live/paper scanner trade the identical signal
+        set. ``generate_signal`` delegates here for its boolean decision.
+
+        Entry: close breaks up through the upper Bollinger band AND (RSI below the
+        long-entry floor, or RSI just crossed down through it). Exit: close below the
+        mid band OR RSI above the short threshold.
+        """
+        from forven.strategies.indicators import rsi as compute_rsi
+
         p = self.params
         bp = p.get("bb_period", 20)
         rsi_period = p.get("rsi_period", 14)
         rsi_entry_long = p.get("rsi_entry_long", 30)
         rsi_entry_short = p.get("rsi_entry_short", 70)
-        
+
         close = df["close"]
-        
+        bb_mid = close.rolling(bp).mean()
+        bb_std = close.rolling(bp).std()
+        bb_upper = bb_mid + p.get("bb_std", 2.0) * bb_std
+
+        rsi_val = compute_rsi(close, rsi_period)
+
+        prev_close = close.shift(1)
+        prev_bb_upper = bb_upper.shift(1)
+        prev_rsi = rsi_val.shift(1)
+
+        breakout = (prev_close <= prev_bb_upper) & (close > bb_upper)
+        rsi_oversold = rsi_val < rsi_entry_long
+        rsi_reversal = (prev_rsi >= rsi_entry_long) & (rsi_val < rsi_entry_long)
+
+        entry = breakout & (rsi_oversold | rsi_reversal)
+        exit_ = (close < bb_mid) | (rsi_val > rsi_entry_short)
+        return entry.fillna(False), exit_.fillna(False)
+
+    def generate_signal(self, df: pd.DataFrame) -> Signal:
+        from forven.strategies.indicators import rsi as compute_rsi, atr
+
+        p = self.params
+        bp = p.get("bb_period", 20)
+        rsi_period = p.get("rsi_period", 14)
+
+        close = df["close"]
+
         # Bollinger Bands
         bb_mid = close.rolling(bp).mean()
         bb_std = close.rolling(bp).std()
         bb_upper = bb_mid + p.get("bb_std", 2.0) * bb_std
         bb_lower = bb_mid - p.get("bb_std", 2.0) * bb_std
-        
+
         # RSI
         rsi_val = compute_rsi(close, rsi_period)
-        
+
         # ATR for position sizing
         atr_val = atr(df, 14)
 
-        # Get values for current and previous bar
+        # Single source of truth for the decision (keeps per-bar and vectorized in lockstep).
+        entries, exits = self.generate_signals(df)
+        entry = bool(entries.iloc[-1])
+
         curr_close = float(close.iloc[-1])
-        prev_close = float(close.iloc[-2])
-        
         curr_bb_upper = float(bb_upper.iloc[-1])
-        prev_bb_upper = float(bb_upper.iloc[-2])
         curr_bb_mid = float(bb_mid.iloc[-1])
         curr_bb_lower = float(bb_lower.iloc[-1])
-        
         curr_rsi = float(rsi_val.iloc[-1])
-        prev_rsi = float(rsi_val.iloc[-2])
-        
         curr_atr = float(atr_val.iloc[-1])
 
-        # Entry: breakout above upper band AND RSI oversold (catching the bounce)
-        # Also allow entry if RSI was above entry threshold and now below (RSI reversal)
-        breakout = prev_close <= prev_bb_upper and curr_close > curr_bb_upper
-        rsi_oversold = curr_rsi < rsi_entry_long
-        rsi_reversal = prev_rsi >= rsi_entry_long and curr_rsi < rsi_entry_long
-        
-        entry = breakout and (rsi_oversold or rsi_reversal)
-        
-        # Exit: price below middle band OR RSI overbought
-        exit_price = curr_close < curr_bb_mid
-        exit_rsi = curr_rsi > rsi_entry_short
-        
-        exit_signal = exit_price or exit_rsi
-
         return Signal(
-            entry_signal=bool(entry),
-            exit_signal=bool(exit_signal),
+            entry_signal=entry,
+            exit_signal=bool(exits.iloc[-1]),
             price=round(curr_close, 4),
             direction="long",
             confidence=min(1.0, (curr_rsi / 100)) if entry else 0.0,

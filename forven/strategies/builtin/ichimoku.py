@@ -47,8 +47,43 @@ class IchimokuStrategy(BaseStrategy):
             f"Senkou Span B period: {p['senkou_b_period']}."
         )
 
+    def generate_signals(self, df: pd.DataFrame):
+        """Vectorized twin of generate_signal — the SINGLE source of entry/exit logic."""
+        p = self.params
+        high = df["high"]
+        low = df["low"]
+        close = df["close"]
+
+        tenkan_p = p["tenkan_period"]
+        kijun_p = p["kijun_period"]
+        senkou_b_p = p["senkou_b_period"]
+
+        # Tenkan-sen: midpoint of highest high and lowest low over tenkan_period
+        tenkan = (high.rolling(tenkan_p).max() + low.rolling(tenkan_p).min()) / 2
+        # Kijun-sen: midpoint over kijun_period
+        kijun = (high.rolling(kijun_p).max() + low.rolling(kijun_p).min()) / 2
+        # Senkou Span A: midpoint of Tenkan and Kijun, shifted forward kijun_period bars
+        senkou_a = ((tenkan + kijun) / 2).shift(kijun_p)
+        # Senkou Span B: midpoint of highest high and lowest low over senkou_b_period, shifted
+        senkou_b = ((high.rolling(senkou_b_p).max() + low.rolling(senkou_b_p).min()) / 2).shift(kijun_p)
+
+        # Per-bar method falls back to close when a Senkou span is NaN (warmup).
+        senkou_a_eff = senkou_a.where(senkou_a.notna(), close)
+        senkou_b_eff = senkou_b.where(senkou_b.notna(), close)
+        cloud_top = pd.concat([senkou_a_eff, senkou_b_eff], axis=1).max(axis=1)
+        above_cloud = close > cloud_top
+
+        prev_tenkan = tenkan.shift(1)
+        prev_kijun = kijun.shift(1)
+        cross_up = (prev_tenkan <= prev_kijun) & (tenkan > kijun)
+        cross_down = (prev_tenkan >= prev_kijun) & (tenkan < kijun)
+
+        entry = cross_up & above_cloud
+        exit_ = cross_down
+        return entry.fillna(False), exit_.fillna(False)
+
     def generate_signal(self, df: pd.DataFrame) -> Signal:
-        from forven.scanner import atr
+        from forven.strategies.indicators import atr
 
         p = self.params
         high = df["high"]
@@ -77,9 +112,7 @@ class IchimokuStrategy(BaseStrategy):
 
         curr_close = float(close.iloc[-1])
         curr_tenkan = float(tenkan.iloc[-1])
-        prev_tenkan = float(tenkan.iloc[-2])
         curr_kijun = float(kijun.iloc[-1])
-        prev_kijun = float(kijun.iloc[-2])
         curr_senkou_a = float(senkou_a.iloc[-1]) if pd.notna(senkou_a.iloc[-1]) else curr_close
         curr_senkou_b = float(senkou_b.iloc[-1]) if pd.notna(senkou_b.iloc[-1]) else curr_close
         curr_atr = float(atr_14.iloc[-1])
@@ -87,11 +120,7 @@ class IchimokuStrategy(BaseStrategy):
         cloud_top = max(curr_senkou_a, curr_senkou_b)
         above_cloud = curr_close > cloud_top
 
-        cross_up = prev_tenkan <= prev_kijun and curr_tenkan > curr_kijun
-        cross_down = prev_tenkan >= prev_kijun and curr_tenkan < curr_kijun
-
-        entry = cross_up and above_cloud
-        exit_ = cross_down
+        entries, exits = self.generate_signals(df)
 
         # Confidence based on distance above cloud
         if above_cloud and cloud_top > 0:
@@ -100,8 +129,8 @@ class IchimokuStrategy(BaseStrategy):
             confidence = 0.0
 
         return Signal(
-            entry_signal=bool(entry),
-            exit_signal=bool(exit_),
+            entry_signal=bool(entries.iloc[-1]),
+            exit_signal=bool(exits.iloc[-1]),
             price=round(curr_close, 4),
             direction="long",
             confidence=round(max(0.0, min(1.0, confidence)), 4),

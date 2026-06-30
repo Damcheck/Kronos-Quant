@@ -143,7 +143,10 @@ def test_run_scan_signal_only_preserves_prior_execution_summary(monkeypatch, for
     assert state.get("execution_summary", {}).get("total_pnl_pct") == 0.12
 
 
-def test_manage_positions_queues_trade_execution_when_fast_path_disabled(monkeypatch, forven_db):
+def test_manage_positions_executes_directly_when_not_paper_local(monkeypatch, forven_db):
+    """Non-paper-local execution goes straight to _execute_direct — the legacy
+    queue-to-execution-trader route was removed (the agent is retired)."""
+    executed: list[dict] = []
     monkeypatch.setattr("forven.config.get_execution_mode", lambda: "paper")
     monkeypatch.setattr(scanner_mod, "_get_open_trades", lambda _strategy_id: [])
     monkeypatch.setattr(scanner_mod, "_paper_test_mode_enabled", lambda: False)
@@ -153,7 +156,6 @@ def test_manage_positions_queues_trade_execution_when_fast_path_disabled(monkeyp
         "_scanner_bool_setting",
         lambda name, default=False: False if name == "paper_stage_local_execution_only" else default,
     )
-    monkeypatch.setattr(scanner_mod, "_execution_fast_path_enabled", lambda: False)
     monkeypatch.setattr(scanner_mod, "_get_account_equity", lambda: 10000.0)
     monkeypatch.setattr(scanner_mod, "_has_seen_entry_signal", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(scanner_mod, "_remember_entry_signal", lambda *_args, **_kwargs: None)
@@ -165,8 +167,7 @@ def test_manage_positions_queues_trade_execution_when_fast_path_disabled(monkeyp
     )
     monkeypatch.setattr(scanner_mod, "_open_trade_db", lambda *_args, **_kwargs: "TR-001")
     monkeypatch.setattr(scanner_mod, "register", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(scanner_mod, "_queue_trade_execution_intent", lambda _intent: (True, "T00999", None))
-    monkeypatch.setattr(scanner_mod, "_execute_direct", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("direct execution should not run")))
+    monkeypatch.setattr(scanner_mod, "_execute_direct", lambda **kwargs: executed.append(kwargs) or {})
     monkeypatch.setattr(scanner_mod, "log_activity", lambda *args, **kwargs: None)
     monkeypatch.setattr("forven.sim.clock.is_sim_active", lambda: False)
 
@@ -186,7 +187,8 @@ def test_manage_positions_queues_trade_execution_when_fast_path_disabled(monkeyp
         account_equity=10000.0,
     )
 
-    assert any(action.startswith("QUEUED long BTC") for action in actions)
+    assert executed and executed[0]["action"] == "open"
+    assert any(action.startswith("OPENED long BTC") for action in actions)
 
 
 def test_manage_positions_executes_paper_stage_locally_by_default(monkeypatch, forven_db):
@@ -198,7 +200,6 @@ def test_manage_positions_executes_paper_stage_locally_by_default(monkeypatch, f
     monkeypatch.setattr(scanner_mod, "_paper_test_mode_enabled", lambda: False)
     monkeypatch.setattr(scanner_mod, "_paper_test_bypass_gates_enabled", lambda: False)
     monkeypatch.setattr(scanner_mod, "_scanner_bool_setting", lambda _name, default=False: default)
-    monkeypatch.setattr(scanner_mod, "_execution_fast_path_enabled", lambda: True)
     monkeypatch.setattr(scanner_mod, "_get_account_equity", lambda: 10000.0)
     monkeypatch.setattr(scanner_mod, "_has_seen_entry_signal", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(scanner_mod, "_remember_entry_signal", lambda *_args, **_kwargs: None)
@@ -216,7 +217,6 @@ def test_manage_positions_executes_paper_stage_locally_by_default(monkeypatch, f
         ),
     )
     monkeypatch.setattr(scanner_mod, "register", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(scanner_mod, "_queue_trade_execution_intent", lambda _intent: (_ for _ in ()).throw(AssertionError("paper local execution should not queue")))
     monkeypatch.setattr(scanner_mod, "_execute_direct", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("paper local execution should not call exchange")))
     monkeypatch.setattr(scanner_mod, "_update_trade_fill", lambda **kwargs: fills.append(kwargs))
     monkeypatch.setattr(scanner_mod, "log_activity", lambda *args, **kwargs: None)

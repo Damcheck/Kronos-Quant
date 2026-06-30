@@ -1,0 +1,305 @@
+"""The single execution engine shared by the backtest and the live/paper scanner.
+
+Given an ordered OHLCV frame, a :class:`DirectionalSignals` payload, and a
+normalized execution profile (``ec``), :func:`simulate` produces the closed trades
+and the still-open positions of a strategy. It owns the whole execution model:
+
+  * entries fill at the NEXT bar's open (signal on bar ``i`` → fill on bar ``i+1``),
+  * position sizing via :mod:`forven.strategies.sizing` (fraction/atr/kelly/fixed/full),
+  * exits evaluated intrabar against each bar's high/low — fixed stop (gap-through
+    fill at the stop level), take-profit (fill at the target), trailing stop
+    (ratcheted on the prior bar's extreme) and time-stop (fill at the bar open),
+  * signal-driven exits (fill at the bar open),
+  * net fee+slippage drag (``round_trip_drag``) subtracted from gross before sizing,
+  * one PnL convention: ``pnl_pct = (price_return*sign*leverage - drag) * size_fraction``.
+
+Two consumers drive the SAME code:
+
+  * the backtest runs :func:`simulate` once over the full history and force-closes
+    any open position at the final bar (see ``backtest._run_directional_signal_series_with_controls``);
+  * the live/paper scanner runs :func:`simulate` over its history each newly-closed
+    bar and acts on the difference vs its recorded trades, leaving the open position
+    live (it does NOT force-close).
+
+Because :func:`simulate` walks bars left-to-right and finalizes each trade at its
+exit bar, running it over a growing prefix and collecting newly-closed trades
+reproduces the full-history result trade-for-trade — the replay-safety property the
+scanner relies on, proven in ``tests/test_execution_parity.py``.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import pandas as pd
+
+from forven.regime import RANGE_BOUND
+from forven.strategies import sizing as _sizing
+from forven.strategies.base import DirectionalSignals  # noqa: F401  (re-exported for callers)
+
+
+def _trade_direction_sign(direction: str) -> float:
+    return -1.0 if str(direction or "long").strip().lower() == "short" else 1.0
+
+
+def _compute_atr_series(df: "pd.DataFrame", period: int = 14) -> "pd.Series":
+    """Wilder ATR in price units, aligned to df.index (no lookahead: TR uses prev close)."""
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    prev_close = close.shift(1)
+    true_range = pd.concat(
+        [(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    atr = true_range.ewm(alpha=1.0 / max(int(period), 1), adjust=False, min_periods=1).mean()
+    return atr.bfill().fillna(0.0)
+
+
+def round_trip_drag(fee_bps: float, slippage_bps: float, leverage: float) -> float:
+    """Per-equity round-trip cost (fees + slippage, paid on the leveraged notional)
+    subtracted from gross before sizing. The ONE definition used everywhere."""
+    return (
+        2.0
+        * (max(float(fee_bps or 0.0), 0.0) + max(float(slippage_bps or 0.0), 0.0))
+        / 10000.0
+        * max(float(leverage), 0.0)
+    )
+
+
+@dataclass
+class KernelResult:
+    """Output of :func:`simulate`.
+
+    ``closed_trades`` are realized trades in chronological (exit) order. ``open_positions``
+    maps direction -> the still-open trade state (entry_price/entry_bar/entry_time/regime/
+    size_fraction/stop_price/target_price/trail_pct/extreme), which the scanner surfaces as
+    the live position and the backtest force-closes at the final bar. ``closed_gross`` is the
+    chronological list of pre-size, leveraged, fee-netted gross returns (the kelly evidence
+    series) — exposed so a caller force-closing an open position appends consistently.
+    """
+
+    closed_trades: list[dict] = field(default_factory=list)
+    open_positions: dict[str, dict] = field(default_factory=dict)
+    closed_gross: list[float] = field(default_factory=list)
+
+
+def finalize(
+    trades: list[dict],
+    closed_gross: list[float],
+    at: dict,
+    direction: str,
+    exit_price: float,
+    exit_idx: int,
+    exit_time: str,
+    exit_reason: str,
+    *,
+    round_trip_drag: float,
+    leverage: float,
+    trade_mode: str,
+    open_at_end: bool = False,
+) -> None:
+    """Append one realized trade (and its pre-size gross to the kelly evidence list).
+
+    Shared by :func:`simulate`'s in-loop exits and the backtest's end-of-data
+    force-close so the math is defined exactly once.
+    """
+    entry_price = float(at["entry_price"])
+    if entry_price <= 0:
+        return
+    sign = _trade_direction_sign(direction)
+    gross = ((exit_price - entry_price) / entry_price) * sign * leverage - round_trip_drag
+    closed_gross.append(gross)  # pre-size, for kelly evidence
+    size_fraction = float(at.get("size_fraction", 1.0))
+    pnl_pct = gross * size_fraction
+    trade = {
+        "entry_bar": int(at["entry_bar"]),
+        "entry_price": entry_price,
+        "exit_price": float(exit_price),
+        "entry_time": str(at["entry_time"]),
+        "exit_time": str(exit_time),
+        "bars_held": max(0, exit_idx - int(at["entry_bar"])),
+        "pnl_pct": round(float(pnl_pct), 5),
+        "direction": direction,
+        "trade_mode": trade_mode,
+        "position_model": "hedged" if trade_mode == "both" else "single_side",
+        "size_fraction": round(size_fraction, 4),
+        # Full-precision fraction (the display field above is rounded to 4dp); the
+        # post-hoc funding pass reads this so its leg is scaled identically to price PnL.
+        "size_fraction_raw": size_fraction,
+        "exit_reason": exit_reason,
+    }
+    if open_at_end:
+        trade["open_at_end"] = True
+    if at.get("regime") is not None:
+        trade["regime"] = at.get("regime")
+    trades.append(trade)
+
+
+def simulate(
+    df: "pd.DataFrame",
+    signals: "DirectionalSignals",
+    warmup: int,
+    leverage: float,
+    *,
+    regimes: "pd.Series | None",
+    round_trip_drag: float,
+    trade_mode: str,
+    allowed_modes: tuple[str, ...],
+    ec: dict,
+    initial_capital: float,
+) -> KernelResult:
+    """Walk the bars and produce closed trades + still-open positions (no force-close).
+
+    Entries fill at the NEXT bar's open (no lookahead). Stops are evaluated intrabar
+    against each subsequent bar's high/low; a position entered on bar *i* is first
+    stop-checked on bar *i+1*. Per-trade ``size_fraction`` scales price PnL.
+    """
+    opens = df["open"].astype(float).values
+    highs = df["high"].astype(float).values
+    lows = df["low"].astype(float).values
+    atr_vals = _compute_atr_series(df, ec.get("atr_period", 14)).values if ec.get("needs_atr") else None
+
+    active_trades: dict[str, dict | None] = {direction: None for direction in allowed_modes}
+    trades: list[dict] = []
+    closed_gross: list[float] = []  # gross (pre-size) returns of closed trades, for kelly
+
+    lev = max(float(leverage), 1e-9)
+
+    def _entry_stop_dist_pct(entry_idx: int, entry_price: float) -> float | None:
+        atr_value = (
+            float(atr_vals[entry_idx])
+            if (ec["sizing_mode"] == "atr" and atr_vals is not None)
+            else None
+        )
+        return _sizing.entry_stop_dist_pct(ec, entry_price=entry_price, atr_value=atr_value)
+
+    def _size_fraction(stop_dist_pct: float | None) -> float:
+        return _sizing.size_fraction(
+            ec, stop_dist_pct, leverage=lev,
+            initial_capital=initial_capital, closed_gross=closed_gross,
+        )
+
+    for idx in range(max(int(warmup), 0) + 1, len(df)):
+        signal_idx = idx - 1
+        current_time = str(df.index[idx])
+        fill_price = float(opens[idx])
+        if fill_price <= 0:
+            continue
+        bar_high = float(highs[idx])
+        bar_low = float(lows[idx])
+
+        # (1) Intrabar stop / target / time-stop checks on already-open positions.
+        for direction in allowed_modes:
+            at = active_trades.get(direction)
+            if at is None:
+                continue
+            sign = _trade_direction_sign(direction)
+
+            exit_price: float | None = None
+            exit_reason = ""
+
+            if ec["time_stop_bars"] and (idx - int(at["entry_bar"])) >= ec["time_stop_bars"]:
+                exit_price, exit_reason = fill_price, "time_stop"
+
+            # Signal-driven exit (decided at the prior bar's close → a market-on-open
+            # order that fills at THIS bar's open). Because the open is the first tick of
+            # the bar, it must pre-empt any intrabar stop/take-profit that would only
+            # trigger later within the same bar — evaluated here, before the stop/TP.
+            if exit_price is None:
+                exit_series = signals.long_exits if direction == "long" else signals.short_exits
+                if bool(exit_series.iloc[signal_idx]):
+                    exit_price, exit_reason = fill_price, "signal"
+
+            # Combine fixed stop and trailing stop into the tighter effective level.
+            # The trailing level uses the peak through the PRIOR bar (at["extreme"]);
+            # this bar's new high/low is folded in only AFTER the breach check (below),
+            # so the trailing stop never ratchets on the same bar it triggers.
+            eff_stop = at.get("stop_price")
+            if at.get("trail_pct"):
+                trail_level = at["extreme"] * (1.0 - sign * at["trail_pct"])
+                if eff_stop is None:
+                    eff_stop = trail_level
+                else:
+                    eff_stop = max(eff_stop, trail_level) if direction == "long" else min(eff_stop, trail_level)
+            if exit_price is None and eff_stop is not None:
+                if direction == "long" and bar_low <= eff_stop:
+                    exit_price = min(fill_price, eff_stop)  # gap-through fills at open
+                    exit_reason = "trailing_stop" if (at.get("trail_pct") and (at.get("stop_price") is None or eff_stop > at["stop_price"])) else "stop_loss"
+                elif direction == "short" and bar_high >= eff_stop:
+                    exit_price = max(fill_price, eff_stop)
+                    exit_reason = "trailing_stop" if (at.get("trail_pct") and (at.get("stop_price") is None or eff_stop < at["stop_price"])) else "stop_loss"
+
+            tp = at.get("target_price")
+            if exit_price is None and tp is not None:
+                # Take-profit is a resting limit; model it conservatively as filling
+                # AT the target even on a gap-through (never crediting the more
+                # favourable gapped open), symmetric with the pessimistic stop fills.
+                if direction == "long" and bar_high >= tp:
+                    exit_price, exit_reason = (tp, "take_profit")
+                elif direction == "short" and bar_low <= tp:
+                    exit_price, exit_reason = (tp, "take_profit")
+
+            if exit_price is not None:
+                finalize(trades, closed_gross, at, direction, exit_price, idx, current_time, exit_reason,
+                         round_trip_drag=round_trip_drag, leverage=leverage, trade_mode=trade_mode)
+                active_trades[direction] = None
+            elif at.get("trail_pct"):
+                # Still open — ratchet the trailing peak with THIS bar for the next bar.
+                at["extreme"] = max(at["extreme"], bar_high) if direction == "long" else min(at["extreme"], bar_low)
+
+        # (2) Signal-driven entries (fill at this bar's open).
+        for direction in allowed_modes:
+            entry_series = signals.long_entries if direction == "long" else signals.short_entries
+            if active_trades.get(direction) is not None or not bool(entry_series.iloc[signal_idx]):
+                continue
+            sign = _trade_direction_sign(direction)
+            # Size/stop off the ATR through the LAST CLOSED bar (signal_idx = idx-1).
+            # Using atr_vals[idx] would read the entry bar's own (not-yet-realized)
+            # high/low/close at the open where the fill happens — a forward-looking read.
+            stop_dist_pct = _entry_stop_dist_pct(signal_idx, fill_price)
+            stop_price = None
+            if stop_dist_pct is not None and (ec["stop_loss_pct"] is not None or ec["sizing_mode"] == "atr"):
+                stop_price = fill_price * (1.0 - sign * stop_dist_pct)
+            target_price = None
+            if ec["take_profit_pct"] is not None:
+                target_price = fill_price * (1.0 + sign * ec["take_profit_pct"] / 100.0)
+            active_trades[direction] = {
+                "entry_bar": idx,
+                "entry_price": fill_price,
+                "entry_time": current_time,
+                "regime": regimes.iloc[signal_idx] if regimes is not None and len(regimes) > signal_idx else RANGE_BOUND,
+                "size_fraction": _size_fraction(stop_dist_pct),
+                "stop_price": stop_price,
+                "target_price": target_price,
+                "trail_pct": (ec["trailing_stop_pct"] / 100.0) if ec["trailing_stop_pct"] is not None else None,
+                "extreme": fill_price,
+            }
+
+    open_positions = {direction: at for direction, at in active_trades.items() if at is not None}
+    return KernelResult(closed_trades=trades, open_positions=open_positions, closed_gross=closed_gross)
+
+
+def force_close(
+    res: KernelResult,
+    df: "pd.DataFrame",
+    *,
+    leverage: float,
+    round_trip_drag: float,
+    trade_mode: str,
+) -> list[dict]:
+    """Append a synthetic close at the final bar's close for every still-open position
+    (the backtest's end-of-data accounting). Mutates and returns ``res.closed_trades``.
+    The scanner does NOT call this — it leaves the position live."""
+    trades = res.closed_trades
+    final_idx = len(df) - 1
+    final_close = float(df["close"].iloc[final_idx]) if len(df) else 0.0
+    final_time = str(df.index[final_idx]) if len(df) else ""
+    for direction, at in res.open_positions.items():
+        if final_close <= 0:
+            continue
+        finalize(
+            trades, res.closed_gross, at, direction, final_close, final_idx, final_time, "signal",
+            round_trip_drag=round_trip_drag, leverage=leverage, trade_mode=trade_mode, open_at_end=True,
+        )
+    return trades

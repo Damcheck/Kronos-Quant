@@ -58,10 +58,15 @@ def test_load_pipeline_config_preserves_robustness_thresholds(forven_db):
 
 
 def _degradation(avg_is: float, avg_oos: float) -> float:
-    """Mirrors the inline math in robustness._run_walk_forward_analysis."""
+    """Mirrors the inline math at EVERY production WFA site (robustness.py:914-921,
+    backtest.py:8065 & 10150). Must stay in lock-step with them.
+
+    avg_is<=0 → 1.0 (FULL degradation): the IS->OOS ratio is meaningless, and a lucky
+    positive OOS slice must NOT earn a free PASS. (The old code returned 0.0 when
+    avg_oos>0; that branch was removed — this test previously pinned the stale value.)"""
     if avg_is > 0:
         return 1.0 - (avg_oos / avg_is)
-    return 1.0 if avg_oos <= 0 else 0.0
+    return 1.0
 
 
 def test_wfa_degradation_math_positive_is():
@@ -76,8 +81,8 @@ def test_wfa_degradation_math_nonpositive_is():
     # IS<=0, OOS<=0 → 1.0 (worst case — no edge anywhere)
     assert _degradation(0.0, -0.2) == pytest.approx(1.0)
     assert _degradation(-0.5, -0.2) == pytest.approx(1.0)
-    # IS<=0 but OOS>0 → 0.0 (no IS edge to degrade from)
-    assert _degradation(0.0, 0.5) == pytest.approx(0.0)
+    # IS<=0 but OOS>0 → 1.0 (inconclusive; a lucky positive OOS slice earns no free PASS)
+    assert _degradation(0.0, 0.5) == pytest.approx(1.0)
 
 
 def test_wfa_degradation_boundary_passes_at_exactly_35pct():
@@ -100,32 +105,36 @@ def test_wfa_degradation_boundary_fails_just_above_35pct():
 # --- Monte Carlo percentile rank --------------------------------------------
 
 
-def _percentile_rank(target: float, samples: list[float]) -> float:
-    """Mirrors the inline math: share of sims >= target."""
+def _prob_profitable(samples: list[float]) -> float:
+    """Mirrors the REAL Monte-Carlo gate statistic: the share of simulated final
+    returns that are > 0, expressed as a percent. The verdict FAILs when this is below
+    ``monte_carlo_percentile_min * 100`` (robustness.py:985,1034). NOTE: percentile_rank
+    (share of sims >= the original return) is now a DIAGNOSTIC only — it is NOT the gate;
+    the old mirror tests pinned it as the gate and gave false confidence."""
     import numpy as np
     if not samples:
         return 0.0
     arr = np.asarray(samples, dtype=float)
-    return float(np.mean(arr >= target))
+    return float(np.mean(arr > 0.0) * 100.0)
 
 
-def test_mc_percentile_pass_at_threshold():
+def test_mc_prob_profitable_pass_at_threshold():
     threshold_frac = float(DEFAULT_PIPELINE_CONFIG["robustness_thresholds"]["monte_carlo_percentile_min"])
-    # 65 out of 100 sims meet the bar → ratio 0.65 (exactly the threshold).
-    samples = [1.0] * 65 + [0.0] * 35
-    rank = _percentile_rank(target=1.0, samples=samples)
-    assert rank == pytest.approx(0.65)
-    # The router multiplies threshold_frac by 100 and compares percentile_rank*100.
-    # rank*100 = 65.0 >= threshold_frac*100 = 65.0 → PASS at equality.
-    assert rank >= threshold_frac
+    mc_profitable_min = threshold_frac * 100.0  # the router scales the fraction to percent
+    # 65 of 100 simulated paths profitable → 65.0% == the threshold → PASS at equality.
+    samples = [1.0] * 65 + [-1.0] * 35
+    prob = _prob_profitable(samples)
+    assert prob == pytest.approx(65.0)
+    assert not (prob < mc_profitable_min)  # gate FAILs only when prob < threshold
 
 
-def test_mc_percentile_fail_just_below_threshold():
+def test_mc_prob_profitable_fail_just_below_threshold():
     threshold_frac = float(DEFAULT_PIPELINE_CONFIG["robustness_thresholds"]["monte_carlo_percentile_min"])
-    samples = [1.0] * 64 + [0.0] * 36
-    rank = _percentile_rank(target=1.0, samples=samples)
-    assert rank == pytest.approx(0.64)
-    assert rank < threshold_frac
+    mc_profitable_min = threshold_frac * 100.0
+    samples = [1.0] * 64 + [-1.0] * 36
+    prob = _prob_profitable(samples)
+    assert prob == pytest.approx(64.0)
+    assert prob < mc_profitable_min  # below the gate → FAIL
 
 
 # --- Param jitter pass rate --------------------------------------------------

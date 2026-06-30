@@ -61,39 +61,63 @@ class RSIMomentumStrategy(BaseStrategy):
             return p["rsi_exit"]
         return self.default_params["rsi_exit"]
 
-    def generate_signal(self, df: pd.DataFrame) -> Signal:
-        from forven.scanner import adx, atr, rsi
+    def generate_signals(self, df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+        """Vectorized twin of ``generate_signal`` — the SINGLE source of entry/exit
+        logic so the backtest and the live/paper scanner trade the identical signal
+        set. ``generate_signal`` delegates here for its boolean decision.
+
+        Entry: RSI crosses up through the oversold threshold while price is above
+        both EMAs and ADX clears its floor. Exit: RSI crosses down through the
+        overbought threshold.
+        """
+        from forven.strategies.indicators import adx, rsi
+
         p = self.params
         close = df["close"]
-        
+        rsi_val = rsi(close, p["rsi_period"])
+        ema_fast = close.ewm(span=p["ema_fast"], adjust=False).mean()
+        ema_slow = close.ewm(span=p["ema_slow"], adjust=False).mean()
+        adx_val = adx(df, p["adx_period"])
+
+        oversold = self._get_oversold()
+        overbought = self._get_overbought()
+
+        prev_rsi = rsi_val.shift(1)
+        trend_ok = (close > ema_fast) & (close > ema_slow)
+        adx_ok = adx_val >= p["adx_min"]
+
+        entry = (prev_rsi < oversold) & (rsi_val >= oversold) & trend_ok & adx_ok
+        exit_ = (prev_rsi >= overbought) & (rsi_val < overbought)
+        return entry.fillna(False), exit_.fillna(False)
+
+    def generate_signal(self, df: pd.DataFrame) -> Signal:
+        from forven.strategies.indicators import adx, atr, rsi
+        p = self.params
+        close = df["close"]
+
         rsi_val = rsi(close, p["rsi_period"])
         ema_fast = close.ewm(span=p["ema_fast"], adjust=False).mean()
         ema_slow = close.ewm(span=p["ema_slow"], adjust=False).mean()
         adx_val = adx(df, p["adx_period"])
         atr_14 = atr(df, 14)
 
+        # Single source of truth for the decision (keeps per-bar and vectorized in lockstep).
+        entries, exits = self.generate_signals(df)
+
         curr_close = float(close.iloc[-1])
         curr_rsi = float(rsi_val.iloc[-1])
-        prev_rsi = float(rsi_val.iloc[-2])
         curr_ema_fast = float(ema_fast.iloc[-1])
         curr_ema_slow = float(ema_slow.iloc[-1])
         curr_adx = float(adx_val.iloc[-1])
         curr_atr = float(atr_14.iloc[-1])
 
-        # Get threshold values using the helper methods that support both param names
         oversold = self._get_oversold()
         overbought = self._get_overbought()
-
         trend_ok = curr_close > curr_ema_fast and curr_close > curr_ema_slow
         adx_ok = curr_adx >= p["adx_min"]
 
-        # Entry: RSI crosses above oversold threshold (from below)
-        entry = prev_rsi < oversold and curr_rsi >= oversold and trend_ok and adx_ok
-        # Exit: RSI crosses below overbought threshold (from above)
-        exit_ = prev_rsi >= overbought and curr_rsi < overbought
-
         return Signal(
-            entry_signal=bool(entry), exit_signal=bool(exit_),
+            entry_signal=bool(entries.iloc[-1]), exit_signal=bool(exits.iloc[-1]),
             price=round(curr_close, 4), direction="long",
             confidence=min(1.0, curr_adx / 40) if adx_ok else 0.0,
             indicators={

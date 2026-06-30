@@ -92,6 +92,9 @@ test-results/
 custom/
 forven/strategies/custom/*
 !forven/strategies/custom/__init__.py
+# Untrusted-origin imported strategies (sandbox-only); modules stay local
+forven/strategies/imported/*
+!forven/strategies/imported/__init__.py
 
 # Root-level ad hoc scripts and exports
 _audit_*.py

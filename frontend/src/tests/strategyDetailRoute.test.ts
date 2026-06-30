@@ -16,6 +16,7 @@ const apiMocks = vi.hoisted(() => ({
 
 const backtestingMocks = vi.hoisted(() => ({
 	getRobustnessResult: vi.fn(),
+	getStrategyOpenPosition: vi.fn(),
 	runCostStressRobustness: vi.fn(),
 	runMonteCarloRobustness: vi.fn(),
 	runParamJitterRobustness: vi.fn(),
@@ -524,8 +525,14 @@ describe('/lab/strategy/[id] backtest history', () => {
 		backtestingMocks.runRegimeSplitRobustness.mockReset();
 		backtestingMocks.runWalkForwardRobustness.mockReset();
 		backtestingMocks.getRobustnessResult.mockReset();
+		backtestingMocks.getStrategyOpenPosition.mockReset();
 		backtestingMocks.submitWalkForwardRobustness.mockReset();
 		backtestingMocks.updateStrategyDefaultParams.mockReset();
+		backtestingMocks.getStrategyOpenPosition.mockResolvedValue({
+			has_open_position: false,
+			count: 0,
+			positions: [],
+		});
 		lifecycleMocks.getGauntletStatus.mockReset();
 		lifecycleMocks.getPaperLiveReadiness.mockReset();
 		lifecycleMocks.getPipelineConfig.mockReset();
@@ -1208,6 +1215,105 @@ describe('/lab/strategy/[id] backtest history', () => {
 		clickByTestId(target, 'backtest-param-overflow-B1001');
 		await waitForCondition(() => target.querySelector('[data-testid="backtest-param-summary-B1001"]')?.textContent?.includes('+4 more') ?? false);
 		expect(target.querySelector('[data-testid="backtest-param-summary-B1001"]')?.textContent).not.toContain('gamma=3');
+	});
+
+	it('pins the active/default Gauntlet run to the top of the history list regardless of sort', async () => {
+		// The pinned run is the OLDER one, so the default created-desc sort would push
+		// it below the newer run. withPinnedFirst must hoist it back to the top.
+		const newer = buildHistoryItem('B_NEW', { created_at: '2026-05-01T00:00:00Z' });
+		const older = buildHistoryItem('B_OLD', { created_at: '2026-01-01T00:00:00Z' });
+		const container = buildContainer([]);
+		(container.history as Record<string, unknown>).backtests = [newer, older];
+		(container.history as Record<string, unknown>).all = [newer, older];
+		(container.strategy as Record<string, unknown>).pinned_backtest_id = 'B_OLD';
+		apiMocks.getStrategyContainer.mockResolvedValue(container);
+
+		app = mount(StrategyDetailPage, { target });
+		await openBacktestHistory(target);
+
+		const rows = Array.from(target.querySelectorAll('[data-testid^="backtest-row-"]'));
+		expect(rows[0]?.getAttribute('data-testid')).toBe('backtest-row-B_OLD');
+		// The active row carries the green inset border and an Active badge.
+		expect(rows[0]?.getAttribute('class') ?? '').toContain('emerald');
+		expect(rows[0]?.textContent).toContain('Active');
+	});
+
+	it('does not flag the active run\'s execution params as changed (no amber chips)', async () => {
+		// The active/pinned run's stored params ARE the strategy default, so every chip —
+		// including execution_profile and leverage that the alpha-param view strips —
+		// must read as unchanged. A genuinely different value still highlights amber.
+		const activeParams = {
+			fast: 12,
+			leverage: 2,
+			execution_profile: { sizing_mode: 'fraction', risk_per_trade: 0.01 },
+		};
+		const container = buildContainer([], { params: activeParams });
+		const active = buildHistoryItem('B_ACTIVE', { config: { params: activeParams } });
+		const other = buildHistoryItem('B_OTHER', {
+			config: { params: { fast: 12, leverage: 5 } },
+		});
+		(container.history as Record<string, unknown>).backtests = [active, other];
+		(container.history as Record<string, unknown>).all = [active, other];
+		(container.strategy as Record<string, unknown>).pinned_backtest_id = 'B_ACTIVE';
+		apiMocks.getStrategyContainer.mockResolvedValue(container);
+
+		app = mount(StrategyDetailPage, { target });
+		await openBacktestHistory(target);
+
+		const activeChips = Array.from(
+			target.querySelectorAll('[data-testid="backtest-param-summary-B_ACTIVE"] span'),
+		);
+		const leverageChip = activeChips.find((chip) => chip.textContent?.includes('leverage=2'));
+		const profileChip = activeChips.find((chip) => chip.textContent?.includes('execution_profile'));
+		expect(leverageChip).toBeTruthy();
+		expect(leverageChip?.getAttribute('class') ?? '').not.toContain('amber');
+		expect(profileChip?.getAttribute('class') ?? '').not.toContain('amber');
+
+		// A run whose leverage differs from the default still flags amber.
+		const otherChips = Array.from(
+			target.querySelectorAll('[data-testid="backtest-param-summary-B_OTHER"] span'),
+		);
+		const otherLeverage = otherChips.find((chip) => chip.textContent?.includes('leverage=5'));
+		expect(otherLeverage?.getAttribute('class') ?? '').toContain('amber');
+	});
+
+	it('marks the Gauntlet Parameters card active (green) when no backtest run is pinned', async () => {
+		// No pinned run => the manually-saved container defaults are the active params,
+		// so the Gauntlet Parameters card surfaces a green Active treatment.
+		const container = buildContainer(['B1001']);
+		apiMocks.getStrategyContainer.mockResolvedValue(container);
+
+		app = mount(StrategyDetailPage, { target });
+		await openBacktestHistory(target);
+
+		const panel = target.querySelector('[data-testid="backtest-parameter-panel"]');
+		expect(panel?.getAttribute('class') ?? '').toContain('emerald');
+		expect(panel?.querySelector('summary')?.textContent).toContain('Active');
+	});
+
+	it('shows execution settings on the Default Parameters card (Configuration tab)', async () => {
+		// The Configuration tab is the default tab. Its Default Parameters card must now
+		// render the shared execution-settings form seeded from the saved execution_profile.
+		const container = buildContainer(['B1001'], {
+			params: {
+				fast: 12,
+				execution_profile: { sizing_mode: 'fraction', risk_per_trade: 0.02, leverage: 3 },
+			},
+		});
+		apiMocks.getStrategyContainer.mockResolvedValue(container);
+
+		app = mount(StrategyDetailPage, { target });
+		await waitForCondition(() => target.textContent?.includes('Default Parameters') ?? false);
+		await waitForCondition(() => target.textContent?.includes('Execution Settings') ?? false);
+
+		expect(target.textContent).toContain('Sizing Mode');
+		// Fraction sizing reveals the Risk Per Trade field.
+		expect(target.textContent).toContain('Risk Per Trade');
+		// The Sizing Mode select reflects the saved execution_profile.
+		const sizingSelect = Array.from(target.querySelectorAll<HTMLSelectElement>('select')).find(
+			(select) => Array.from(select.options).some((option) => option.value === 'fraction'),
+		);
+		expect(sizingSelect?.value).toBe('fraction');
 	});
 
 	it('does not show the params draft as permanently dirty when the strategy has a saved execution_profile', async () => {

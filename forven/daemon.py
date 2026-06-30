@@ -51,7 +51,13 @@ from forven.exchange.risk import (
     update_equity,
 )
 from forven.market_cache import normalize_prices, publish_price_snapshot, publish_candle_snapshot
-from forven.market_data import fetch_hyperliquid_candles, dataframe_to_ohlcv_rows
+from forven.market_data import (
+    fetch_market_candles,
+    fetch_binance_prices,
+    resolve_market_data_source,
+    BinancePriceFeed,
+    dataframe_to_ohlcv_rows,
+)
 from forven.runtime_health import compute_runtime_code_fingerprint
 from forven.system_mode_policy import autonomous_runtime_allowed
 
@@ -256,6 +262,58 @@ def _set_recovery_state(state: dict, **updates) -> dict[str, object]:
     for key, value in payload.items():
         state[key] = value
     return payload
+
+
+def mark_boot_recovery_pending() -> None:
+    """BOOT-1: force the startup-recovery gate CLOSED at process start, BEFORE the
+    scheduler/scanner thread can run a live execution scan.
+
+    A cleanly-exited prior run persists recovery_active=False; without this stamp the
+    scanner (a separate thread that starts with the same delay) could open a live
+    position in the boot window BEFORE the daemon's boot reconcile re-verifies the
+    exchange. The daemon's reconcile clears/re-sets it on the real outcome; a
+    daemon-spawn failure clears it via clear_boot_recovery_pending. Best-effort.
+    """
+    try:
+        raw = kv_get("daemon_state", {}) or {}
+        state = dict(raw) if isinstance(raw, dict) else {}
+        # Leave an already-active genuine operator block (blocked/error) intact.
+        if bool(state.get("recovery_active")) and str(state.get("recovery_status") or "").strip().lower() in {"blocked", "error"}:
+            return
+        _set_recovery_state(
+            state,
+            recovery_active=True,
+            recovery_status="checking",
+            recovery_started_at=_iso_now(),
+            recovery_summary="Startup exchange reconcile pending — new entries blocked until the boot reconcile verifies the exchange.",
+        )
+        kv_set_best_effort("daemon_state", state)
+        log.info("BOOT-1: stamped startup-recovery gate (checking) before runtime threads start.")
+    except Exception as exc:
+        log.warning("Could not stamp boot recovery gate: %s", exc)
+
+
+def clear_boot_recovery_pending(reason: str = "daemon_unavailable") -> None:
+    """Release the BOOT-1 startup-recovery gate when the daemon will NOT run in this
+    process (its boot reconcile would otherwise never clear the 'checking' stamp,
+    wedging paper trading). Only clears a 'checking' stamp — never an operator
+    'blocked'/'error' state."""
+    try:
+        raw = kv_get("daemon_state", {}) or {}
+        state = dict(raw) if isinstance(raw, dict) else {}
+        if str(state.get("recovery_status") or "").strip().lower() != "checking":
+            return
+        _set_recovery_state(
+            state,
+            recovery_active=False,
+            recovery_status=str(reason or "daemon_unavailable"),
+            recovery_last_checked_at=_iso_now(),
+            recovery_summary="Startup recovery gate released (daemon not running this process).",
+        )
+        kv_set_best_effort("daemon_state", state)
+        log.info("BOOT-1: released startup-recovery gate (%s).", reason)
+    except Exception as exc:
+        log.warning("Could not clear boot recovery gate: %s", exc)
 
 
 def publish_recovery_operator_state(state: dict, *, action_key: str = "exchange_recovery") -> dict[str, object]:
@@ -1124,38 +1182,69 @@ def _book_aware_account_value(testnet: bool = True) -> dict | None:
 
         total_val = total_margin = total_ntl = 0.0
         unreliable = False
+        # KS-CACHE-LOG (2026-06-29 false kill-switch): a stale/inflated value in
+        # _BOOK_EQUITY_CACHE silently poisoned the aggregate for hours because the
+        # substitution path was debug-only. Track per-wallet provenance and emit a
+        # LOUD, DURABLE (api.log) evidence line whenever any wallet falls back to
+        # cache or a read fails — so a recurrence can be diagnosed live, BEFORE the
+        # operator restarts (which wipes this in-memory cache and the evidence).
+        substituted = False
+        read_failed = False
+        breakdown: list[str] = []
         for addr in addresses:
             key = (str(addr).strip().lower() if addr else "__master__")
             kwargs = {"account_address": addr} if addr else {}
             raised = False
+            err_reason = ""
             try:
                 acc = get_account_value(testnet=testnet, **kwargs)
                 val = float(acc.get("accountValue", 0) or 0) if isinstance(acc, dict) else 0.0
-            except Exception:
+            except Exception as exc:
                 acc, val, raised = None, 0.0, True
+                err_reason = f"{type(exc).__name__}: {exc}"
             if val > 0:
                 _BOOK_EQUITY_CACHE[key] = val  # last-known-good
                 total_val += val
+                breakdown.append(f"{key}=${val:,.2f}(live)")
                 if isinstance(acc, dict):
                     total_margin += float(acc.get("totalMarginUsed", 0) or 0)
                     total_ntl += float(acc.get("totalNtlPos", 0) or 0)
             else:
+                if raised:
+                    read_failed = True
                 cached = _BOOK_EQUITY_CACHE.get(key)
                 if cached is not None and cached > 0:
                     # Had funds before, now reads 0/failed => transient glitch.
                     # Substitute last-known-good so it can't fake a drawdown.
                     total_val += cached
-                    log.debug("book equity: substituted last-known $%.2f for %s (transient read)", cached, key)
+                    substituted = True
+                    breakdown.append(f"{key}=${cached:,.2f}(CACHED)")
+                    log.warning(
+                        "book equity: SUBSTITUTED cached $%.2f for %s (live read %s) — "
+                        "stale cache can poison the aggregate",
+                        cached, key, err_reason or "returned 0/non-positive",
+                    )
                 elif raised:
                     # Read ERRORED with no history => genuinely unknown; skip tick.
                     unreliable = True
-                # else: read returned 0 with no history => a legitimately EMPTY
-                # account (e.g. master drained, all capital in the sub-accounts).
-                # Count it as $0 — do NOT mark unreliable, or the daemon could
-                # never compute equity for a valid empty-master config.
+                    breakdown.append(f"{key}=ERR({err_reason})")
+                else:
+                    # else: read returned 0 with no history => a legitimately EMPTY
+                    # account (e.g. master drained, all capital in the sub-accounts).
+                    # Count it as $0 — do NOT mark unreliable, or the daemon could
+                    # never compute equity for a valid empty-master config.
+                    breakdown.append(f"{key}=$0(empty)")
         if unreliable or total_val <= 0:
-            log.warning("book-aware equity read incomplete/unreliable this tick; skipping risk update")
+            log.warning(
+                "book-aware equity read incomplete/unreliable this tick; skipping risk update [%s]",
+                ", ".join(breakdown) or "no accounts",
+            )
             return None
+        if substituted or read_failed:
+            log.warning(
+                "book-aware equity used DEGRADED reads: total=$%.2f source=books_aggregate [%s]",
+                total_val, ", ".join(breakdown),
+            )
         return {
             "accountValue": total_val,
             "totalMarginUsed": total_margin,
@@ -1169,7 +1258,7 @@ def _book_aware_account_value(testnet: bool = True) -> dict | None:
         return None
 
 
-def _check_liquidation_distances() -> None:
+def _check_liquidation_distances() -> dict:
     """H7: warn the operator when any OPEN position drifts toward liquidation.
 
     The only margin gate today is at OPEN time (80%); nothing watches an open
@@ -1177,7 +1266,14 @@ def _check_liquidation_distances() -> None:
     (master + direction sub-accounts) each tick and alerts (throttled via the
     notification cooldown) at warn / critical distance thresholds. Best-effort —
     never raises into the risk loop.
+
+    Also returns a compact {"ASSET:direction": {...}} snapshot of the exchange's
+    reported mark / unrealized PnL / entry for every open position, so the live
+    session view can show the authoritative exchange P&L without issuing its own
+    (WS-starving) exchange call — it reuses the positions this sweep already fetches.
+    Returns {} on any failure.
     """
+    snapshot: dict[str, dict] = {}
     try:
         from forven.db import kv_get
         from forven.exchange import books
@@ -1222,6 +1318,20 @@ def _check_liquidation_distances() -> None:
                     continue
                 if not coin or szi == 0 or mark <= 0:
                     continue
+                # Record the exchange's authoritative position economics for the live
+                # session view (keyed by asset+direction; last account wins on a dup).
+                try:
+                    direction = "long" if szi > 0 else "short"
+                    snapshot[f"{coin}:{direction}"] = {
+                        "asset": coin,
+                        "direction": direction,
+                        "mark_price": mark,
+                        "entry_price": (float(pos.get("entryPx") or 0) or None),
+                        "unrealized_pnl": float(pos.get("unrealizedPnl") or 0),
+                        "size": abs(szi),
+                    }
+                except Exception:
+                    pass
                 if liq <= 0:
                     # Hyperliquid omits per-position liquidationPx for cross-margin
                     # positions (the liq price is account-wide). We can't compute a
@@ -1258,6 +1368,7 @@ def _check_liquidation_distances() -> None:
                     pass
     except Exception as exc:
         log.debug("Liquidation-distance check failed: %s", exc)
+    return snapshot
 
 
 async def _run_risk_cycle() -> dict:
@@ -1383,8 +1494,27 @@ async def _run_risk_cycle() -> dict:
 
 
 async def _run_tick(state: dict, prices: dict[str, float], source: str, last_reconcile: list[float]) -> None:
-    """One daemon tick: publish prices, enforce risk, reconcile periodically."""
+    """One daemon tick: publish prices FIRST (fresh), then enforce risk, reconcile periodically."""
     now = time.time()
+
+    # PRICE-FRESHNESS: publish the snapshot IMMEDIATELY, before the (possibly slow) risk cycle and
+    # liquidation reads. publish_price_snapshot stamps updated_at at PUBLISH time, so doing it at
+    # the END of a slow tick stamped a now-stale price as fresh — the consumers' 120s age gate is
+    # blind to that (a ~6-min-old mark read as ~3s old, which filled a paper short ~$80 off the
+    # candle). Publishing first keeps the value contemporaneous with its timestamp, and if a tick
+    # DOES stall the timestamp simply ages (so the gate can finally see the staleness).
+    snapshot = await _to_thread_with_timeout(
+        "daemon.publish_price_snapshot",
+        PRICE_SNAPSHOT_TIMEOUT_SECONDS,
+        publish_price_snapshot,
+        prices,
+        source,
+    )
+    if not isinstance(snapshot, dict):
+        snapshot = {"prices": prices}
+    state["last_prices"] = dict(snapshot.get("prices") or prices)
+    state["last_price_source"] = source
+    state["last_tick_ts"] = now
 
     risk_snapshot = await _run_risk_cycle()
 
@@ -1397,11 +1527,17 @@ async def _run_tick(state: dict, prices: dict[str, float], source: str, last_rec
     if now - _LAST_LIQ_CHECK[0] >= LIQ_CHECK_INTERVAL_SECONDS:
         _LAST_LIQ_CHECK[0] = now
         try:
-            await _to_thread_with_timeout(
+            positions_snapshot = await _to_thread_with_timeout(
                 "daemon.liquidation_check",
                 RISK_ACCOUNT_TIMEOUT_SECONDS,
                 _check_liquidation_distances,
             )
+            # Cache the exchange's reported mark / unrealized PnL per position so the
+            # live session view shows the authoritative exchange P&L (refreshed on
+            # this 60s cadence) without its own exchange round-trip.
+            if isinstance(positions_snapshot, dict):
+                state["exchange_positions"] = positions_snapshot
+                state["exchange_positions_synced_at"] = _iso_now()
         except Exception:
             pass
 
@@ -1409,19 +1545,7 @@ async def _run_tick(state: dict, prices: dict[str, float], source: str, last_rec
     # Backward compatibility with legacy UI that still reads scan_count.
     state["scan_count"] = state["tick_count"]
     state["last_scan"] = _iso_now()
-    state["last_price_source"] = source
-    state["last_tick_ts"] = now
 
-    snapshot = await _to_thread_with_timeout(
-        "daemon.publish_price_snapshot",
-        PRICE_SNAPSHOT_TIMEOUT_SECONDS,
-        publish_price_snapshot,
-        prices,
-        source,
-    )
-    if not isinstance(snapshot, dict):
-        snapshot = {"prices": prices}
-    state["last_prices"] = dict(snapshot.get("prices") or prices)
     if isinstance(risk_snapshot, dict):
         equity = risk_snapshot.get("equity")
         if isinstance(equity, (int, float)) and float(equity) > 0:
@@ -1551,9 +1675,9 @@ async def _refresh_candle_cache(state: dict) -> None:
     for coin in _active_coins():
         try:
             df = await _to_thread_with_timeout(
-                f"daemon.fetch_hyperliquid_candles.{coin}",
+                f"daemon.fetch_market_candles.{coin}",
                 CANDLE_FETCH_TIMEOUT_SECONDS,
-                fetch_hyperliquid_candles,
+                fetch_market_candles,  # source-aware: Binance by default
                 coin,
                 bars=CANDLE_CACHE_BARS,
                 interval="1h",
@@ -1653,7 +1777,12 @@ async def async_market_loop(state: dict):
     feeder: asyncio.Task | None = None
 
     async def _start_market_workers() -> tuple[asyncio.Task, asyncio.Task]:
-        feed = HyperLiquidFeed(coins=_active_coins, on_price=on_price)
+        # Source-aware price feed: Binance (the lead exchange) by default so paper
+        # marking/display uses REAL Binance prices, not HyperLiquid testnet.
+        if resolve_market_data_source() == "binance":
+            feed = BinancePriceFeed(coins=_active_coins, on_price=on_price)
+        else:
+            feed = HyperLiquidFeed(coins=_active_coins, on_price=on_price)
         return (
             spawn(_price_consumer(price_queue, state), name="daemon-price-consumer"),
             spawn(feed.start(), name="daemon-feed"),
@@ -1707,12 +1836,20 @@ async def async_market_loop(state: dict):
                     and now - last_fallback_poll >= PRICE_FALLBACK_POLL_INTERVAL
                 ):
                     try:
-                        mids = await _to_thread_with_timeout(
-                            "daemon.get_all_mids.fallback",
-                            FALLBACK_MIDS_TIMEOUT_SECONDS,
-                            get_all_mids,
-                            _get_testnet(),
-                        )
+                        if resolve_market_data_source() == "binance":
+                            mids = await _to_thread_with_timeout(
+                                "daemon.fetch_binance_prices.fallback",
+                                FALLBACK_MIDS_TIMEOUT_SECONDS,
+                                fetch_binance_prices,
+                                _active_coins(),
+                            )
+                        else:
+                            mids = await _to_thread_with_timeout(
+                                "daemon.get_all_mids.fallback",
+                                FALLBACK_MIDS_TIMEOUT_SECONDS,
+                                get_all_mids,
+                                _get_testnet(),
+                            )
                         if isinstance(mids, dict):
                             await enqueue_price("poll", mids)
                     except Exception as e:

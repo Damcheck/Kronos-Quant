@@ -16,6 +16,7 @@ const apiMocks = vi.hoisted(() => ({
 }));
 
 const backtestingMocks = vi.hoisted(() => ({
+	getStrategyOpenPosition: vi.fn(),
 	updateStrategyDefaultParams: vi.fn(),
 }));
 
@@ -262,6 +263,12 @@ describe('Strategy detail promotion readiness routing', () => {
 		apiMocks.submitBacktest.mockReset();
 		apiMocks.submitOptimization.mockReset();
 		backtestingMocks.updateStrategyDefaultParams.mockReset();
+		backtestingMocks.getStrategyOpenPosition.mockReset();
+		backtestingMocks.getStrategyOpenPosition.mockResolvedValue({
+			has_open_position: false,
+			count: 0,
+			positions: [],
+		});
 		toastMocks.addToast.mockReset();
 		apiMocks.getDatasets.mockResolvedValue([]);
 		apiMocks.getPipelineSettings.mockResolvedValue(pipelineSettings);

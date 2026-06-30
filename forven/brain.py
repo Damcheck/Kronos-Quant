@@ -20,6 +20,7 @@ from forven.context import build_brain_context
 from forven.model_routing import get_primary_provider_model
 from forven.db import (
     get_db, kv_get, kv_set, log_activity,
+    live_equity_baseline_kv_key,
     get_open_trades, append_strategy_event,
     append_audit_summary,
     create_approval,
@@ -56,7 +57,10 @@ STAGE_TO_AGENT = {
     "research_only": "strategy-developer",
     "gauntlet": "simulation-agent",
     "paper": "risk-manager",
-    "live_graduated": "execution-trader",
+    # Live execution is automated by the scanner's parity kernel; the retired
+    # execution-trader agent no longer exists, so live oversight ownership falls
+    # to risk-manager (which already owns paper + live risk/allocation).
+    "live_graduated": "risk-manager",
     "archived": None,
     "rejected": None,
 }
@@ -518,7 +522,11 @@ def _normalize_strategy_owner(value: str | None) -> str | None:
         return "brain"
     if normalized == "backtest-engineer":
         return "simulation-agent"
-    if normalized in {"quant-researcher", "strategy-developer", "simulation-agent", "risk-manager", "execution-trader", "ceo", "brain"}:
+    # execution-trader is retired; carry its historical ownerships forward to
+    # risk-manager (which now owns live oversight).
+    if normalized == "execution-trader":
+        return "risk-manager"
+    if normalized in {"quant-researcher", "strategy-developer", "simulation-agent", "risk-manager", "ceo", "brain"}:
         return normalized
     return None
 
@@ -1148,6 +1156,9 @@ def _record_strategy_handoff_event(
                 "controller": "brain",
             },
             idempotency_key=f"brain-handoff:{strategy_id}:{from_owner}:{to_owner}:{to_status}",
+            # Canonical lifecycle path: authorized to record a stage-change event
+            # (the out-of-band tripwire in append_strategy_event refuses unauthorized ones).
+            _lifecycle_authorized=True,
         )
     except Exception as exc:
         log.warning("Failed to append strategy handoff event for %s: %s", strategy_id, exc)
@@ -1949,6 +1960,39 @@ def transition_stage(
             log.warning("Failed to queue post-mortem task for %s: %s", strategy_id, exc)
 
     log.info("Stage transition %s: %s -> %s", strategy_id, current_stage, normalized_target)
+
+    # Live go-live equity baseline: stamp the REAL Hyperliquid account equity at the
+    # moment a strategy graduates to live, so its live "Capital" card reports a true
+    # return % against the equity it actually deployed against — not the fabricated
+    # $10k paper sandbox base. Done AFTER the write transaction closes (kv_set opens
+    # its own connection and would self-deadlock against the held WAL writer lock if
+    # called inside the `with get_db()` block above). Best-effort and idempotent:
+    # reads only the cached daemon snapshot (no exchange round-trip), stamps only a
+    # genuine exchange value, and never overwrites an existing baseline (re-graduation
+    # preserves the original deploy basis).
+    if normalized_target == "live_graduated":
+        try:
+            baseline_key = live_equity_baseline_kv_key(strategy_id)
+            if not kv_get(baseline_key, None):
+                daemon_state = kv_get("daemon_state", {}) or {}
+                exch = daemon_state.get("exchange_account")
+                exch = exch if isinstance(exch, dict) else {}
+                source = str(exch.get("source") or "").strip().lower()
+                equity_raw = exch.get("accountValue")
+                if equity_raw is None:
+                    equity_raw = daemon_state.get("account_equity")
+                try:
+                    equity_f = float(equity_raw) if equity_raw is not None else 0.0
+                except (TypeError, ValueError):
+                    equity_f = 0.0
+                if equity_f > 0 and source in {"exchange", "books_aggregate"}:
+                    kv_set(baseline_key, {"equity": equity_f, "source": source, "stamped_at": now})
+                    log.info(
+                        "Stamped live go-live equity baseline for %s: $%.2f (%s)",
+                        strategy_id, equity_f, source,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Failed to stamp live equity baseline for %s: %s", strategy_id, exc)
 
     # P1-T07: backfill brain_decisions.outcome_observed when this transition
     # is terminal. Best-effort — never let a missing decision link block the

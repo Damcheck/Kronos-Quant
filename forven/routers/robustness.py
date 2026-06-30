@@ -735,7 +735,14 @@ def _jitter_param_value(value: object, factor: float) -> object:
     jittered = float(value) * float(factor)
     if isinstance(value, int) and not isinstance(value, bool):
         minimum = 1 if value > 0 else 0
-        return max(minimum, int(round(jittered)))
+        rounded = int(round(jittered))
+        if rounded == value and factor != 1.0:
+            # A small integer param (e.g. <= 4) rounds back to itself under a ±10%
+            # jitter, making the rerun byte-identical to the baseline and trivially
+            # "stable" — which inflates the jitter pass-rate. Force at least a ±1 step in
+            # the draw's direction so the perturbation actually bites.
+            rounded = value + (1 if factor > 1.0 else -1)
+        return max(minimum, rounded)
     return float(jittered)
 
 
@@ -1000,7 +1007,11 @@ def _run_monte_carlo_analysis(body: MonteCarloBody) -> dict:
         max_drawdowns.append(float(np.nanmax(drawdown_pct)) if drawdown_pct.size else 0.0)
 
         if len(sampled) > 1 and np.std(sampled) > 0:
-            sharpes.append(float(np.mean(sampled) / np.std(sampled) * np.sqrt(252)))
+            # Per-TRADE Sharpe of the bootstrapped path. (Was * sqrt(252), which
+            # annualizes as if these were daily returns — they are per-trade returns at
+            # an arbitrary frequency, so the 252 factor was a meaningless scale. This is
+            # a diagnostic only; the MC verdict uses prob_profitable + the drawdown cap.)
+            sharpes.append(float(np.mean(sampled) / np.std(sampled)))
         else:
             sharpes.append(0.0)
 
@@ -1249,11 +1260,29 @@ def _run_param_jitter_analysis(body: ParamJitterBody, *, outer_budget_s: float |
     # within `allowed_degradation` of the original. Fall back to the positive rate only
     # when the baseline Sharpe is non-positive (no meaningful level to degrade from).
     allowed_degradation = float(robustness_cfg.get("param_jitter_max_degradation", 0.5))
-    jitter_pass_rate = _jitter_pass_rate(sharpes_arr, original_sharpe, allowed_degradation)
+    # Reference Sharpe for the degradation test = an UNPERTURBED rerun over the SAME
+    # (capped) window the jitter reruns used — NOT the persisted full-window
+    # original_sharpe. When the baseline window exceeds the rerun cap, comparing jittered
+    # reruns (short window) against the full-window Sharpe confounds window-sensitivity
+    # with parameter-sensitivity. cost_stress already anchors to a same-window baseline;
+    # this gives param_jitter the same apples-to-apples reference. Falls back to
+    # original_sharpe if the unperturbed rerun fails.
+    reference_sharpe = original_sharpe
+    try:
+        _ref_run = _rerun(dict(base_params))
+        if isinstance(_ref_run, dict) and not _ref_run.get("error"):
+            _ref_metrics = _ref_run.get("metrics") if isinstance(_ref_run.get("metrics"), dict) else {}
+            reference_sharpe = _coerce_float(
+                _ref_metrics.get("sharpe_ratio", _ref_metrics.get("sharpe")), original_sharpe
+            )
+    except Exception:
+        reference_sharpe = original_sharpe
+    jitter_pass_rate = _jitter_pass_rate(sharpes_arr, reference_sharpe, allowed_degradation)
     return {
         "method": "rerun_parameter_jitter",
         "strategy_type": strategy_type,
         "original_sharpe": round(original_sharpe, 3),
+        "reference_sharpe": round(reference_sharpe, 3),
         "original_return": round(original_return, 3),
         "n_iterations": n_iters,
         "iterations_completed": len(iterations),
@@ -1507,28 +1536,38 @@ def _run_regime_split_analysis(body: RegimeSplitBody) -> dict:
         )
 
     regimes.sort(key=lambda item: item["trade_count"], reverse=True)
-    # Profitable now measured in return space.
-    profitable_regimes = sum(1 for item in regimes if item["total_return_pct"] > 0)
-    dominant_regime = max(regimes, key=lambda item: item["trade_count"])["name"] if regimes else "UNKNOWN"
-    weakest_regime = min(regimes, key=lambda item: item["win_rate"])["name"] if regimes else "UNKNOWN"
-
-    n_classified = int(sum(item["trade_count"] for item in regimes))
-    classified_ratio = n_classified / len(trades) if trades else 0.0
 
     from forven.policy import load_pipeline_config
 
     robustness_cfg = load_pipeline_config().get("robustness_thresholds", {})
     profitable_min = float(robustness_cfg.get("regime_split_profitable_min", 0.50))
+    min_trades_per_regime = max(int(robustness_cfg.get("regime_split_min_trades_per_regime", 5) or 0), 1)
+
+    # Only regimes with enough trades count toward the diversity verdict. A regime
+    # holding a single (statistically meaningless) trade must NOT satisfy the ≥2-regime
+    # gate or dilute the profitable-share — that let a near-single-regime strategy pass.
+    # Under-populated regimes are surfaced for display but not counted.
+    scored_regimes = [r for r in regimes if r["trade_count"] >= min_trades_per_regime]
+    dropped_regimes = [r["name"] for r in regimes if r["trade_count"] < min_trades_per_regime]
+
+    # Profitable measured in return space, over the QUALIFYING regimes only.
+    profitable_regimes = sum(1 for item in scored_regimes if item["total_return_pct"] > 0)
+    dominant_regime = max(regimes, key=lambda item: item["trade_count"])["name"] if regimes else "UNKNOWN"
+    _weakest_pool = scored_regimes or regimes
+    weakest_regime = min(_weakest_pool, key=lambda item: item["win_rate"])["name"] if _weakest_pool else "UNKNOWN"
+
+    n_classified = int(sum(item["trade_count"] for item in regimes))
+    classified_ratio = n_classified / len(trades) if trades else 0.0
 
     # Verdict: require BOTH
-    #   (a) at least `profitable_min` share of regimes profitable, AND
-    #   (b) strategy traded in ≥2 regimes (single-regime strategies cannot claim diversity).
-    # If only one regime was observed, surface it as a warning — don't pass it on a vacuous majority.
-    profitable_share = (profitable_regimes / len(regimes)) if regimes else 0.0
+    #   (a) at least `profitable_min` share of QUALIFYING regimes profitable, AND
+    #   (b) ≥2 QUALIFYING regimes (single-regime strategies cannot claim diversity).
+    profitable_share = (profitable_regimes / len(scored_regimes)) if scored_regimes else 0.0
     verdict_reasons: list[str] = []
-    if len(regimes) < 2:
+    if len(scored_regimes) < 2:
         verdict_reasons.append(
-            f"only {len(regimes)} regime observed; need ≥2 to claim regime diversity"
+            f"only {len(scored_regimes)} regime(s) with ≥{min_trades_per_regime} trades; "
+            "need ≥2 to claim regime diversity"
         )
     if profitable_share < profitable_min:
         verdict_reasons.append(
@@ -1543,7 +1582,10 @@ def _run_regime_split_analysis(body: RegimeSplitBody) -> dict:
         "unresolved_trades": unresolved_trades,
         "unresolved_reasons": dict(unresolved_reasons),
         "classified_ratio": round(classified_ratio, 3),
-        "n_regimes": len(regimes),
+        "n_regimes": len(scored_regimes),
+        "n_regimes_observed": len(regimes),
+        "dropped_low_trade_regimes": dropped_regimes,
+        "regime_min_trades": min_trades_per_regime,
         "regimes": regimes,
         "dominant_regime": dominant_regime,
         "weakest_regime": weakest_regime,

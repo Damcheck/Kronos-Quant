@@ -41,37 +41,58 @@ class FundingStrategy(BaseStrategy):
             f"Exits when funding normalizes."
         )
 
+    def generate_signals(self, df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+        """Vectorized twin of ``generate_signal`` — the SINGLE source of entry/exit
+        logic so the backtest and the live/paper scanner trade the identical signal
+        set. ``generate_signal`` delegates here for its boolean decision.
+
+        Entry: the funding rate is extremely negative (below ``-entry_threshold``)
+        while price is above the 200-EMA regime filter. Exit: funding normalizes
+        back above ``-exit_threshold``. When no ``funding_rate`` column is present
+        there is nothing to vectorize, so the signals are all-False — matching the
+        per-bar method's neutral return when funding data is unavailable.
+        """
+        p = self.params
+        close = df["close"]
+        entry_threshold = p.get("entry_threshold", 0.00003)
+        exit_threshold = p.get("exit_threshold", 0.00001)
+
+        if "funding_rate" not in df.columns:
+            empty = pd.Series(False, index=df.index)
+            return empty, empty.copy()
+
+        ema200 = close.ewm(span=200, adjust=False).mean()
+        funding = df["funding_rate"]
+        regime_ok = close > ema200
+
+        entry = (funding < -entry_threshold) & regime_ok
+        exit_ = funding > -exit_threshold
+        return entry.fillna(False), exit_.fillna(False)
+
     def generate_signal(self, df: pd.DataFrame) -> Signal:
-        """Funding rate mean reversion - uses df['funding_rate'] if available (backtest) or fetches live."""
-        from forven.scanner import atr
+        """Funding rate mean reversion — reads df['funding_rate'] (enriched by the
+        parent: scanner/backtest add it by asset). Neutral when the column is absent."""
+        from forven.strategies.indicators import atr
 
         p = self.params
         close = df["close"]
         ema200 = close.ewm(span=200, adjust=False).mean()
         atr_14 = atr(df, 14)
-        
+
         curr_close = float(close.iloc[-1])
         curr_ema200 = float(ema200.iloc[-1])
         curr_atr = float(atr_14.iloc[-1])
-        
-        # Use pre-computed funding_rate from dataframe if available (backtest mode)
-        # Otherwise fall back to live funding rate (live trading mode)
+
+        # Funding comes from the parent-enriched ``funding_rate`` column — the scanner
+        # and backtest both enrich it by asset before delegating. A strategy must not
+        # fetch its own market data: that breaks backtest/live parity and is denied in
+        # the isolated worker anyway (R3 — forven.strategies.sentiment is no longer on
+        # the untrusted import allowlist). When the column is absent there is simply no
+        # funding signal, so fall through to the neutral return below.
         funding = None
         if "funding_rate" in df.columns:
-            # Backtest mode - use pre-computed funding rates
             funding = float(df["funding_rate"].iloc[-1])
-        else:
-            # Live mode - try to fetch live funding rate
-            try:
-                from forven.strategies.sentiment import fetch_funding_rates
-                funding_map = fetch_funding_rates()
-                if isinstance(funding_map, dict):
-                    funding_payload = funding_map.get(self.asset)
-                    if isinstance(funding_payload, dict) and "funding" in funding_payload:
-                        funding = float(funding_payload.get("funding", 0.0))
-            except Exception:
-                pass
-        
+
         # If no funding data available, return neutral signal
         if funding is None:
             return Signal(
@@ -79,17 +100,20 @@ class FundingStrategy(BaseStrategy):
                 direction="long",
                 indicators={"funding": 0, "ema200": round(curr_ema200, 4), "atr_14": round(curr_atr, 6), "adx": 0},
             )
-        
+
         regime_ok = curr_close > curr_ema200
 
-        entry_threshold = p.get("entry_threshold", 0.00003)
-        exit_threshold = p.get("exit_threshold", 0.00001)
-
-        entry = funding < -entry_threshold and regime_ok
-        exit_ = funding > -exit_threshold
+        # Single source of truth for the decision (keeps per-bar and vectorized in
+        # lockstep). In live mode the funding rate comes from a live fetch rather
+        # than a df column, so inject it before delegating to the vectorized twin.
+        signal_df = df
+        if "funding_rate" not in df.columns:
+            signal_df = df.copy()
+            signal_df["funding_rate"] = funding
+        entries, exits = self.generate_signals(signal_df)
 
         return Signal(
-            entry_signal=bool(entry), exit_signal=bool(exit_),
+            entry_signal=bool(entries.iloc[-1]), exit_signal=bool(exits.iloc[-1]),
             price=round(curr_close, 4), direction="long",
             indicators={
                 "funding": funding,

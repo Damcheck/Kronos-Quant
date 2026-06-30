@@ -213,6 +213,18 @@ def _using_pyarrow() -> bool:
     return pa is not None and pq is not None
 
 
+def _require_pyarrow_for_lake():
+    """SECURITY (P3.5 / audit L7): the OHLCV lake is parquet. NEVER fall back to
+    ``pd.read_pickle`` / ``to_pickle`` — a planted pickle file deserializes into
+    arbitrary code execution, and (per ``forven.dataeng.revisions``) the lake must
+    never be a pickle source. ``pyarrow`` is a hard dependency (pyproject.toml), so a
+    missing pyarrow is a broken install, not a supported mode: fail closed."""
+    raise RuntimeError(
+        "pyarrow is required for OHLCV lake I/O; refusing the insecure pickle "
+        "fallback (P3.5 — a malicious pickle would execute arbitrary code)"
+    )
+
+
 def _timeframe_to_ms(timeframe: str) -> int:
     normalized = str(timeframe or "").strip()
     if normalized in TIMEFRAME_MS:
@@ -316,9 +328,34 @@ def dataset_market_type(asset_class: str) -> str:
     return normalized or "unknown"
 
 
+def _assert_safe_dataset_component(label: str, comp: str) -> str:
+    """P3.1: a dataset path component must not be able to escape DATA_DIR. ``timeframe``
+    is interpolated into the filename raw, and ``symbol_to_fs`` (to_fs) only swaps
+    ``/``/``_``→``-`` + uppercases — it does NOT strip ``..``, ``\\`` or ``:`` — so a
+    crafted symbol/timeframe is a path-traversal write-/read-anywhere primitive (CSV
+    upload, dataset read). Reject separators / traversal / leading dots; a single dot in
+    the middle (e.g. ``BRK.B``) stays allowed."""
+    comp = str(comp or "").strip()
+    if (
+        not comp
+        or len(comp) > 64
+        or comp.startswith(".")
+        or comp in (".", "..")
+        or any(bad in comp for bad in ("/", "\\", "..", ":", "\x00"))
+    ):
+        raise ValueError(f"invalid dataset {label}: {comp!r}")
+    return comp
+
+
 def parquet_path(symbol: str, timeframe: str) -> Path:
-    fs_symbol = symbol_to_fs(symbol)
-    return DATA_DIR / fs_symbol / f"{timeframe}.parquet"
+    fs_symbol = _assert_safe_dataset_component("symbol", symbol_to_fs(symbol))
+    tf = _assert_safe_dataset_component("timeframe", timeframe)
+    # Hard backstop: even if a component slips past the charset checks, resolve() and
+    # assert the final path stays under DATA_DIR before any read/write touches it.
+    path = (DATA_DIR / fs_symbol / f"{tf}.parquet").resolve()
+    if not path.is_relative_to(DATA_DIR.resolve()):
+        raise ValueError(f"dataset path escapes the data directory: {symbol!r}/{timeframe!r}")
+    return path
 
 
 def _data_engine_read_enabled() -> bool:
@@ -391,7 +428,7 @@ def load_parquet(symbol: str, timeframe: str, *, as_of: object | None = None) ->
                 raise RuntimeError(
                     "pyarrow is required to read parquet-backed OHLCV datasets in this environment"
                 )
-        frame = _normalize_ohlcv_frame(pd.read_pickle(path))
+        _require_pyarrow_for_lake()
     if as_of is not None:
         try:
             from forven.dataeng.revisions import reconstruct_as_of
@@ -432,7 +469,7 @@ def save_parquet(df: pd.DataFrame, symbol: str, timeframe: str, source: str = "c
         out.attrs["forven_symbol"] = symbol_to_fs(symbol)
         out.attrs["forven_timeframe"] = str(timeframe)
         out.attrs["forven_updated_at"] = _now_iso()
-        out.to_pickle(tmp_path)
+        _require_pyarrow_for_lake()
     os.replace(str(tmp_path), str(path))
     _invalidate_catalog_cache()
 
@@ -482,7 +519,7 @@ def dataset_last_timestamp_ms(symbol: str, timeframe: str) -> int | None:
             # Statistics absent — single-column load (still far cheaper than a full read).
             series = pq.read_table(path, columns=["timestamp"]).to_pandas()["timestamp"]
         else:
-            series = pd.read_pickle(path)["timestamp"]
+            _require_pyarrow_for_lake()
         ts = _as_utc_timestamp(pd.Series(series)).dropna().sort_values()
         if len(ts):
             return int(ts.iloc[-1].timestamp() * 1000)
@@ -572,9 +609,7 @@ def get_dataset_source(symbol: str, timeframe: str) -> str | None:
             keyvals = pq.read_metadata(path).metadata or {}
             raw = keyvals.get(b"forven_source")
             return raw.decode("utf-8", errors="ignore") if raw else None
-        frame = pd.read_pickle(path)
-        src = frame.attrs.get("forven_source")
-        return str(src) if src else None
+        _require_pyarrow_for_lake()
     except Exception:
         return None
 
@@ -659,7 +694,7 @@ def _series_row_count(symbol: str, timeframe: str) -> int:
             return 0
         if _using_pyarrow():
             return int(pq.read_metadata(path).num_rows or 0)
-        return len(pd.read_pickle(path))
+        _require_pyarrow_for_lake()
     except Exception:
         return 0
 
@@ -835,16 +870,7 @@ def _dataset_from_file(path: Path, symbol: str, timeframe: str) -> dict[str, Any
                 start = _to_iso(ts.iloc[0]) if len(ts) else None
                 end = _to_iso(ts.iloc[-1]) if len(ts) else None
     else:
-        frame = _normalize_ohlcv_frame(pd.read_pickle(path))
-        rows = len(frame)
-        source_name = str(frame.attrs.get("forven_source") or "ccxt")
-        if rows == 0:
-            start = None
-            end = None
-        else:
-            ts = _as_utc_timestamp(frame["timestamp"]).dropna().sort_values()
-            start = _to_iso(ts.iloc[0]) if len(ts) else None
-            end = _to_iso(ts.iloc[-1]) if len(ts) else None
+        _require_pyarrow_for_lake()
 
     asset_class = classify_dataset_asset_class(symbol, source_name)
     return {

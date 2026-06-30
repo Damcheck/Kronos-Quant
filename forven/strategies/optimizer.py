@@ -182,6 +182,18 @@ def _objective_value(metrics: dict, objective: str | None) -> float:
     if normalized == "total_return_pct":
         return _finite_metric(metrics, "total_return_pct", "total_return", "pnl_pct")
     if normalized == "profit_factor":
+        # An all-wins trial has profit_factor == inf; _finite_metric would drop the
+        # non-finite value and fall to -inf, ranking the genuine BEST trial LAST. Map a
+        # positive-infinite PF to a large finite sentinel so a zero-loss trial wins the
+        # maximization (it is the best by this objective).
+        raw_pf = metrics.get("profit_factor", metrics.get("pf"))
+        try:
+            if metrics.get("profit_factor_is_infinite") or (
+                raw_pf is not None and math.isinf(float(raw_pf)) and float(raw_pf) > 0
+            ):
+                return 1e9
+        except (TypeError, ValueError):
+            pass
         return _finite_metric(metrics, "profit_factor", "pf")
     if normalized == "win_rate":
         return _finite_metric(metrics, "win_rate", "win_rate_pct")
@@ -589,6 +601,14 @@ def grid_search(
     if overall_timeout_message:
         log.warning("Grid search %s returning partial results after timeout: %s", strategy_id, overall_timeout_message)
 
+    # Record the ACTUAL number of param combinations evaluated (after feasibility cap /
+    # LHS sampling). This is the true selection breadth the Deflated-Sharpe deflation
+    # must use — persisting the caller's requested n_trials (often None→50) understates
+    # it and inflates the DSR.
+    for r in results:
+        if isinstance(r, dict):
+            r["trials_evaluated"] = len(combos)
+
     return results[:TOP_N]
 
 
@@ -725,14 +745,20 @@ def optimize_strategy(
         best.get("execution_controls") or {},
     )
 
-    # Step 2: WFA validation on best params (cap at 1440 bars = 60 days @ 1h)
+    # Step 2: WFA validation on best params (cap at 1440 bars = 60 days @ 1h).
     wfa_bars = min(bars, 1440)
     best_full_params = best.get("full_params") if isinstance(best.get("full_params"), dict) else best["params"]
     best_execution_controls = best.get("full_execution_controls") if isinstance(best.get("full_execution_controls"), dict) else exec_controls
-    try:
-        wfa_leverage = float(leverage if leverage is not None else best_full_params.get("leverage", 3.0))
-    except (TypeError, ValueError):
-        wfa_leverage = 3.0
+    # Size the fold count so each in-sample slice clears the worker's warmup+min-eval
+    # floor (split_size * in_sample_pct >= warmup(210)+min_eval(20)). The default 5 folds
+    # over 1440 bars give 288-bar windows → 201-bar IS slices < 230 → EVERY fold is
+    # skipped and the WFA mis-reports a robustness FAIL, which then rejected every
+    # optimization candidate at the acceptance precheck. >= 2 folds required for a valid WFA.
+    _WFA_MIN_WINDOW = 330  # ceil((210 + 20) / 0.7)
+    wfa_folds = max(2, min(5, wfa_bars // _WFA_MIN_WINDOW))
+    from forven.strategies.backtest import resolve_leverage as _resolve_leverage
+
+    wfa_leverage = _resolve_leverage(best_full_params, explicit=leverage)
     try:
         wfa_result = walk_forward(
             strategy_id=f"{strategy_id}-opt-best",
@@ -740,6 +766,7 @@ def optimize_strategy(
             strategy_type=strategy_type,
             params=best_full_params,
             total_bars=wfa_bars,
+            n_splits=wfa_folds,
             timeframe=timeframe,
             start_date=start_date,
             end_date=end_date,
@@ -784,7 +811,9 @@ def optimize_strategy(
         "wfa_verdict": wfa_result.get("verdict", "N/A"),
         "wfa_degradation": wfa_result.get("degradation", None),
         "validated": wfa_pass,
-        "n_trials": n_trials,
+        # The genuine selection breadth = combos actually evaluated (for the DSR
+        # deflation), falling back to the caller's requested budget.
+        "n_trials": int(best.get("trials_evaluated") or 0) or n_trials,
         "top_results": grid_results[:3],
     }
 
@@ -956,6 +985,20 @@ def _get_param_space(strategy_id: str, strategy_type: str, base_params: dict) ->
     """Get parameter space for optimization from strategy class or defaults."""
     base_params = base_params if isinstance(base_params, dict) else {}
     resolved_strategy_obj = None
+
+    # Untrusted-origin (sandbox-only) strategies are never introspected in the parent
+    # (the real class is absent), but their parameter_space() was captured by the worker
+    # at import and stored under _parameter_space. Use it so imported strategies CAN be
+    # tuned — each candidate is evaluated through the worker like any other sandbox-only
+    # execution. Fall back to an empty space (evaluate the author's stored params as-is)
+    # when none was recorded. Never fall through to the in-parent custom-module scan.
+    from forven.strategies.sandbox_proxy import is_sandbox_only_type
+
+    if is_sandbox_only_type(strategy_type):
+        stored_space = base_params.get("_parameter_space")
+        if isinstance(stored_space, dict) and stored_space:
+            return stored_space
+        return {}
 
     # Try registry class first
     try:

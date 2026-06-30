@@ -2,8 +2,8 @@
 
 import pandas as pd
 
-from forven.strategies.base import BaseStrategy, Signal
-from forven.scanner import atr, stochastic
+from forven.strategies.base import BaseStrategy, DirectionalSignals, Signal
+from forven.strategies.indicators import atr, stochastic
 
 TYPE_NAME = "stochastic"
 
@@ -55,14 +55,56 @@ class StochasticStrategy(BaseStrategy):
             f"Covers at oversold (below {p['k_oversold']})."
         )
 
+    def generate_signals(self, df: pd.DataFrame) -> DirectionalSignals:
+        """Vectorized twin of generate_signal — the SINGLE source of entry/exit logic.
+
+        Mirrors generate_signal's per-bar %K cross logic condition-for-condition for
+        BOTH the long and short branches (the class is direction-parametrized). No ADX
+        or volume filter is applied, matching generate_signal exactly.
+        """
+        p = self.params
+
+        if len(df) < 2:
+            return DirectionalSignals.empty(df.index)
+
+        stoch = stochastic(df, int(p.get("k_period", 14)), int(p.get("d_period", 3)))
+        stoch_k = stoch["stoch_k"]
+        prev_stoch_k = stoch_k.shift(1)
+
+        k_oversold = float(p.get("k_oversold", 20))
+        k_overbought = float(p.get("k_overbought", 80))
+        k_exit_oversold = float(p.get("k_exit_oversold", 40))
+        k_exit_overbought = float(p.get("k_exit_overbought", 60))
+
+        # Long branch: entry on %K crossing up through oversold; exit at overbought
+        # OR %K crossing down through the long exit-oversold band.
+        long_entry = (prev_stoch_k < k_oversold) & (stoch_k >= k_oversold)
+        long_exit = (stoch_k >= k_overbought) | (
+            (prev_stoch_k >= k_exit_oversold) & (stoch_k < k_exit_oversold)
+        )
+
+        # Short branch: entry on %K crossing down through overbought; exit at oversold
+        # OR %K crossing up through the short exit-overbought band.
+        short_entry = (prev_stoch_k > k_overbought) & (stoch_k <= k_overbought)
+        short_exit = (stoch_k <= k_oversold) | (
+            (prev_stoch_k <= k_exit_overbought) & (stoch_k > k_exit_overbought)
+        )
+
+        return DirectionalSignals(
+            long_entries=long_entry.fillna(False),
+            long_exits=long_exit.fillna(False),
+            short_entries=short_entry.fillna(False),
+            short_exits=short_exit.fillna(False),
+        )
+
     def generate_signal(self, df: pd.DataFrame) -> Signal:
         p = self.params
-        
+
         stoch = stochastic(df, int(p.get("k_period", 14)), int(p.get("d_period", 3)))
         stoch_k = stoch["stoch_k"]
         stoch_d = stoch["stoch_d"]
         atr_14 = atr(df, 14)
-        
+
         if len(df) < 2:
             return Signal(
                 entry_signal=False, exit_signal=False,
@@ -70,26 +112,23 @@ class StochasticStrategy(BaseStrategy):
                 direction=p.get("direction", "long"),
                 confidence=0.0, indicators={}
             )
-        
+
         curr_close = float(df["close"].iloc[-1])
         curr_stoch_k = float(stoch_k.iloc[-1])
-        prev_stoch_k = float(stoch_k.iloc[-2])
         curr_stoch_d = float(stoch_d.iloc[-1])
         curr_atr = float(atr_14.iloc[-1])
-        
+
         direction = p.get("direction", "long")
-        k_oversold = float(p.get("k_oversold", 20))
-        k_overbought = float(p.get("k_overbought", 80))
-        k_exit_oversold = float(p.get("k_exit_oversold", 40))
-        k_exit_overbought = float(p.get("k_exit_overbought", 60))
-        
+
+        # Decision comes from the vectorized twin — pick the side this instance trades.
+        signals = self.generate_signals(df)
         if direction == "long":
-            entry = prev_stoch_k < k_oversold and curr_stoch_k >= k_oversold
-            exit_ = curr_stoch_k >= k_overbought or (prev_stoch_k >= k_exit_oversold and curr_stoch_k < k_exit_oversold)
+            entry = bool(signals.long_entries.iloc[-1])
+            exit_ = bool(signals.long_exits.iloc[-1])
         else:
-            entry = prev_stoch_k > k_overbought and curr_stoch_k <= k_overbought
-            exit_ = curr_stoch_k <= k_oversold or (prev_stoch_k <= k_exit_overbought and curr_stoch_k > k_exit_overbought)
-        
+            entry = bool(signals.short_entries.iloc[-1])
+            exit_ = bool(signals.short_exits.iloc[-1])
+
         return Signal(
             entry_signal=bool(entry), exit_signal=bool(exit_),
             price=round(curr_close, 4), direction=direction,

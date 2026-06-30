@@ -91,10 +91,16 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
         r"\1=" + REDACTED_MARKER,
     ),
     # JSON key/value pairs: "api_key": "value", "authorization": "Bearer ...", etc.
-    # Preserves the JSON structure; replaces only the string value.
+    # Preserves the JSON structure; replaces only the string value. Compound names
+    # are listed before bare ones (access[-_]?token before access) so the more
+    # specific key matches first. Covers the field names this app actually stores
+    # secrets under — including the OAuth `access`/`refresh`/`id_token` and
+    # `private_key`/`api_secret` that the pre-P1.5 list omitted (audit P1.5).
     (
         re.compile(
-            r"(?i)(\"(?:api_key|api[-_]?token|access[-_]?token|refresh[-_]?token|secret|secret[-_]?key|client[-_]?secret|password|authorization|bearer)\"\s*:\s*)\"[^\"]+\""
+            r"(?i)(\"(?:api_key|api[-_]?token|api[-_]?secret|access[-_]?token|refresh[-_]?token"
+            r"|id[-_]?token|secret[-_]?key|client[-_]?secret|private[-_]?key"
+            r"|access|refresh|token|secret|password|authorization|bearer)\"\s*:\s*)\"[^\"]+\""
         ),
         r"\1\"" + REDACTED_MARKER + "\"",
     ),

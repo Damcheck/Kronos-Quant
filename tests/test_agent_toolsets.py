@@ -101,7 +101,55 @@ def _add_override(agent_id: str, context: str, tool_name: str, *, enabled: bool)
 # --- VALID_CONTEXTS -------------------------------------------------------
 
 def test_valid_contexts_set() -> None:
-    assert set(VALID_CONTEXTS) == {"scheduled", "interactive", "recovery", "research"}
+    # 'develop' added in audit P1.1: the context for code-authoring autonomous
+    # tasks (develop_candidate) — denies catastrophic, keeps codegen/research.
+    assert set(VALID_CONTEXTS) == {"scheduled", "interactive", "recovery", "research", "develop"}
+
+
+# --- P1.1: inject→register trigger gating ---------------------------------
+
+def _add_codegen_tool(registry, name: str, category: str = "general") -> None:
+    registry[name] = ToolDef(
+        name=name,
+        description=f"test tool {name}",
+        input_schema={"type": "object", "properties": {}},
+        handler=registry["get_status"].handler,
+        permissions=frozenset({"*"}),
+        category=category,
+    )
+
+
+def test_register_strategy_categorized_as_codegen(synthetic_registry) -> None:
+    """P1.1: register_strategy and the *_register_strategy_file variants take raw
+    code imported in-process — the default categorization must mark them codegen."""
+    reg = synthetic_registry
+    names = ("register_strategy", "forven_register_strategy_file", "assistant_register_strategy_file")
+    for nm in names:
+        _add_codegen_tool(reg, nm, category="general")
+    apply_default_categorization()
+    for nm in names:
+        assert reg[nm].category == "codegen", nm
+
+
+def test_research_context_denies_register_strategy(synthetic_registry) -> None:
+    """P1.1: a research-context agent (heaviest untrusted ingestion) must NOT be
+    able to reach register_strategy — closing the inject→register trigger."""
+    reg = synthetic_registry
+    _add_codegen_tool(reg, "register_strategy", category="codegen")
+    research = {t["name"] for t in get_tools_for_agent("agent-x", context="research")}
+    assert "register_strategy" not in research
+
+
+def test_develop_context_allows_codegen_but_denies_catastrophic(synthetic_registry) -> None:
+    """P1.1: the develop_candidate flow legitimately authors strategies, so the
+    'develop' context must KEEP codegen (register_strategy) while still denying a
+    catastrophic primitive (factory_reset) a prompt-injected task could reach."""
+    reg = synthetic_registry
+    _add_codegen_tool(reg, "register_strategy", category="codegen")
+    _add_codegen_tool(reg, "factory_reset", category="catastrophic")
+    develop = {t["name"] for t in get_tools_for_agent("agent-x", context="develop")}
+    assert "register_strategy" in develop       # authoring still works
+    assert "factory_reset" not in develop       # catastrophic denied
 
 
 # --- Default behavior -----------------------------------------------------

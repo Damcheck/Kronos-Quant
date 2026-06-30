@@ -13,6 +13,7 @@
 		promoteForvenStrategy,
 		submitBacktest,
 		submitOptimization,
+		updateStrategyDisplayName,
 		type BacktestResult,
 		type Dataset,
 		type PipelineSettings,
@@ -21,7 +22,12 @@
 		type StrategyContainerPayload,
 	} from '$lib/api';
 	import { getPrebuiltStrategies } from '$lib/api/strategies';
-	import { updateStrategyDefaultParams } from '$lib/api/backtesting';
+	import {
+		getStrategyOpenPosition,
+		updateStrategyDefaultParams,
+		type OpenPositionUpdate,
+		type StrategyOpenPosition,
+	} from '$lib/api/backtesting';
 	import type { EquityPoint, ParamSpec, Strategy, Trade } from '$lib/api/types';
 	import StrategyLink from '$lib/components/ui/StrategyLink.svelte';
 	import DateRangeFieldset from '$lib/components/ui/DateRangeFieldset.svelte';
@@ -34,6 +40,8 @@
 	import HeatmapChart from '$lib/components/charts/HeatmapChart.svelte';
 	import RobustnessPanel from '$lib/components/robustness/RobustnessPanel.svelte';
 	import GauntletStatusCard from '$lib/components/robustness/GauntletStatusCard.svelte';
+	import ExecutionSettingsFields from '$lib/components/lab/ExecutionSettingsFields.svelte';
+	import type { SizingMode, ExecutionProfileDraft } from '$lib/types/executionProfile';
 	import {
 		getPipelineConfig,
 		type GauntletTestEntry,
@@ -81,6 +89,74 @@
 		}
 	}
 
+	// ── Display-name editing ─────────────────────────────────────────────────────
+	// Friendly name override for the container; falls back to the canonical
+	// {ASSET}-{TYPE}-{ID} name when blank.
+	let editingName = false;
+	let nameDraft = '';
+	let savingName = false;
+
+	function startEditName(): void {
+		if (!container) return;
+		nameDraft = container.strategy.display_name ?? '';
+		editingName = true;
+	}
+
+	function cancelEditName(): void {
+		editingName = false;
+		nameDraft = '';
+	}
+
+	async function saveName(): Promise<void> {
+		if (!container || savingName) return;
+		const strategyIdValue = container.strategy.id;
+		const next = nameDraft.trim();
+		// No-op if unchanged (treat null/'' as equivalent).
+		if ((container.strategy.display_name ?? '') === next) {
+			cancelEditName();
+			return;
+		}
+		savingName = true;
+		try {
+			const res = await updateStrategyDisplayName(strategyIdValue, next || null);
+			// Reassign container so Svelte picks up the nested change.
+			container = {
+				...container,
+				strategy: { ...container.strategy, display_name: res.display_name },
+			};
+			editingName = false;
+			nameDraft = '';
+			addToast(
+				res.display_name ? `Renamed to "${res.display_name}"` : 'Display name reset to default',
+				'success',
+				`/lab/strategy/${encodeURIComponent(strategyIdValue)}`,
+			);
+		} catch (err) {
+			addToast(
+				err instanceof Error ? err.message : 'Failed to update display name',
+				'error',
+				`/lab/strategy/${encodeURIComponent(strategyIdValue)}`,
+			);
+		} finally {
+			savingName = false;
+		}
+	}
+
+	function focusAndSelect(node: HTMLInputElement): void {
+		node.focus();
+		node.select();
+	}
+
+	function onNameKeydown(event: KeyboardEvent): void {
+		if (event.key === 'Enter') {
+			event.preventDefault();
+			void saveName();
+		} else if (event.key === 'Escape') {
+			event.preventDefault();
+			cancelEditName();
+		}
+	}
+
 	// TabKey identifiers predate the current UI labels. Mapping (code -> visible label):
 	//   'backtests'      -> "Gauntlet History" (the "Run the Gauntlet" button submits a backtest)
 	//   'optimizations'  -> "Robustness" (hosts the optimization + robustness sub-tabs)
@@ -118,23 +194,6 @@
 		max: string;
 		step: string;
 		error: string;
-	};
-	type SizingMode = 'full' | 'fraction' | 'fixed' | 'atr' | 'kelly';
-	type ExecutionProfileDraft = {
-		initial_capital: string;
-		fee_bps: string;
-		slippage_bps: string;
-		leverage: string;
-		sizing_mode: SizingMode;
-		risk_per_trade: string;
-		fixed_size: string;
-		atr_stop_multiplier: string;
-		kelly_multiplier: string;
-		kelly_lookback: string;
-		stop_loss_pct: string;
-		take_profit_pct: string;
-		trailing_stop_pct: string;
-		time_stop_bars: string;
 	};
 	const DEFAULT_EXECUTION_LEVERAGE = '1';
 	const EXECUTION_PARAM_KEYS = new Set([
@@ -321,8 +380,14 @@
 	$: returnTo = $page.url.searchParams.get('returnTo') || '/lab';
 
 	$: backtestHistoryRaw = container?.history.backtests ?? [];
-	$: backtestHistory = sortBacktestHistory(backtestHistoryRaw, historySortBy, historySortDir);
 	$: pinnedBacktestId = (container?.strategy?.pinned_backtest_id ?? '').toString().trim();
+	// The active/default Gauntlet run is pinned to the very top of the list (and
+	// rendered green) regardless of the current sort, so the run actually driving
+	// paper/live is always the first row the operator sees.
+	$: backtestHistory = withPinnedFirst(
+		sortBacktestHistory(backtestHistoryRaw, historySortBy, historySortDir),
+		pinnedBacktestId
+	);
 	$: historySortIndicator = (field: HistorySortField): string =>
 		historySortBy === field ? (historySortDir === 'desc' ? ' \u2193' : ' \u2191') : '';
 	$: optimizationHistory = container?.history.optimizations ?? [];
@@ -350,6 +415,13 @@
 	}
 
 	$: strategyParams = stripExecutionProfile(container?.configuration.params);
+	// The FULL set of active default params — including execution_profile and the
+	// execution param keys that `strategyParams` strips. The Gauntlet-history "changed"
+	// chip compares against this so execution params (leverage, execution_profile, …)
+	// are not perpetually flagged amber just because the alpha-param view omits them.
+	// For the active/pinned run, whose stored params ARE the strategy default, this
+	// makes every chip read as unchanged (no yellow).
+	$: strategyDefaultsFull = extractParamRecord(container?.configuration.params);
 	$: recentEvents = container?.events ?? [];
 	$: submitProgressPct = parseProgressPct(submitProgress);
 	$: datasetSuggestionSymbols = buildDatasetSymbolSuggestions(availableDatasets, backtestForm.timeframe || optimizationForm.timeframe || '1h');
@@ -433,6 +505,12 @@
 	$: executionDraftError = validateExecutionDraft(executionDraft) ?? '';
 	$: paramsDirty = !areParameterRecordsEqual(strategyParams, paramsDraft);
 	$: gauntletDraftDirty = paramsDirty || executionDirty;
+	// When NO backtest run is pinned, the manually-saved container defaults are what
+	// drive paper/live — i.e. the Gauntlet Parameters themselves are the active params.
+	// Surface that with a green treatment on the card (mirrors the green active row in
+	// the history table) once the draft is saved/synced rather than mid-edit.
+	$: gauntletParamsAreActive =
+		!pinnedBacktestId && gauntletDraftSource === 'defaults' && !gauntletDraftDirty;
 	$: currentStrategyIdentity = resolveContainerStrategyIdentity(container);
 	$: matchingPrebuiltStrategy = resolvePrebuiltStrategy(currentStrategyIdentity, prebuiltStrategies);
 	$: availableParamSpecs = resolvePrebuiltParamSpecs(currentStrategyIdentity, prebuiltStrategies);
@@ -1233,8 +1311,8 @@
 	}
 
 	function isBacktestParamDifferentFromDefaults(key: string, value: unknown): boolean {
-		if (!(key in strategyParams)) return true;
-		return stableStringify(strategyParams[key]) !== stableStringify(value);
+		if (!(key in strategyDefaultsFull)) return true;
+		return stableStringify(strategyDefaultsFull[key]) !== stableStringify(value);
 	}
 
 	function getBacktestParamSummary(item: StrategyContainerHistoryItem): Array<{ key: string; value: string; changed: boolean }> {
@@ -1588,6 +1666,21 @@
 			return String(av).localeCompare(String(bv)) * sign;
 		});
 		return decorated.map((entry) => entry.item);
+	}
+
+	// Hoist the pinned/active run to the front of the (already sorted) list so it is
+	// always the first row, no matter which column the operator sorts by.
+	function withPinnedFirst(
+		items: StrategyContainerHistoryItem[],
+		pinnedId: string
+	): StrategyContainerHistoryItem[] {
+		if (!pinnedId) return items;
+		const index = items.findIndex((item) => item.result_id === pinnedId);
+		if (index <= 0) return items;
+		const next = items.slice();
+		const [pinned] = next.splice(index, 1);
+		next.unshift(pinned);
+		return next;
 	}
 
 	function historyItemStatus(item: StrategyContainerHistoryItem): 'running' | 'succeeded' | 'failed' {
@@ -2942,6 +3035,56 @@
 		}
 	}
 
+	function formatPositionPrice(value: number | null | undefined): string {
+		if (value === null || value === undefined || !Number.isFinite(value)) return '—';
+		return Number(value).toLocaleString(undefined, { maximumFractionDigits: 8 });
+	}
+
+	// Defensive: a failed pre-edit check must never block saving — log and proceed.
+	async function fetchOpenPositionSummary(strategyId: string): Promise<StrategyOpenPosition | null> {
+		try {
+			return await getStrategyOpenPosition(strategyId);
+		} catch (err) {
+			console.warn('Open-position pre-save check failed; proceeding with save.', err);
+			return null;
+		}
+	}
+
+	// Build the warning shown before saving execution settings onto a live/paper
+	// trade. Returns null when there is no open position to warn about.
+	function describeOpenPositionWarning(summary: StrategyOpenPosition | null): string | null {
+		if (!summary?.has_open_position || !summary.positions?.length) return null;
+		const pos = summary.positions[0];
+		const entry = formatPositionPrice(pos.entry_price);
+		const extra = summary.count > 1 ? ` (plus ${summary.count - 1} other open position${summary.count - 1 === 1 ? '' : 's'})` : '';
+		return `⚠️ This strategy has an open ${pos.direction.toUpperCase()} ${pos.asset} position (entry ${entry})${extra}. Saving these execution settings will UPDATE its stop-loss / take-profit on the live position. Apply anyway?`;
+	}
+
+	// Surface what the backend recomputed on the open position after a save.
+	function notifyOpenPositionUpdate(update: OpenPositionUpdate | null | undefined): void {
+		if (!update?.affected) return;
+		for (const p of update.positions ?? []) {
+			// The backend records a per-trade apply FAILURE as { trade_id, error } (no
+			// direction/asset) and never raises — the param save itself still succeeded.
+			// Surface that as its own error toast instead of dereferencing p.direction on the
+			// error variant, which would throw and turn a successful save into a false
+			// "failed" toast (and skip the post-save container refresh).
+			if (!p.direction) {
+				addToast(
+					`Open position not updated${p.asset ? ` (${p.asset})` : ''}: ${p.error ?? 'apply failed'}`,
+					'error',
+					`/lab/strategy/${encodeURIComponent(strategyId)}`,
+				);
+				continue;
+			}
+			addToast(
+				`Updated open ${p.direction.toUpperCase()} ${p.asset}: SL ${formatPositionPrice(p.stop_loss?.old)} → ${formatPositionPrice(p.stop_loss?.new)}, TP ${formatPositionPrice(p.take_profit?.old)} → ${formatPositionPrice(p.take_profit?.new)}`,
+				'info',
+				`/lab/strategy/${encodeURIComponent(strategyId)}`,
+			);
+		}
+	}
+
 	async function setAsDefaultParams() {
 		if (!container || settingDefaultParams) return;
 		const effectiveParams = getEffectiveOptimizationParams();
@@ -2950,14 +3093,19 @@
 		const paramsToSave = optimizedExecutionDraft
 			? { ...effectiveParams, execution_profile: executionDraftToPayload(optimizedExecutionDraft) }
 			: effectiveParams;
-		const confirmed = typeof window === 'undefined' || window.confirm(
-			'Set these optimized parameters as the strategy defaults?\n\nThis will update the parameters used for paper trading and live execution.'
+		const openPositionWarning = describeOpenPositionWarning(
+			await fetchOpenPositionSummary(container.strategy.id),
 		);
+		const confirmMessage = openPositionWarning
+			? `Set these optimized parameters as the strategy defaults?\n\nThis will update the parameters used for paper trading and live execution.\n\n${openPositionWarning}`
+			: 'Set these optimized parameters as the strategy defaults?\n\nThis will update the parameters used for paper trading and live execution.';
+		const confirmed = typeof window === 'undefined' || window.confirm(confirmMessage);
 		if (!confirmed) return;
 		settingDefaultParams = true;
 		try {
-			await updateStrategyDefaultParams(container.strategy.id, paramsToSave, { pinnedBacktestId: null });
+			const res = await updateStrategyDefaultParams(container.strategy.id, paramsToSave, { pinnedBacktestId: null });
 			addToast('Default parameters updated', 'success', `/lab/strategy/${encodeURIComponent(strategyId)}`);
+			notifyOpenPositionUpdate(res?.open_position_update);
 			await loadContainer();
 		} catch (err) {
 			addToast(err instanceof Error ? err.message : 'Failed to update params', 'error', `/lab/strategy/${encodeURIComponent(strategyId)}`);
@@ -2970,16 +3118,21 @@
 		if (!container || settingDefaultParams) return;
 		const params = getBacktestParamDraft(item);
 		if (Object.keys(params).length === 0) return;
-		const confirmed = typeof window === 'undefined' || window.confirm(
-			'Set this backtest as the strategy default?\n\nIts parameters will drive paper trading and live execution, and its metrics will display on the Lab manager.'
+		const openPositionWarning = describeOpenPositionWarning(
+			await fetchOpenPositionSummary(container.strategy.id),
 		);
+		const confirmMessage = openPositionWarning
+			? `Set this backtest as the strategy default?\n\nIts parameters will drive paper trading and live execution, and its metrics will display on the Lab manager.\n\n${openPositionWarning}`
+			: 'Set this backtest as the strategy default?\n\nIts parameters will drive paper trading and live execution, and its metrics will display on the Lab manager.';
+		const confirmed = typeof window === 'undefined' || window.confirm(confirmMessage);
 		if (!confirmed) return;
 		settingDefaultParams = true;
 		try {
-			await updateStrategyDefaultParams(container.strategy.id, params, {
+			const res = await updateStrategyDefaultParams(container.strategy.id, params, {
 				pinnedBacktestId: item.result_id
 			});
 			addToast('Default parameters updated', 'success', `/lab/strategy/${encodeURIComponent(strategyId)}`);
+			notifyOpenPositionUpdate(res?.open_position_update);
 			await loadContainer();
 		} catch (err) {
 			addToast(err instanceof Error ? err.message : 'Failed to update params', 'error', `/lab/strategy/${encodeURIComponent(strategyId)}`);
@@ -3043,6 +3196,12 @@
 			addToast('Fix the highlighted parameter errors before saving.', 'error');
 			return;
 		}
+		// This pane has no confirm by default — only prompt when the save would
+		// mutate an open paper/live position.
+		const openPositionWarning = describeOpenPositionWarning(
+			await fetchOpenPositionSummary(container.strategy.id),
+		);
+		if (openPositionWarning && typeof window !== 'undefined' && !window.confirm(openPositionWarning)) return;
 		settingDefaultParams = true;
 		parameterSaveMessage = '';
 		parameterSaveError = '';
@@ -3052,9 +3211,10 @@
 			// the alpha params, so a tuned profile survives reload and drives backtests
 			// instead of being ephemeral.
 			const paramsToSave = { ...paramsDraft, execution_profile: executionDraftToPayload(executionDraft) };
-			await updateStrategyDefaultParams(container.strategy.id, paramsToSave, { pinnedBacktestId: null });
+			const res = await updateStrategyDefaultParams(container.strategy.id, paramsToSave, { pinnedBacktestId: null });
 			parameterSaveMessage = 'Default parameters saved.';
 			addToast('Default parameters updated', 'success', `/lab/strategy/${encodeURIComponent(strategyId)}`);
+			notifyOpenPositionUpdate(res?.open_position_update);
 			await loadContainer();
 		} catch (err) {
 			parameterSaveError = err instanceof Error ? err.message : 'Failed to save parameter defaults';
@@ -3371,7 +3531,7 @@
 </script>
 
 <svelte:head>
-	<title>{container?.strategy.name ?? strategyId} · Lab</title>
+	<title>{container?.strategy.display_name || container?.strategy.name || strategyId} · Lab</title>
 </svelte:head>
 
 <div class="h-full flex flex-col overflow-hidden">
@@ -3385,7 +3545,55 @@
 		</button>
 		<span class="text-gray-700">|</span>
 		{#if container}
-			<StrategyLink strategyId={container.strategy.id} label={container.strategy.name} returnTo={returnTo} />
+			{#if editingName}
+				<input
+					use:focusAndSelect
+					class="rounded border border-cyan-700 bg-black px-2 py-0.5 font-mono text-[11px] text-cyan-100 focus:border-cyan-400 focus:outline-none disabled:opacity-50"
+					style="min-width: 220px"
+					maxlength="140"
+					bind:value={nameDraft}
+					placeholder={container.strategy.name}
+					disabled={savingName}
+					on:keydown={onNameKeydown}
+					aria-label="Display name"
+				/>
+				<button
+					type="button"
+					class="rounded border border-emerald-700/60 bg-emerald-950/30 px-2 py-0.5 text-[11px] text-emerald-200 transition hover:bg-emerald-900/40 disabled:opacity-50"
+					title="Save display name (Enter)"
+					disabled={savingName}
+					on:click={saveName}
+				>
+					{savingName ? '…' : 'Save'}
+				</button>
+				<button
+					type="button"
+					class="rounded border border-[#2b2b2b] px-2 py-0.5 text-[11px] text-gray-400 transition hover:text-white disabled:opacity-50"
+					title="Cancel (Esc)"
+					disabled={savingName}
+					on:click={cancelEditName}
+				>
+					Cancel
+				</button>
+			{:else}
+				<StrategyLink strategyId={container.strategy.id} label={container.strategy.display_name || container.strategy.name} returnTo={returnTo} />
+				<button
+					type="button"
+					data-testid="edit-display-name-button"
+					class="text-gray-500 transition-colors hover:text-cyan-300"
+					title="Edit display name"
+					aria-label="Edit display name"
+					on:click={startEditName}
+				>
+					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+						<path d="M12 20h9" />
+						<path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" />
+					</svg>
+				</button>
+				{#if container.strategy.display_name}
+					<span class="font-mono text-[10px] text-gray-600" title="Canonical name">({container.strategy.name})</span>
+				{/if}
+			{/if}
 			{#if container.strategy.hypothesis_id}
 				{@const hypothesisHrefId = container.strategy.hypothesis_display_id || container.strategy.hypothesis_id}
 				{@const hypothesisLabelId = container.strategy.hypothesis_display_id || container.strategy.hypothesis_id}
@@ -3565,8 +3773,8 @@
 						<div class="flex items-center justify-between gap-2">
 							<div class="flex items-center gap-2">
 								<div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Default Parameters</div>
-								<span class={`rounded border px-1.5 py-0.5 text-[10px] ${paramsDirty ? 'border-amber-900/70 bg-amber-950/20 text-amber-200' : 'border-[#2b2b2b] text-gray-500'}`}>
-									{paramsDirty ? 'Unsaved' : 'Synced'}
+								<span class={`rounded border px-1.5 py-0.5 text-[10px] ${gauntletDraftDirty ? 'border-amber-900/70 bg-amber-950/20 text-amber-200' : 'border-[#2b2b2b] text-gray-500'}`}>
+									{gauntletDraftDirty ? 'Unsaved' : 'Synced'}
 								</span>
 							</div>
 							<div class="flex items-center gap-1.5">
@@ -3624,6 +3832,15 @@
 						{/if}
 						<div class="mt-2">
 							<ParameterEditor bind:params={paramsDraft} bind:hasErrors={paramsHasErrors} saving={settingDefaultParams} />
+						</div>
+						<div class="mt-3 border-t border-[#1a1a1a] pt-3">
+							<div class="mb-2 text-[10px] uppercase tracking-[0.2em] text-gray-500">Execution Settings</div>
+							<ExecutionSettingsFields
+								bind:draft={executionDraft}
+								error={executionDraftError}
+								disabled={settingDefaultParams}
+								onSizingModeChange={() => applySizingModeDefaults(executionDraft.sizing_mode)}
+							/>
 						</div>
 						<details class="mt-2 rounded border border-[#1f1f1f] bg-black">
 							<summary class="cursor-pointer px-2 py-1.5 text-[10px] uppercase tracking-wide text-gray-500">Raw JSON</summary>
@@ -3798,14 +4015,18 @@
 					</div>
 				</div>
 
-				<details class="mb-3 rounded-lg border border-[#1d1d1d] bg-[#090909]" data-testid="backtest-parameter-panel">
+				<details class={`mb-3 rounded-lg border bg-[#090909] ${gauntletParamsAreActive ? 'border-emerald-700/60 shadow-[inset_2px_0_0_0_rgba(16,185,129,0.9)]' : 'border-[#1d1d1d]'}`} data-testid="backtest-parameter-panel">
 					<summary class="flex cursor-pointer items-center justify-between px-3 py-2">
 						<div class="flex items-center gap-2 text-[10px] uppercase tracking-wide text-gray-500">
-							Gauntlet Parameters
+							<span class={gauntletParamsAreActive ? 'text-emerald-300' : ''}>Gauntlet Parameters</span>
 							<span class={`rounded border px-1.5 py-0.5 text-[10px] normal-case tracking-normal ${gauntletDraftSource === 'run' ? 'border-cyan-900/60 text-cyan-300' : 'border-[#2b2b2b] text-gray-500'}`}>
 								{gauntletDraftSource === 'run' && gauntletDraftSourceId ? `Run ${gauntletDraftSourceId}` : 'Container defaults'}
 							</span>
-							<span class={`rounded border px-1.5 py-0.5 text-[10px] normal-case tracking-normal ${gauntletDraftDirty ? 'border-amber-900/60 text-amber-300' : 'border-[#2b2b2b] text-gray-500'}`}>{gauntletDraftDirty ? 'Unsaved' : 'Synced'}</span>
+							{#if gauntletParamsAreActive}
+								<span class="rounded-full border border-emerald-600/60 bg-emerald-950/30 px-2 py-0.5 text-[10px] uppercase tracking-wide text-emerald-200" title="No backtest run is pinned — these manually-saved parameters are the active default driving paper/live.">Active</span>
+							{:else}
+								<span class={`rounded border px-1.5 py-0.5 text-[10px] normal-case tracking-normal ${gauntletDraftDirty ? 'border-amber-900/60 text-amber-300' : 'border-[#2b2b2b] text-gray-500'}`}>{gauntletDraftDirty ? 'Unsaved' : 'Synced'}</span>
+							{/if}
 						</div>
 						<div class="flex items-center gap-1.5">
 							<button type="button" class="rounded border border-[#2b2b2b] bg-black px-2 py-0.5 text-[10px] uppercase text-gray-400 hover:text-white disabled:opacity-40" data-testid="backtest-params-reset" on:click|stopPropagation={resetGauntletDraftToDefaults} disabled={(gauntletDraftSource === 'defaults' && !gauntletDraftDirty) || settingDefaultParams}>Reset to Defaults</button>
@@ -3813,81 +4034,12 @@
 						</div>
 					</summary>
 					<div class="border-t border-[#1a1a1a] p-3" data-testid="backtest-parameter-editor">
-						<div class="mb-4 grid gap-3 lg:grid-cols-3">
-							<label class="block text-[10px] uppercase tracking-wide text-gray-500">
-								Initial Capital
-								<input type="number" bind:value={executionDraft.initial_capital} min="0" step="1000" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
-							</label>
-							<label class="block text-[10px] uppercase tracking-wide text-gray-500">
-								Fee (bps)
-								<input type="number" bind:value={executionDraft.fee_bps} min="0" step="0.1" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
-							</label>
-							<label class="block text-[10px] uppercase tracking-wide text-gray-500">
-								Slippage (bps)
-								<input type="number" bind:value={executionDraft.slippage_bps} min="0" step="0.1" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
-							</label>
-							<label class="block text-[10px] uppercase tracking-wide text-gray-500">
-								Leverage
-								<input type="number" bind:value={executionDraft.leverage} min="0" max="125" step="0.1" placeholder="Engine default" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
-							</label>
-							<label class="block text-[10px] uppercase tracking-wide text-gray-500">
-								Sizing Mode
-								<select bind:value={executionDraft.sizing_mode} on:change={() => applySizingModeDefaults(executionDraft.sizing_mode)} class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700">
-									<option value="full">Full equity</option>
-									<option value="fraction">Fraction risk</option>
-									<option value="fixed">Fixed notional</option>
-									<option value="atr">ATR risk</option>
-									<option value="kelly">Kelly</option>
-								</select>
-							</label>
-							{#if executionDraft.sizing_mode === 'fraction' || executionDraft.sizing_mode === 'atr'}
-								<label class="block text-[10px] uppercase tracking-wide text-gray-500">
-									Risk Per Trade
-									<input type="number" bind:value={executionDraft.risk_per_trade} min="0" max="1" step="0.005" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
-								</label>
-							{/if}
-							{#if executionDraft.sizing_mode === 'fixed'}
-								<label class="block text-[10px] uppercase tracking-wide text-gray-500">
-									Fixed Notional
-									<input type="number" bind:value={executionDraft.fixed_size} min="0" step="100" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
-								</label>
-							{/if}
-							{#if executionDraft.sizing_mode === 'atr'}
-								<label class="block text-[10px] uppercase tracking-wide text-gray-500">
-									ATR Stop Multiplier
-									<input type="number" bind:value={executionDraft.atr_stop_multiplier} min="0" step="0.1" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
-								</label>
-							{/if}
-							{#if executionDraft.sizing_mode === 'kelly'}
-								<label class="block text-[10px] uppercase tracking-wide text-gray-500">
-									Kelly Multiplier
-									<input type="number" bind:value={executionDraft.kelly_multiplier} min="0" max="5" step="0.05" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
-								</label>
-								<label class="block text-[10px] uppercase tracking-wide text-gray-500">
-									Kelly Lookback
-									<input type="number" bind:value={executionDraft.kelly_lookback} min="1" step="1" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
-								</label>
-							{/if}
-							<label class="block text-[10px] uppercase tracking-wide text-gray-500">
-								Stop Loss %
-								<input type="number" bind:value={executionDraft.stop_loss_pct} min="0" max="100" step="0.1" placeholder="None" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
-							</label>
-							<label class="block text-[10px] uppercase tracking-wide text-gray-500">
-								Take Profit %
-								<input type="number" bind:value={executionDraft.take_profit_pct} min="0" step="0.1" placeholder="None" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
-							</label>
-							<label class="block text-[10px] uppercase tracking-wide text-gray-500">
-								Trailing Stop %
-								<input type="number" bind:value={executionDraft.trailing_stop_pct} min="0" max="100" step="0.1" placeholder="None" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
-							</label>
-							<label class="block text-[10px] uppercase tracking-wide text-gray-500">
-								Time Stop (bars)
-								<input type="number" bind:value={executionDraft.time_stop_bars} min="1" step="1" placeholder="None" class="mt-1 w-full rounded border border-[#2b2b2b] bg-black px-3 py-2 text-xs text-white outline-none focus:border-cyan-700" />
-							</label>
-						</div>
-						{#if executionDraftError}
-							<div class="mb-3 rounded border border-red-900/50 bg-red-950/20 px-3 py-2 text-[11px] text-red-200">{executionDraftError}</div>
-						{/if}
+						<ExecutionSettingsFields
+							bind:draft={executionDraft}
+							error={executionDraftError}
+							disabled={settingDefaultParams}
+							onSizingModeChange={() => applySizingModeDefaults(executionDraft.sizing_mode)}
+						/>
 						<ParameterEditor bind:params={paramsDraft} bind:hasErrors={paramsHasErrors} saving={settingDefaultParams} />
 					</div>
 				</details>
@@ -3937,10 +4089,12 @@
 											<tr
 												data-testid={`backtest-row-${item.result_id}`}
 												class={`border-t border-[#161616] font-mono transition ${
-													selectedResultId === item.result_id
-														? 'bg-cyan-950/20 shadow-[inset_2px_0_0_0_rgba(34,211,238,0.9)]'
-														: pinnedBacktestId && pinnedBacktestId === item.result_id
-															? 'bg-emerald-950/15 shadow-[inset_2px_0_0_0_rgba(16,185,129,0.9)] hover:bg-emerald-950/25'
+													pinnedBacktestId && pinnedBacktestId === item.result_id
+														? selectedResultId === item.result_id
+															? 'bg-emerald-950/30 shadow-[inset_2px_0_0_0_rgba(16,185,129,1),inset_-2px_0_0_0_rgba(34,211,238,0.9)]'
+															: 'bg-emerald-950/15 shadow-[inset_2px_0_0_0_rgba(16,185,129,0.9)] hover:bg-emerald-950/25'
+														: selectedResultId === item.result_id
+															? 'bg-cyan-950/20 shadow-[inset_2px_0_0_0_rgba(34,211,238,0.9)]'
 															: 'hover:bg-[#0d0d0d]'
 												}`}
 												tabindex="0"

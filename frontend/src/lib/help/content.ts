@@ -1597,17 +1597,6 @@ Crypto exchanges typically charge 0.1% (10 bps) per trade, meaning a round-trip 
 			{ range: 'disabled', label: 'Signal-Only', color: 'yellow', description: 'Execution-requested scans still run, but they only produce signals and queue no exchange actions.' }
 		]
 	},
-	execution_fast_path: {
-		id: 'execution_fast_path',
-		term: 'Execution Fast-Path',
-		shortDescription: 'Choose direct in-process execution versus deterministic queued execution tasks.',
-		category: 'strategy',
-		fullDescription: 'This setting controls routing, not permission. When enabled, allowed scanner executions place trades directly in-process. When disabled, allowed executions enqueue deterministic `trade_execution` tasks for the execution trader to process from structured payloads.',
-		interpretations: [
-			{ range: 'enabled', label: 'Direct', color: 'green', description: 'Lowest latency when exchange connectivity is healthy.' },
-			{ range: 'disabled', label: 'Queued', color: 'yellow', description: 'Routes through deterministic execution tasks for a more mediated flow.' }
-		]
-	},
 	throughput_auto_scheduler_control: {
 		id: 'throughput_auto_scheduler_control',
 		term: 'Auto Scheduler Cadence Control',

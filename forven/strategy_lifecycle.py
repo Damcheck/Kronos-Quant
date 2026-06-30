@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from forven.db import (
     _now,
+    append_audit_summary,
     create_strategy_container,
     get_db,
     get_recent_strategy_events,
@@ -230,6 +231,7 @@ def _row_to_lifecycle_strategy(row: dict) -> dict:
         "id": strategy_id,
         "display_id": display_id,
         "name": strategy_name,
+        "display_name": (str((row or {}).get("display_name") or "").strip() or None),
         "hypothesis_id": (row or {}).get("hypothesis_id") or None,
         "hypothesis_display_id": (row or {}).get("hypothesis_display_id") or None,
         "state": _to_lifecycle_state(status),
@@ -1006,6 +1008,55 @@ def read_strategies(status: str | None = None, limit: int | None = None, offset:
     return [_scrub_nonfinite(_compact_strategy_list_row(row)) for row in enriched_rows]
 
 
+def set_strategy_display_name(strategy_id: str, display_name: str | None, actor: str = "ui") -> dict:
+    """Set or clear the operator-facing display-name override for a strategy.
+
+    A blank/empty value clears the override so the UI falls back to the canonical
+    {ASSET}-{TYPE}-{ID} name. The canonical `name` column is never touched, so the
+    placeholder-repair pass and naming convention keep working underneath.
+    """
+    target = str(strategy_id or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="strategy_id is required")
+
+    cleaned = str(display_name or "").strip()[:140]
+    resolved = cleaned or None
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id, name, display_name FROM strategies WHERE id = ?",
+            (target,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"strategy not found: {target}")
+
+        previous = row["display_name"] or None
+        if previous != resolved:
+            conn.execute(
+                "UPDATE strategies SET display_name = ?, updated_at = ? WHERE id = ?",
+                (resolved, _now(), target),
+            )
+            append_audit_summary(
+                conn,
+                target,
+                {
+                    "event": "display_name_changed",
+                    "from": previous,
+                    "to": resolved,
+                    "actor": actor,
+                    "timestamp": _now(),
+                },
+            )
+        canonical_name = str(row["name"] or target)
+
+    return {
+        "ok": True,
+        "strategy_id": target,
+        "name": canonical_name,
+        "display_name": resolved,
+    }
+
+
 def promote_strategy(strategy_id: str, body: StrategyPromoteBody):
     try:
         from forven.brain import transition_stage
@@ -1632,10 +1683,18 @@ def import_strategy_container(payload: object) -> dict:
             "only the strategy definition was recreated."
         )
 
-    # Code-class strategies bundle their source file. Re-register it through the
-    # intake security pipeline (AST scan + banned-import gate + lookahead probe)
-    # so the runtime class exists on this machine; param-family strategies skip
-    # this and are recreated from params alone.
+    # Code-class strategies bundle their source file.
+    #
+    # SECURITY (2026-06-29 strategy-import-RCE audit, R1): importing a strategy that
+    # bundles custom Python runs the AUTHOR'S code in this trusted process — module
+    # top-level + __init__ + the lookahead probe all execute in-process during
+    # registration, with os.environ secrets, the decrypted Fernet key, exchange
+    # creds, and the DB reachable. The AST guard (hardened in the same audit) is
+    # defense-in-depth, NOT a trust boundary, and the confused-deputy channel
+    # (allowlisted forven.scanner/data/data_manager) needs no guard bypass at all.
+    # Until that lifecycle runs OUT-OF-PROCESS (docs/strategy-share-security-audit-
+    # 2026-06-29.md, R2), refuse to execute shared code. Param/registry-type
+    # strategies are reconstructed from their definition below and are unaffected.
     source_code = payload.get("source_code") if isinstance(payload.get("source_code"), dict) else None
     if source_code and str(source_code.get("content") or "").strip():
         return _import_code_strategy(source_code, source_id, warnings)
@@ -1709,9 +1768,15 @@ def _apply_import_attribution(new_id: str, source_id: str, source_ref: str | Non
 
 
 def _import_code_strategy(source_code: dict, source_id: str, warnings: list[str]) -> dict:
-    """Write a bundled custom strategy file and register it through the intake
-    pipeline (AST scan + banned-import gate + lookahead probe + quick_screen
-    container). Never overwrites a differing local file."""
+    """Import a bundled custom-code strategy as SANDBOX-ONLY (R2).
+
+    The author's Python is written to ``forven/strategies/imported/<module>.py``
+    (NEVER ``custom/``, which the trusted parent imports), validated in the
+    locked-down worker subprocess, and registered as a ``sandbox_only`` container.
+    Its code is never imported into the host process; every later execution
+    (gauntlet/backtest/scanner) is routed through the worker. Never overwrites a
+    differing local file. See docs/strategy-share-security-audit-2026-06-29.md (R2).
+    """
     import re as _re
     from pathlib import Path
 
@@ -1724,9 +1789,8 @@ def _import_code_strategy(source_code: dict, source_id: str, warnings: list[str]
             status_code=400, detail=f"invalid module name in export: {raw_module or '(none)'}"
         )
 
-    # Pre-write static guard so obviously-unsafe code never touches disk; the
-    # intake path re-scans (and adds the banned-import + lookahead gates) before
-    # importing.
+    # Pre-write static guard (SCAN ONLY — never executes) so obviously-unsafe code
+    # never touches disk; the worker re-scans before importing.
     try:
         from forven.sandbox.ast_guard import scan_source
 
@@ -1740,11 +1804,11 @@ def _import_code_strategy(source_code: dict, source_id: str, warnings: list[str]
             detail=f"imported strategy code rejected by security scan: {findings}",
         )
 
-    from forven.strategies import custom
-    from forven.strategies.intake import register_custom_strategy_file
+    from forven.strategies import imported as imported_pkg
+    from forven.strategies.intake import register_imported_strategy_file
 
-    custom_dir = Path(custom.__file__).resolve().parent
-    target = custom_dir / f"{raw_module}.py"
+    imported_dir = Path(imported_pkg.__file__).resolve().parent
+    target = imported_dir / f"{raw_module}.py"
 
     wrote_file = False
     if target.exists():
@@ -1756,7 +1820,7 @@ def _import_code_strategy(source_code: dict, source_id: str, warnings: list[str]
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"a different strategy file already exists at custom/{raw_module}.py — "
+                    f"a different imported strategy already exists at imported/{raw_module}.py — "
                     "rename or remove it before importing"
                 ),
             )
@@ -1765,7 +1829,9 @@ def _import_code_strategy(source_code: dict, source_id: str, warnings: list[str]
         wrote_file = True
 
     try:
-        reg = register_custom_strategy_file(file_path=str(target), source="import")
+        reg = register_imported_strategy_file(
+            module_name=raw_module, source="import", source_id=source_id
+        )
     except ValueError as exc:
         msg = str(exc)
         if wrote_file:
@@ -1773,7 +1839,7 @@ def _import_code_strategy(source_code: dict, source_id: str, warnings: list[str]
                 target.unlink()
             except Exception:
                 pass
-        if "already registered" in msg.lower():
+        if "already registered" in msg.lower() or "already present" in msg.lower():
             return {
                 "ok": False,
                 "error": f"This strategy is already present on this machine ({msg}).",
@@ -1781,6 +1847,13 @@ def _import_code_strategy(source_code: dict, source_id: str, warnings: list[str]
                 "source_strategy_id": source_id or None,
             }
         raise HTTPException(status_code=400, detail=f"import failed: {msg}") from exc
+    except Exception as exc:
+        if wrote_file:
+            try:
+                target.unlink()
+            except Exception:
+                pass
+        raise HTTPException(status_code=400, detail=f"import failed: {exc}") from exc
 
     new_id = str((reg or {}).get("strategy_id") or "").strip()
     if not new_id:
@@ -1792,6 +1865,11 @@ def _import_code_strategy(source_code: dict, source_id: str, warnings: list[str]
         raise HTTPException(status_code=500, detail="registration returned no strategy id")
 
     stage = _apply_import_attribution(new_id, source_id, str(target))
+    warnings = list(warnings)
+    warnings.append(
+        "Imported as a SANDBOX-ONLY strategy: its code runs only inside the isolated "
+        "worker (secret-free, network-denied), never in the main app."
+    )
     if not bool((reg or {}).get("certified", True)):
         cert_err = (reg or {}).get("certification_error")
         warnings.append(
@@ -1805,6 +1883,7 @@ def _import_code_strategy(source_code: dict, source_id: str, warnings: list[str]
         "state": None,
         "warnings": warnings,
         "source_strategy_id": source_id or None,
+        "sandbox_only": True,
     }
 
 

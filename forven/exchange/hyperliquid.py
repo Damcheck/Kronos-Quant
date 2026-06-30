@@ -438,6 +438,41 @@ def _assert_execution_allowed(testnet: bool) -> None:
     )
 
 
+def _assert_withdrawal_safe_wallet_for_mainnet(
+    testnet: bool, main_wallet: str, agent_wallet: str
+) -> None:
+    """Live MAINNET trading must use a Hyperliquid API/agent wallet, not a master key.
+
+    An API/agent wallet (created via ``approveAgent``) is protocol-barred from
+    withdrawals and transfers, so even a full host compromise that exfiltrates the
+    configured signing key is limited to *trading* — it cannot move funds off the
+    exchange. A master-account private key, by contrast, can sign ``withdraw3`` /
+    ``usdSend`` and drain the account. We therefore refuse to place REAL-money
+    orders with a master key unless the operator explicitly accepts that exposure
+    via ``FORVEN_HL_ALLOW_MASTER_KEY=1``. Paper/testnet is unaffected — no real
+    funds, no withdrawal risk. ``main_wallet`` != ``agent_wallet`` (a distinct,
+    on-chain-approved agent; approval itself is verified by
+    ``_ensure_agent_authorized_for_trading``) is the agent-wallet signature.
+    """
+    if testnet:
+        return
+    if _is_agent_trading_on_behalf(main_wallet, agent_wallet):
+        return  # distinct approved agent wallet — withdrawal-incapable by protocol
+    if _is_truthy(os.environ.get("FORVEN_HL_ALLOW_MASTER_KEY")):
+        log.warning(
+            "HyperLiquid live trading with a MASTER-account key (withdrawal-capable): "
+            "FORVEN_HL_ALLOW_MASTER_KEY override is set. A host compromise could move "
+            "funds off the exchange with this key — prefer a separate API/agent wallet."
+        )
+        return
+    raise RuntimeError(
+        "Refusing live mainnet trading with a master-account private key. Hyperliquid "
+        "API/agent wallets cannot withdraw or transfer, so the safe setup is a separate "
+        "API wallet (approveAgent) plus your main wallet address in Settings. To trade "
+        "with a withdrawal-capable master key anyway, set FORVEN_HL_ALLOW_MASTER_KEY=1."
+    )
+
+
 def _hl_encryption_disabled() -> bool:
     env_value = os.environ.get("FORVEN_HL_DISABLE_ENCRYPTION")
     if env_value is not None and str(env_value).strip():
@@ -1009,6 +1044,8 @@ def _exchange_for_trading(
     _ensure_agent_authorized_for_trading(
         exchange, info, auth_wallet, str(getattr(exchange, "base_url", ""))
     )
+    _agent_wallet = str(getattr(getattr(exchange, "wallet", None), "address", "") or "").strip()
+    _assert_withdrawal_safe_wallet_for_mainnet(testnet, auth_wallet, _agent_wallet)
     return exchange, info, address
 
 
@@ -1210,6 +1247,37 @@ def _extract_bulk_order_ids(result: dict, order_labels: list[str]) -> dict[str, 
     return extracted
 
 
+def _first_status_error(result: dict) -> str | None:
+    """The exchange's rejection reason from an order response, if any.
+
+    HyperLiquid reports a rejected leg as a per-status ``{"error": ...}`` inside
+    ``response.data.statuses`` (with a top-level ``status:"ok"``), or as a
+    top-level ``{"status":"err","response":"..."}``. Returns the first such error
+    so a single-order placer can fail CLOSED instead of returning a success-shaped
+    payload that carries no order id.
+    """
+    if not isinstance(result, dict):
+        return None
+    top = str(result.get("error") or "").strip()
+    if top:
+        return top
+    try:
+        response = result.get("response")
+        data = response.get("data") if isinstance(response, dict) else None
+        statuses = data.get("statuses") if isinstance(data, dict) else None
+        if isinstance(statuses, list):
+            for st in statuses:
+                if isinstance(st, dict) and str(st.get("error") or "").strip():
+                    return str(st["error"]).strip()
+        if str(result.get("status") or "").strip().lower() in ("err", "error"):
+            resp = response if isinstance(response, str) else result.get("response")
+            if isinstance(resp, str) and resp.strip():
+                return resp.strip()
+    except Exception:
+        pass
+    return None
+
+
 def _build_order_cloids(idempotency_key: str | None, order_labels: list[str]) -> dict[str, Cloid]:
     clo_ids: dict[str, Cloid] = {}
     base_key = str(idempotency_key or "").strip()
@@ -1363,12 +1431,23 @@ def market_order(
     client_order_ids = _attach_order_cloids(orders, order_labels, idempotency_key)
     result = _submit("place_order", hl_trade_breaker, exchange.bulk_orders, orders)
     order_ids = _extract_bulk_order_ids(result, order_labels)
+    # HL-1: the ENTRY leg is the only HARD requirement. If the entry filled but a
+    # protective leg (stop/tp) was rejected per-status (e.g. "would immediately
+    # trigger" in a fast adverse move, or a tick/precision rejection on the cap leg),
+    # do NOT raise and discard the real fill — that strands an UNPROTECTED orphan
+    # position the caller never records. Require only "entry"; surface which
+    # protective legs failed so the caller arms them with a follow-up reduce-only
+    # order (and the periodic reconcile re-arms a missing stop as a backstop).
     _require_bulk_order_ids(
         result,
-        order_labels=order_labels,
+        order_labels=["entry"],
         order_ids=order_ids,
         client_order_ids=client_order_ids,
     )
+    protective_leg_failed = [
+        lbl for lbl in order_labels
+        if lbl in ("stop", "take_profit") and lbl not in order_ids
+    ]
     # Use actual fill price if available, otherwise fall back to limit price
     actual_fill = _extract_fill_price(result, status_index=0)
     actual_size = _extract_fill_size(result, status_index=0)
@@ -1390,6 +1469,19 @@ def market_order(
         payload["stop_order_id"] = order_ids["stop"]
     if "take_profit" in order_ids:
         payload["take_profit_order_id"] = order_ids["take_profit"]
+    if protective_leg_failed:
+        payload["protective_leg_failed"] = protective_leg_failed
+        payload["protective_leg_error"] = _first_status_error(result)
+        log.error(
+            "%s %s entry filled but protective leg(s) %s were rejected (%s) — caller must arm them",
+            asset, side, protective_leg_failed, payload["protective_leg_error"],
+        )
+    # LIVE-6: signal when the entry price is the FALLBACK aggressive limit (no avgPx
+    # in the response) so the caller doesn't record a non-real fill — either an IOC
+    # that didn't fill, or a filled response that omitted avgPx. entry_price stays as
+    # the limit for display, but flagged unconfirmed.
+    if actual_fill is None:
+        payload["fill_price_unknown"] = True
     return payload
 
 
@@ -1617,6 +1709,15 @@ def place_protective_stop(
     if "stop" in order_ids:
         payload["stop_order_id"] = order_ids["stop"]
         payload.setdefault("order_id", order_ids["stop"])
+        return payload
+    # HL-3 / MANUAL-3: no order id came back — the trigger was rejected (per-status
+    # or top-level). This placer previously returned a success-shaped payload with no
+    # id, so a caller checking only result.get("error") reported a stop as PLACED
+    # when it was not, leaving the position unprotected with a false confirmation.
+    # Fail CLOSED so every caller surfaces the rejection.
+    if "error" not in payload:
+        payload["error"] = _first_status_error(result) or "protective stop rejected by exchange (no order id returned)"
+    log.error("place_protective_stop %s: no order id returned — %s", asset, payload["error"])
     return payload
 
 
@@ -1697,6 +1798,13 @@ def place_take_profit(
     if "take_profit" in order_ids:
         payload["take_profit_order_id"] = order_ids["take_profit"]
         payload.setdefault("order_id", order_ids["take_profit"])
+        return payload
+    # HL-3 / MANUAL-3: fail CLOSED when no order id is returned (per-status or
+    # top-level rejection), so a caller never records a take-profit that was not
+    # actually placed.
+    if "error" not in payload:
+        payload["error"] = _first_status_error(result) or "take-profit rejected by exchange (no order id returned)"
+    log.error("place_take_profit %s: no order id returned — %s", asset, payload["error"])
     return payload
 
 
@@ -1774,7 +1882,16 @@ def cancel_all_orders(asset: str | None = None, testnet: bool = True, vault_addr
 
     _assert_execution_allowed(testnet)
     exchange, info, address = _exchange_for_trading(testnet, vault_address=vault_address)
-    orders = info.open_orders(address)
+    # HL-5: read open orders through the breaker/retry wrapper (like every other account
+    # read) so a transient 502/timeout is retried instead of aborting the whole flatten /
+    # cancel sweep on the first blip. On a hard failure, surface an error marker rather
+    # than raising uncaught.
+    try:
+        orders = _with_breaker("account", hl_account_breaker, info.open_orders, address)
+    except Exception as exc:
+        log.error("cancel_all_orders %s: open-orders read failed (%s); aborting cancel sweep (will retry).",
+                  asset or "ALL", exc)
+        return [{"error": f"open_orders read failed: {exc}"}]
     results = []
     for order in orders:
         coin = order.get("coin", "")

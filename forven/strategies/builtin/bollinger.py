@@ -40,11 +40,33 @@ class BollingerStrategy(BaseStrategy):
             f"Sells when price falls back to the middle band."
         )
 
-    def generate_signal(self, df: pd.DataFrame) -> Signal:
-        from forven.scanner import adx, atr
+    def generate_signals(self, df: pd.DataFrame):
+        """Vectorized twin of generate_signal — the SINGLE source of entry/exit logic."""
+        from forven.strategies.indicators import adx
         p = self.params
         bp = p.get("bb_period", 20)
-        
+
+        close = df["close"]
+        bb_mid = close.rolling(bp).mean()
+        bb_std = close.rolling(bp).std()
+        bb_upper = bb_mid + p.get("bb_std", 2.0) * bb_std
+        ema200 = close.ewm(span=200, adjust=False).mean()
+        adx_val = adx(df, p.get("adx_period", 14))
+
+        prev_close = close.shift(1)
+        prev_bb_upper = bb_upper.shift(1)
+
+        breakout = (prev_close <= prev_bb_upper) & (close > bb_upper)
+        entry = breakout & (close > ema200) & (adx_val >= p.get("adx_min", 20))
+        exit_ = close < bb_mid
+
+        return entry.fillna(False), exit_.fillna(False)
+
+    def generate_signal(self, df: pd.DataFrame) -> Signal:
+        from forven.strategies.indicators import adx, atr
+        p = self.params
+        bp = p.get("bb_period", 20)
+
         close = df["close"]
         bb_mid = close.rolling(bp).mean()
         bb_std = close.rolling(bp).std()
@@ -55,18 +77,16 @@ class BollingerStrategy(BaseStrategy):
 
         # Get values for current and previous bar
         curr_close = float(close.iloc[-1])
-        prev_close = float(close.iloc[-2])
-        
+
         curr_bb_upper = float(bb_upper.iloc[-1])
-        prev_bb_upper = float(bb_upper.iloc[-2])
         curr_bb_mid = float(bb_mid.iloc[-1])
         curr_ema200 = float(ema200.iloc[-1])
         curr_adx = float(adx_val.iloc[-1])
         curr_atr = float(atr_14.iloc[-1])
 
-        breakout = prev_close <= prev_bb_upper and curr_close > curr_bb_upper
-        entry = breakout and curr_close > curr_ema200 and curr_adx >= p.get("adx_min", 20)
-        exit_ = curr_close < curr_bb_mid
+        entries, exits = self.generate_signals(df)
+        entry = bool(entries.iloc[-1])
+        exit_ = bool(exits.iloc[-1])
 
         return Signal(
             entry_signal=bool(entry), exit_signal=bool(exit_),

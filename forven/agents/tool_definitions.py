@@ -20,7 +20,9 @@ BRAIN_AGENT_IDS = [
     "quant-researcher",
     "simulation-agent",
     "risk-manager",
-    "execution-trader",
+    # execution-trader retired 2026-06-30 (execution is kernel-driven; no LLM
+    # order path) — removed from the assignable roster so the brain can't
+    # delegate trading tasks to it.
     "strategy-developer",
     "full-stack-engineer",
     "brain",

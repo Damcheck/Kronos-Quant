@@ -3,7 +3,6 @@
 import json
 import logging
 
-from forven.config import is_beta_build
 from forven.db import get_db, kv_get, log_activity
 from .context import _current_agent_id_var, _current_task_display_id_var
 from .tool_registry import register_tool
@@ -12,21 +11,25 @@ log = logging.getLogger("forven.agents.runner")
 
 
 def _register_live_execution_tool(**kwargs):
-    """register_tool() variant that disappears in packaged beta builds.
+    """No-op decorator: place_order / close_position are NOT exposed as agent tools.
 
-    place_order and close_position currently hardcode testnet=True, so they
-    can't actually move real funds — but (a) defense in depth: a future
-    change that plumbs testnet from env could silently flip to live, and
-    (b) the audit explicitly called these out as "don't even show them to
-    the LLM in a tester install." If the tool isn't registered, the model
-    literally cannot call it: the tool name never appears in the registry
-    that builds the per-turn tool list. No runtime check to forget, no
-    permission flag that could be misconfigured. See security audit
-    2026-04-23.
+    Trade execution is owned end-to-end by the scanner's parity kernel
+    (``manage_positions_via_kernel`` → ``_execute_direct`` / the local paper
+    applier) and by the operator's manual position controls (``api_domains/
+    paper_control.py``, ``api_domains/trading.py``). The LLM agents must NOT place
+    or close orders out-of-band: an execution-trader "close phantom positions"
+    task ran exchange closes against LOCAL paper trades, which returned no fill,
+    marked them pending_close_reconcile, and the sweep then finalized them as
+    "unknown"/incomplete closes — corrupting the paper book. (See the unknown-close
+    investigation, 2026-06-30; the out-of-band-trade-write hazard from the security
+    hardening initiative.)
+
+    Returning a no-op decorator means the tool name NEVER enters the registry, so
+    the model literally cannot call it — no permission flag to misconfigure, defense
+    in depth matching the original beta-build rationale (security audit 2026-04-23).
+    The handler functions stay defined for direct/internal use and tests.
     """
-    if is_beta_build():
-        return lambda fn: fn
-    return register_tool(**kwargs)
+    return lambda fn: fn
 
 
 def _execution_bool_setting(name: str, default: bool) -> bool:
@@ -62,6 +65,26 @@ def _resolve_strategy_from_trade(trade_id: str | None) -> str | None:
     return None
 
 
+def _resolve_paper_mark_price(asset: str) -> float | None:
+    """Current mark (mid) for ``asset`` — used to close a LOCAL paper trade at a
+    real price without touching the exchange. Returns None when no live mark is
+    available; callers must refuse rather than fabricate a fill."""
+    symbol = str(asset or "").strip().upper()
+    if not symbol:
+        return None
+    try:
+        from forven.exchange.hyperliquid import get_all_mids
+
+        mids = get_all_mids(testnet=True) or {}
+        raw = mids.get(symbol)
+        if raw is None:
+            raw = mids.get(asset)
+        return float(raw) if raw is not None else None
+    except Exception as exc:
+        log.warning("Could not resolve mark price for %s: %s", asset, exc)
+        return None
+
+
 def _extract_task_strategy_id(task: dict) -> str | None:
     """Resolve strategy_id from a task row, using explicit field or input payload."""
     if not isinstance(task, dict):
@@ -91,7 +114,8 @@ _STAGE_TO_OWNER_GUARD = {
     "quick_screen": "simulation-agent",
     "gauntlet": "simulation-agent",
     "paper": "risk-manager",
-    "live_graduated": "execution-trader",
+    # execution-trader retired — live oversight ownership is risk-manager's.
+    "live_graduated": "risk-manager",
 }
 
 
@@ -122,12 +146,6 @@ def _check_task_owner(
     """Verify that the current strategy owner matches the worker owner."""
     normalized_agent = _normalize_agent_id(agent_id)
     normalized_task_type = str(task_type or "").strip().lower()
-
-    # Execution tasks must be runnable by execution-trader even while a strategy
-    # is in paper ownership (risk-manager). Blocking here prevents
-    # exchange orders from ever being placed.
-    if normalized_agent == "execution-trader" and normalized_task_type in {"execution", "trade_execution"}:
-        return None, True
 
     # strategy-developer codes containers at any stage; ownership is irrelevant.
     if normalized_agent == "strategy-developer" and normalized_task_type in (
@@ -510,7 +528,11 @@ def _tool_close_position(params: dict) -> str:
     Both paper and live modes execute on testnet. Paper mode IS testnet trading.
     """
     from forven.exchange.hyperliquid import close_position
-    from forven.trade_state import mark_trade_pending_close_reconcile
+    from forven.trade_state import (
+        close_trade_record,
+        is_local_only_paper_trade,
+        mark_trade_pending_close_reconcile,
+    )
 
     asset = params["asset"]
     size = params["size"]
@@ -518,6 +540,54 @@ def _tool_close_position(params: dict) -> str:
 
     trade_id = params.get("trade_id")
     strategy_id = params.get("strategy_id") or params.get("strategy")
+
+    # A local-only paper trade NEVER reached the exchange — there is no position
+    # there to close. Routing it through close_position() returns no fill, marks
+    # the trade pending_close_reconcile, and the reconcile sweep then finalizes it
+    # as an "unknown"/incomplete close (the bug this fixes). Close it LOCALLY at
+    # the current mark instead. Refuse rather than fabricate when no mark is
+    # available — never invent a fill price.
+    if trade_id:
+        try:
+            with get_db() as conn:
+                _trade_row = conn.execute(
+                    "SELECT * FROM trades WHERE id = ?", (str(trade_id),)
+                ).fetchone()
+            local_trade = dict(_trade_row) if _trade_row else None
+        except Exception as exc:
+            local_trade = None
+            log.warning("close_position: could not load trade %s: %s", trade_id, exc)
+        if local_trade and is_local_only_paper_trade(local_trade):
+            mark_price = _resolve_paper_mark_price(asset)
+            if mark_price is None:
+                msg = (
+                    f"Cannot close local paper trade {trade_id}: no current mark price "
+                    f"for {asset} (refusing to fabricate an exit)."
+                )
+                log.warning(msg)
+                return json.dumps({"error": msg})
+            closed = close_trade_record(
+                str(trade_id),
+                signal_exit_price=mark_price,
+                exit_price=mark_price,
+                close_reason=str(params.get("close_reason") or "agent_paper_local_close"),
+                close_price_source="agent_paper_local",
+                only_if_open=True,
+            )
+            log_activity(
+                "trade", "execution-trader",
+                f"CLOSE (paper-local) {asset} trade={trade_id} @ {mark_price}",
+            )
+            return json.dumps(
+                {
+                    "status": "closed_local_paper",
+                    "trade_id": trade_id,
+                    "asset": asset,
+                    "exit_price": mark_price,
+                    "updated": bool((closed or {}).get("updated")),
+                },
+                default=str,
+            )
 
     log.info("EXECUTION: Closing %s %.6f %s", side, size, asset)
     log_activity("trade", "execution-trader", f"CLOSE: {side} {asset} size={size}")

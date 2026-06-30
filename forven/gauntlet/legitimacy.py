@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from forven.gauntlet.models import normalize_step_key
@@ -66,13 +67,24 @@ def validate_robustness_payload(step_key: object, payload: dict[str, Any]) -> di
         return {"ok": True, "reason": "parameter jitter payload has stability evidence"}
 
     if normalized == "cost_stress":
-        has_cost_metric = any(
-            key in payload
-            for key in ("stressed_sharpe", "min_sharpe", "degradation_pct", "baseline_metrics", "stressed_metrics")
-        )
-        if not has_cost_metric:
-            return {"ok": False, "reason": "cost stress needs stressed performance evidence"}
-        return {"ok": True, "reason": "cost stress payload has stressed-cost evidence"}
+        # Align with what _run_cost_stress actually emits: `original`, `stressed`
+        # (each a metrics dict) and `degradation_pct`. The old key list matched on
+        # `degradation_pct`, which is ALWAYS present (initialized to 0.0), so the check
+        # was vacuous — it verified nothing about whether the stressed rerun ran. Require
+        # a real stressed metrics dict with a finite Sharpe.
+        stressed = payload.get("stressed")
+        if not isinstance(stressed, dict) or not isinstance(payload.get("original"), dict):
+            return {"ok": False, "reason": "cost stress missing original/stressed rerun metrics"}
+        if "total_trades" not in stressed:
+            return {"ok": False, "reason": "cost stress stressed-rerun has no trade evidence"}
+        s_sharpe = stressed.get("sharpe_ratio", stressed.get("sharpe"))
+        try:
+            ok_sharpe = s_sharpe is not None and math.isfinite(float(s_sharpe))
+        except (TypeError, ValueError):
+            ok_sharpe = False
+        if not ok_sharpe:
+            return {"ok": False, "reason": "cost stress stressed-rerun has no finite Sharpe"}
+        return {"ok": True, "reason": "cost stress payload has original+stressed rerun metrics"}
 
     if normalized == "regime_split":
         regimes = _as_list(payload.get("regimes"))

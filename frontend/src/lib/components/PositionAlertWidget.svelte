@@ -106,7 +106,12 @@
 
 	function openSessionFromAlert(sessionId: string) {
 		if (typeof window === 'undefined') return;
+		// Persist for the cross-page case: navigating to /trading mounts the page,
+		// which reads this key and selects the session.
 		window.localStorage.setItem('forven.paper.selectedSessionId', sessionId);
+		// Live channel for the already-on-/trading case: the same-URL <a> nav is a
+		// no-op, so the page never re-reads the key. Tell the mounted page directly.
+		window.dispatchEvent(new CustomEvent('forven:select-session', { detail: { sessionId } }));
 	}
 
 	async function refreshPositionAlert() {

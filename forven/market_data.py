@@ -14,13 +14,26 @@ log = logging.getLogger("forven.market_data")
 
 HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
 
+# DATA-1: cover the HyperLiquid-native candle intervals, not just a 6-entry subset.
+# Strategies on 30m / 2h / 3m / 8h / 12h are first-class everywhere else (data.TIMEFRAME_MS
+# + strategy creation), but were silently undtradeable in live/paper because the fetcher
+# raised "unsupported interval" on every call. (6h / 45m are NOT HL-native candle intervals
+# and are rejected at fetch — a promotion-time timeframe validation against this set is the
+# follow-up for those.)
 INTERVAL_TO_MS = {
     "1m": 60_000,
+    "3m": 3 * 60_000,
     "5m": 5 * 60_000,
     "15m": 15 * 60_000,
+    "30m": 30 * 60_000,
     "1h": 60 * 60_000,
+    "2h": 2 * 60 * 60_000,
     "4h": 4 * 60 * 60_000,
+    "8h": 8 * 60 * 60_000,
+    "12h": 12 * 60 * 60_000,
     "1d": 24 * 60 * 60_000,
+    "3d": 3 * 24 * 60 * 60_000,
+    "1w": 7 * 24 * 60 * 60_000,
 }
 
 
@@ -186,8 +199,11 @@ def fetch_hyperliquid_candles(
     interval: str = "1h",
     end_time: int | None = None,
     clean: bool = False,
+    include_unclosed: bool = False,
 ) -> pd.DataFrame:
-    """Fetch OHLCV candles from HyperLiquid and return a normalized dataframe."""
+    """Fetch OHLCV candles from HyperLiquid and return a normalized dataframe.
+    Drops the unclosed active candle unless ``include_unclosed`` (the chart wants the
+    live forming bar)."""
     normalized_coin = str(coin or "").strip().upper()
     if not normalized_coin:
         raise ValueError("coin is required")
@@ -232,8 +248,10 @@ def fetch_hyperliquid_candles(
         df[column] = df[column].astype(float)
         
     # Prevent lookahead bias / repainting by dropping the unclosed active candle
-    reference_ts = pd.Timestamp(end_ms, unit="ms", tz="UTC") if end_time else pd.Timestamp.now("UTC")
-    df = df[df.index + pd.Timedelta(interval_ms, unit="ms") <= reference_ts]
+    # (kept when include_unclosed — the chart shows the live forming bar).
+    if not include_unclosed:
+        reference_ts = pd.Timestamp(end_ms, unit="ms", tz="UTC") if end_time else pd.Timestamp.now("UTC")
+        df = df[df.index + pd.Timedelta(interval_ms, unit="ms") <= reference_ts]
     
     normalized = df.rename(
         columns={
@@ -318,3 +336,340 @@ def ohlcv_rows_to_dataframe(rows: list[dict]) -> pd.DataFrame:
             frame[column] = 0.0
     frame = frame.dropna(subset=["open", "high", "low", "close"])
     return frame[["open", "high", "low", "close", "volume"]]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Binance market data (the lead exchange) — paper trades on REAL Binance data so
+# the chart, signals, and prices match the backtest (which also uses Binance) and
+# the real market, instead of HyperLiquid testnet (which drifts). Execution stays
+# in-app; only the DATA comes from Binance. Public market data needs no API key.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_BINANCE_EXCHANGE = None
+
+
+def _binance_exchange():
+    """Lazy, process-wide ccxt Binance client (public market data, rate-limited)."""
+    global _BINANCE_EXCHANGE
+    if _BINANCE_EXCHANGE is None:
+        import ccxt
+
+        _BINANCE_EXCHANGE = ccxt.binance({"enableRateLimit": True})
+    return _BINANCE_EXCHANGE
+
+
+def _binance_symbol(coin: str) -> str:
+    """Map a coin/asset token to the Binance ccxt spot pair (e.g. BTC -> BTC/USDT).
+
+    Uses USDT — the same quote the backtest's Binance lake stores — so paper reads
+    the identical series the backtest validated on.
+    """
+    from forven.symbol_mapping import _extract_crypto_base
+
+    token = str(coin or "").strip().upper()
+    base = _extract_crypto_base(token) or token
+    return f"{base}/USDT"
+
+
+def fetch_binance_candles(
+    coin: str,
+    *,
+    bars: int = 300,
+    interval: str = "1h",
+    end_time: int | None = None,
+    clean: bool = False,
+    include_unclosed: bool = False,
+) -> pd.DataFrame:
+    """Fetch OHLCV candles from BINANCE — a drop-in for ``fetch_hyperliquid_candles``.
+
+    Returns the same normalized frame (UTC open-time index; open/high/low/close/volume).
+    The unclosed active candle is dropped (no lookahead/repaint for signals) UNLESS
+    ``include_unclosed`` is True — the CHART passes True so it shows the live forming
+    bar like TradingView, while the scanner keeps closed bars. Paginates Binance's
+    1000-bar/call cap so the scanner's long window and the chart's 2000-bar window
+    are served.
+    """
+    normalized_coin = str(coin or "").strip().upper()
+    if not normalized_coin:
+        raise ValueError("coin is required")
+    normalized_interval = str(interval or "1h").strip().lower()
+    interval_ms = INTERVAL_TO_MS.get(normalized_interval)
+    if interval_ms is None:
+        raise ValueError(f"unsupported interval: {interval}")
+
+    requested_bars = max(int(bars), 1)
+    symbol = _binance_symbol(normalized_coin)
+    exchange = _binance_exchange()
+    end_ms = int(end_time) if end_time else int(time.time() * 1000)
+    start_ms = end_ms - (requested_bars + 1) * interval_ms
+
+    rows: list[list] = []
+    since = start_ms
+    per_call = 1000
+    last_err: Exception | None = None
+    for _attempt in range(2):  # one retry on a transient network hiccup
+        try:
+            rows = []
+            cursor = since
+            while cursor < end_ms:
+                batch = exchange.fetch_ohlcv(symbol, timeframe=normalized_interval, since=cursor, limit=per_call)
+                if not batch:
+                    break
+                rows.extend(batch)
+                last_t = int(batch[-1][0])
+                if len(batch) < per_call or last_t + interval_ms >= end_ms:
+                    break
+                cursor = last_t + interval_ms
+            last_err = None
+            break
+        except Exception as exc:  # noqa: BLE001 — surfaced below if both attempts fail
+            last_err = exc
+    if last_err is not None:
+        raise RuntimeError(f"Binance candle fetch failed for {symbol} {normalized_interval}: {last_err}")
+    if not rows:
+        raise RuntimeError(f"No candle data returned for {symbol} {normalized_interval}")
+
+    df = pd.DataFrame(rows, columns=["t", "open", "high", "low", "close", "volume"])
+    df["t"] = pd.to_datetime(df["t"].astype("int64"), unit="ms", utc=True)
+    df = df[~df.index.duplicated(keep="last")] if df.index.name == "t" else df
+    df = df.drop_duplicates(subset="t", keep="last").set_index("t").sort_index()
+    for column in ("open", "high", "low", "close", "volume"):
+        df[column] = df[column].astype(float)
+
+    # Drop the unclosed active candle (no lookahead / repaint), mirroring HL fetch —
+    # unless the caller (the chart) wants the live forming bar shown.
+    if not include_unclosed:
+        reference_ts = pd.Timestamp(end_ms, unit="ms", tz="UTC") if end_time else pd.Timestamp.now("UTC")
+        df = df[df.index + pd.Timedelta(interval_ms, unit="ms") <= reference_ts]
+    df = df[["open", "high", "low", "close", "volume"]].tail(requested_bars)
+
+    if clean:
+        df = clean_ohlcv(df, interval=normalized_interval)
+    return df
+
+
+def fetch_binance_prices(coins) -> dict[str, float]:
+    """Latest Binance spot prices for a list of coins, keyed by bare coin (BTC, ETH…)."""
+    tokens = [str(c).strip().upper() for c in (coins or []) if c]
+    if not tokens:
+        return {}
+    exchange = _binance_exchange()
+    sym_to_coin: dict[str, str] = {}
+    for token in tokens:
+        sym = _binance_symbol(token)
+        from forven.symbol_mapping import _extract_crypto_base
+
+        sym_to_coin[sym] = _extract_crypto_base(token) or token
+    out: dict[str, float] = {}
+    try:
+        tickers = exchange.fetch_tickers(list(sym_to_coin.keys()))
+        for sym, ticker in (tickers or {}).items():
+            coin = sym_to_coin.get(sym)
+            last = ticker.get("last") if isinstance(ticker, dict) else None
+            if last is None and isinstance(ticker, dict):
+                last = ticker.get("close")
+            if coin and last is not None:
+                out[coin] = float(last)
+    except Exception:
+        for sym, coin in sym_to_coin.items():
+            try:
+                ticker = exchange.fetch_ticker(sym)
+                last = ticker.get("last") or ticker.get("close")
+                if last is not None:
+                    out[coin] = float(last)
+            except Exception:
+                continue
+    return out
+
+
+def fetch_binance_price(coin: str) -> float | None:
+    """Latest Binance spot price for one coin, or None."""
+    return fetch_binance_prices([coin]).get(_binance_symbol(coin).split("/")[0])
+
+
+def resolve_market_data_source() -> str:
+    """The configured market-data exchange for paper data/prices. Default 'binance'
+    (the lead exchange); the operator can set 'hyperliquid' to revert."""
+    try:
+        from forven.api_core import get_settings
+
+        src = str(get_settings().get("market_data_source", "binance") or "binance").strip().lower()
+    except Exception:
+        src = "binance"
+    return src if src in ("binance", "hyperliquid") else "binance"
+
+
+def fetch_market_candles(
+    coin: str,
+    *,
+    bars: int = 300,
+    interval: str = "1h",
+    end_time: int | None = None,
+    clean: bool = False,
+    include_unclosed: bool = False,
+) -> pd.DataFrame:
+    """Source-aware candle fetch: Binance (default) or HyperLiquid, per the
+    ``market_data_source`` setting. When the source is Binance it does NOT silently
+    fall back to HyperLiquid on error (that would reintroduce the wrong prices) —
+    it raises, and the caller skips. ``include_unclosed`` keeps the live forming bar
+    (the chart wants it; the scanner does not)."""
+    if resolve_market_data_source() == "binance":
+        return fetch_binance_candles(coin, bars=bars, interval=interval, end_time=end_time, clean=clean, include_unclosed=include_unclosed)
+    return fetch_hyperliquid_candles(coin, bars=bars, interval=interval, end_time=end_time, clean=clean, include_unclosed=include_unclosed)
+
+
+class BinancePriceFeed:
+    """Async Binance price feed mirroring HyperLiquidFeed's interface — polls spot
+    tickers and dispatches ``{coin: price}`` to ``on_price``. Binance has no public
+    allMids websocket, so a short poll is used (fresh enough for paper marking)."""
+
+    def __init__(self, coins, on_price, poll_seconds: float = 3.0):
+        if callable(coins):
+            self._coins_fn = coins
+        else:
+            _static = [str(c).upper() for c in coins]
+            self._coins_fn = lambda: _static
+        self.on_price = on_price
+        self._poll = max(float(poll_seconds), 1.0)
+
+    async def _dispatch(self, prices: dict[str, float]):
+        import asyncio
+        import inspect
+
+        if not prices:
+            return
+        if asyncio.iscoroutinefunction(self.on_price):
+            await self.on_price(prices)
+            return
+        result = self.on_price(prices)
+        if inspect.isawaitable(result):
+            await result
+
+    async def start(self):
+        import asyncio
+
+        delay = 1.0
+        while True:
+            try:
+                coins = self._coins_fn()
+                prices = await asyncio.to_thread(fetch_binance_prices, coins)
+                await self._dispatch(prices)
+                delay = 1.0
+                await asyncio.sleep(self._poll)
+            except Exception as exc:  # noqa: BLE001 — keep the feed alive, back off
+                log.warning("BinancePriceFeed poll failed: %s", exc)
+                await asyncio.sleep(min(delay, 30.0))
+                delay = min(delay * 2, 30.0)
+
+
+# ─── Binance derivatives data (funding + open interest) ──────────────────────
+# Backtest AND paper read the SAME funding/OI columns (via backtest._enrich_with_
+# market_data). Sourcing them from Binance — like the candles — keeps the two
+# engines on one venue. Binance funds every 8h; we express the rate PER HOUR
+# (rate / 8) so it merges onto the candle grid and accrues exactly like the
+# (hourly) HyperLiquid series did — one funding convention across both engines.
+_FUTURES_BINANCE_EXCHANGE = None
+_BINANCE_FUNDING_INTERVAL_HOURS = 8.0
+_FUNDING_SERIES_CACHE: dict[str, tuple[float, list[tuple[int, float]]]] = {}
+_OI_SERIES_CACHE: dict[str, tuple[float, list[tuple[int, float]]]] = {}
+_SERIES_CACHE_TTL = 300.0  # funding events are 8h apart; 5-min cache is plenty
+
+
+def _binance_futures_exchange():
+    """Lazy ccxt Binance USDⓈ-M FUTURES client (funding/OI live on the perp venue)."""
+    global _FUTURES_BINANCE_EXCHANGE
+    if _FUTURES_BINANCE_EXCHANGE is None:
+        import ccxt
+
+        _FUTURES_BINANCE_EXCHANGE = ccxt.binance(
+            {"options": {"defaultType": "future"}, "enableRateLimit": True}
+        )
+    return _FUTURES_BINANCE_EXCHANGE
+
+
+def _fetch_binance_funding_series_raw(symbol: str, start_ms: int, end_ms: int) -> list[tuple[int, float]]:
+    exchange = _binance_futures_exchange()
+    out: list[tuple[int, float]] = []
+    since = int(start_ms)
+    per_call = 1000
+    for _ in range(60):  # bound pagination (60*1000 events ≫ any window)
+        batch = exchange.fetch_funding_rate_history(symbol, since=since, limit=per_call)
+        if not batch:
+            break
+        for row in batch:
+            ts = int(row.get("timestamp") or 0)
+            rate = row.get("fundingRate")
+            if ts and rate is not None and ts <= end_ms:
+                out.append((ts, float(rate) / _BINANCE_FUNDING_INTERVAL_HOURS))
+        last_ts = int(batch[-1].get("timestamp") or 0)
+        if len(batch) < per_call or last_ts >= end_ms or last_ts <= since:
+            break
+        since = last_ts + 1
+    out.sort(key=lambda pair: pair[0])
+    return out
+
+
+def fetch_binance_funding_series(coin: str, start_ms: int | None = None, end_ms: int | None = None) -> list[tuple[int, float]]:
+    """Binance funding as (timestamp_ms, PER-HOUR rate) pairs over a window — a
+    drop-in for ``market_data_collector.get_funding_rate_series`` (which is HL)."""
+    symbol = _binance_symbol(coin)
+    now = time.time()
+    end_ms = int(end_ms) if end_ms else int(now * 1000)
+    start_ms = int(start_ms) if start_ms else end_ms - 730 * 24 * 3600 * 1000
+    cached = _FUNDING_SERIES_CACHE.get(symbol)
+    if cached and (now - cached[0]) < _SERIES_CACHE_TTL and cached[1] and cached[1][0][0] <= start_ms:
+        series = cached[1]
+    else:
+        series = _fetch_binance_funding_series_raw(symbol, start_ms, end_ms)
+        if series:
+            _FUNDING_SERIES_CACHE[symbol] = (now, series)
+    return [(ts, rate) for ts, rate in series if start_ms <= ts <= end_ms]
+
+
+def fetch_binance_oi_series(coin: str, start_ms: int | None = None, end_ms: int | None = None, *, interval: str = "1h") -> list[tuple[int, float]]:
+    """Binance open interest as (timestamp_ms, OI) pairs — best-effort. Binance's
+    openInterestHist only covers ~30 days, so deep-history bars have no OI (the
+    column stays sparse, matching the graceful "absent → zeros" handling)."""
+    symbol = _binance_symbol(coin)
+    now = time.time()
+    end_ms = int(end_ms) if end_ms else int(now * 1000)
+    start_ms = int(start_ms) if start_ms else end_ms - 30 * 24 * 3600 * 1000
+    cached = _OI_SERIES_CACHE.get(symbol)
+    if cached and (now - cached[0]) < _SERIES_CACHE_TTL:
+        series = cached[1]
+    else:
+        try:
+            exchange = _binance_futures_exchange()
+            batch = exchange.fetch_open_interest_history(symbol, interval, since=int(start_ms), limit=500)
+        except Exception:
+            batch = []
+        series = []
+        for row in batch or []:
+            ts = int(row.get("timestamp") or 0)
+            oi = row.get("openInterestAmount")
+            if oi is None and isinstance(row.get("info"), dict):
+                oi = row["info"].get("sumOpenInterest")
+            if ts and oi is not None:
+                series.append((ts, float(oi)))
+        series.sort(key=lambda pair: pair[0])
+        _OI_SERIES_CACHE[symbol] = (now, series)
+    return [(ts, oi) for ts, oi in series if start_ms <= ts <= end_ms]
+
+
+def fetch_binance_funding_rate(coin: str) -> float | None:
+    """Latest Binance funding rate as a PER-HOUR rate (rate/8). Source-aware
+    drop-in for ``fetch_hyperliquid_funding_rate``."""
+    try:
+        exchange = _binance_futures_exchange()
+        info = exchange.fetch_funding_rate(_binance_symbol(coin))
+        rate = info.get("fundingRate") if isinstance(info, dict) else None
+        return None if rate is None else float(rate) / _BINANCE_FUNDING_INTERVAL_HOURS
+    except Exception:
+        return None
+
+
+def fetch_market_funding_rate(coin: str) -> float | None:
+    """Source-aware latest funding rate: Binance (default) or HyperLiquid."""
+    if resolve_market_data_source() == "binance":
+        return fetch_binance_funding_rate(coin)
+    return fetch_hyperliquid_funding_rate(coin)

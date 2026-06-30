@@ -82,40 +82,47 @@ class WilliamsR_ADX_Strategy(BaseStrategy):
             f"Sells when %R crosses down from above {p['williams_r_overbought']}."
         )
 
+    def generate_signals(self, df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+        """Vectorized twin of generate_signal - the SINGLE source of entry/exit logic."""
+        p = self.params
+
+        wr = williams_r(df, p["williams_r_period"])
+        adx_val = self._adx(df, p["adx_period"])
+        prev_wr = wr.shift(1)
+
+        # Entry: Williams %R crosses UP from below oversold AND ADX >= threshold
+        entry = (
+            (prev_wr < p["williams_r_oversold"])
+            & (wr >= p["williams_r_oversold"])
+            & (adx_val >= p["adx_threshold"])
+        )
+
+        # Exit: Williams %R crosses DOWN from above overbought
+        exit_ = (prev_wr > p["williams_r_overbought"]) & (wr <= p["williams_r_overbought"])
+
+        return entry.fillna(False), exit_.fillna(False)
+
     def generate_signal(self, df: pd.DataFrame) -> Signal:
         p = self.params
-        
+
         # Calculate indicators
         wr = williams_r(df, p["williams_r_period"])
         adx_val = self._adx(df, p["adx_period"])
-        
+
         # Get current and previous values
         curr_close = float(df["close"].iloc[-1])
         curr_wr = float(wr.iloc[-1])
-        prev_wr = float(wr.iloc[-2])
         curr_adx = float(adx_val.iloc[-1])
-        
-        # Entry: Williams %R crosses UP from below oversold AND ADX > threshold
-        # Cross up means: previous < oversold AND current >= oversold
-        entry = (
-            prev_wr < p["williams_r_oversold"] 
-            and curr_wr >= p["williams_r_oversold"]
-            and curr_adx >= p["adx_threshold"]
-        )
-        
-        # Exit: Williams %R crosses DOWN from above overbought
-        # Cross down means: previous > overbought AND current <= overbought
-        exit_ = (
-            prev_wr > p["williams_r_overbought"] 
-            and curr_wr <= p["williams_r_overbought"]
-        )
-        
+
+        # Decision comes from the vectorized twin
+        entries, exits = self.generate_signals(df)
+
         # Calculate confidence based on ADX strength
         confidence = min(1.0, curr_adx / 40) if curr_adx >= p["adx_threshold"] else 0.0
-        
+
         return Signal(
-            entry_signal=bool(entry),
-            exit_signal=bool(exit_),
+            entry_signal=bool(entries.iloc[-1]),
+            exit_signal=bool(exits.iloc[-1]),
             price=round(curr_close, 4),
             direction="long",
             confidence=round(confidence, 2),

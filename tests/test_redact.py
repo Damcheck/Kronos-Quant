@@ -35,6 +35,25 @@ def test_slack_token_scrubbed():
     assert count == 1
 
 
+def test_oauth_and_key_json_fields_scrubbed():
+    """P1.5: the JSON-value redactor must cover the OAuth + key field names this
+    app actually stores secrets under (access/refresh/id_token/token/private_key/
+    api_secret) — the pre-P1.5 list omitted them."""
+    cases = {
+        '"access": "ya29-secret-access-token-value"': "ya29-secret-access-token-value",
+        '"refresh": "1-refresh-token-secret-value-xyz"': "1-refresh-token-secret-value-xyz",
+        '"id_token": "header-payloadsegment-signature"': "header-payloadsegment-signature",
+        '"token": "rawtokensecretvalue1234567890"': "rawtokensecretvalue1234567890",
+        '"private_key": "deadbeefcafef00d-not-a-real-key"': "deadbeefcafef00d-not-a-real-key",
+        '"api_secret": "supersecretapivalue0987654321"': "supersecretapivalue0987654321",
+    }
+    for text, secret in cases.items():
+        scrubbed, count = redact(text)
+        assert secret not in scrubbed, f"leaked secret in: {text}"
+        assert REDACTED_MARKER in scrubbed
+        assert count >= 1
+
+
 def test_github_token_scrubbed():
     text = "GH token: ghp_abcdefghij1234567890ABCDEFGHIJ123456"
     scrubbed, count = redact(text)

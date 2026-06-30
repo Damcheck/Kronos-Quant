@@ -5,7 +5,7 @@ Supports both LONG and SHORT position modes.
 
 import pandas as pd
 
-from forven.strategies.base import BaseStrategy, Signal
+from forven.strategies.base import BaseStrategy, DirectionalSignals, Signal
 
 TYPE_NAME = "keltner"
 
@@ -57,29 +57,25 @@ class KeltnerStrategy(BaseStrategy):
             f"Sells when price falls to the middle line."
         )
 
-    def generate_signal(self, df: pd.DataFrame) -> Signal:
-        from forven.scanner import adx
+    def _bands(self, df: pd.DataFrame):
+        """Compute the Keltner channel bands (mid/upper/lower) the SAME way the
+        per-bar method does, resolving the param-name aliases once."""
         p = self.params
-        
         # Support multiple naming conventions
         kp = (
-            p.get("keltner_period") or 
-            p.get("keltner_window") or 
+            p.get("keltner_period") or
+            p.get("keltner_window") or
             p.get("kc_period", 20)
         )
         km = (
-            p.get("keltner_mult") or 
-            p.get("keltner_multiplier") or 
+            p.get("keltner_mult") or
+            p.get("keltner_multiplier") or
             p.get("kc_mult", 2.0)
         )
         # Also support atr_multiplier as alias for keltner multiplier
         if p.get("atr_multiplier"):
             km = p.get("atr_multiplier")
-            
-        adx_period = p.get("adx_period", 14)
-        adx_min = p.get("adx_min", 20)
-        position = p.get("position", "long")  # "long" or "short"
-        
+
         close = df["close"]
         kc_mid = close.ewm(span=kp, adjust=False).mean()
         h, low_p, c = df["high"], df["low"], df["close"]
@@ -87,7 +83,77 @@ class KeltnerStrategy(BaseStrategy):
         atr_kc = tr.ewm(span=kp, adjust=False).mean()
         kc_upper = kc_mid + km * atr_kc
         kc_lower = kc_mid - km * atr_kc
-        
+        return kp, km, kc_mid, kc_upper, kc_lower
+
+    def generate_signals(self, df: pd.DataFrame) -> DirectionalSignals:
+        """Vectorized twin of ``generate_signal`` — the SINGLE source of entry/exit
+        logic so the backtest and the live/paper scanner trade the identical signal
+        set. ``generate_signal`` delegates here for its boolean decision.
+
+        Long (position="long"): enter when close crosses up through the upper
+        Keltner band (prev close at/below, current above) while ADX clears its
+        floor; exit when close falls below the channel mid. Short (position="short")
+        mirrors it: enter on a cross down through the lower band, cover when close
+        rises back above the mid.
+        """
+        from forven.strategies.indicators import adx
+
+        p = self.params
+        adx_period = p.get("adx_period", 14)
+        adx_min = p.get("adx_min", 20)
+        position = p.get("position", "long")  # "long" or "short"
+
+        close = df["close"]
+        kp, _, kc_mid, kc_upper, kc_lower = self._bands(df)
+
+        # Optional: ADX filter for regime detection. When disabled the per-bar
+        # method uses curr_adx=50, which always clears adx_min for the defaults,
+        # so the vectorized equivalent is an all-True gate.
+        use_adx_filter = p.get("use_adx_filter", True)
+        if use_adx_filter:
+            adx_ok = adx(df, adx_period) >= adx_min
+        else:
+            adx_ok = pd.Series(50 >= adx_min, index=df.index)
+
+        prev_close = close.shift(1)
+        prev_upper = kc_upper.shift(1)
+        prev_lower = kc_lower.shift(1)
+
+        # Mirror the per-bar method's warmup guard (`if len(df) < kp + 2: neutral`):
+        # the first kp+1 bars (positional index < kp+1) emit no signal at all.
+        ready = pd.Series(range(len(df)), index=df.index) >= (kp + 1)
+
+        empty = pd.Series(False, index=df.index, dtype=bool)
+
+        if position == "short":
+            short_entries = (close < kc_lower) & (prev_close >= prev_lower) & adx_ok & ready
+            short_exits = (close > kc_mid) & ready
+            return DirectionalSignals(
+                long_entries=empty.copy(),
+                long_exits=empty.copy(),
+                short_entries=short_entries.fillna(False),
+                short_exits=short_exits.fillna(False),
+            )
+
+        long_entries = (close > kc_upper) & (prev_close <= prev_upper) & adx_ok & ready
+        long_exits = (close < kc_mid) & ready
+        return DirectionalSignals(
+            long_entries=long_entries.fillna(False),
+            long_exits=long_exits.fillna(False),
+            short_entries=empty.copy(),
+            short_exits=empty.copy(),
+        )
+
+    def generate_signal(self, df: pd.DataFrame) -> Signal:
+        from forven.strategies.indicators import adx
+        p = self.params
+
+        adx_period = p.get("adx_period", 14)
+        position = p.get("position", "long")  # "long" or "short"
+
+        close = df["close"]
+        kp, km, kc_mid, kc_upper, kc_lower = self._bands(df)
+
         # Optional: ADX filter for regime detection
         use_adx_filter = p.get("use_adx_filter", True)
         if use_adx_filter:
@@ -95,34 +161,40 @@ class KeltnerStrategy(BaseStrategy):
             curr_adx = float(adx_val.iloc[-1])
         else:
             curr_adx = 50  # Default to allowing signals if ADX filter disabled
-            
+
         # Check if we have enough data
         if len(df) < kp + 2:
-            return Signal.HOLD
-            
-        prev_close = close.iloc[-2]
+            return Signal(
+                entry_signal=False, exit_signal=False,
+                price=float(close.iloc[-1]), direction=position, confidence=0.0,
+            )
+
         curr_close = close.iloc[-1]
-        prev_upper = kc_upper.iloc[-2]
-        curr_upper = kc_upper.iloc[-1]
-        prev_lower = kc_lower.iloc[-2]
-        curr_lower = kc_lower.iloc[-1]
         curr_mid = kc_mid.iloc[-1]
-        
+
+        # Single source of truth for the decision (keeps per-bar and vectorized in lockstep).
+        sig = self.generate_signals(df)
+        if position == "short":
+            entry_now = bool(sig.short_entries.iloc[-1])
+            exit_now = bool(sig.short_exits.iloc[-1])
+        else:
+            entry_now = bool(sig.long_entries.iloc[-1])
+            exit_now = bool(sig.long_exits.iloc[-1])
+
         if position == "short":
             # SHORT SIGNAL: price breaks below lower Keltner channel in downtrend
-            if curr_close < curr_lower and prev_close >= prev_lower:
-                if curr_adx >= adx_min:
-                    return Signal(
-                        entry_signal=True,
-                        exit_signal=False,
-                        price=float(curr_close),
-                        direction="short",
-                        confidence=0.7,
-                        indicators={"kc_upper": float(kc_upper.iloc[-1]), "kc_lower": float(kc_lower.iloc[-1]), "kc_mid": float(curr_mid), "adx": curr_adx}
-                    )
-            
+            if entry_now:
+                return Signal(
+                    entry_signal=True,
+                    exit_signal=False,
+                    price=float(curr_close),
+                    direction="short",
+                    confidence=0.7,
+                    indicators={"kc_upper": float(kc_upper.iloc[-1]), "kc_lower": float(kc_lower.iloc[-1]), "kc_mid": float(curr_mid), "adx": curr_adx}
+                )
+
             # EXIT SHORT: price rises above middle line
-            if curr_close > curr_mid:
+            if exit_now:
                 return Signal(
                     entry_signal=False,
                     exit_signal=True,
@@ -133,19 +205,18 @@ class KeltnerStrategy(BaseStrategy):
                 )
         else:
             # LONG SIGNAL: price breaks above upper Keltner channel in uptrend
-            if curr_close > curr_upper and prev_close <= prev_upper:
-                if curr_adx >= adx_min:
-                    return Signal(
-                        entry_signal=True,
-                        exit_signal=False,
-                        price=float(curr_close),
-                        direction="long",
-                        confidence=0.7,
-                        indicators={"kc_upper": float(kc_upper.iloc[-1]), "kc_lower": float(kc_lower.iloc[-1]), "kc_mid": float(curr_mid), "adx": curr_adx}
-                    )
-            
+            if entry_now:
+                return Signal(
+                    entry_signal=True,
+                    exit_signal=False,
+                    price=float(curr_close),
+                    direction="long",
+                    confidence=0.7,
+                    indicators={"kc_upper": float(kc_upper.iloc[-1]), "kc_lower": float(kc_lower.iloc[-1]), "kc_mid": float(curr_mid), "adx": curr_adx}
+                )
+
             # EXIT LONG: price falls below middle line
-            if curr_close < curr_mid:
+            if exit_now:
                 return Signal(
                     entry_signal=False,
                     exit_signal=True,
@@ -154,8 +225,11 @@ class KeltnerStrategy(BaseStrategy):
                     confidence=1.0,
                     indicators={"kc_mid": float(curr_mid)}
                 )
-            
-        return Signal.HOLD
+
+        return Signal(
+            entry_signal=False, exit_signal=False,
+            price=float(curr_close), direction=position, confidence=0.0,
+        )
 
 
 STRATEGY_CLASS = KeltnerStrategy

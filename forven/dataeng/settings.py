@@ -51,7 +51,13 @@ class DataEngineSettings(BaseModel):
     # keeps the funnel fail-open when no divergence has been computed yet.
     source_reconciliation: dict[str, Any] = Field(
         default_factory=lambda: {
-            "enabled": False,
+            # Enabled by default: the backtest validates on Binance while paper/live
+            # trade HyperLiquid, so this gate flags + blocks promotion when the two
+            # series diverge above max_divergence_pct. It stays FAIL-OPEN
+            # (block_when_missing=False) until the reconciliation job has computed a
+            # reading, so it never jams a never-reconciled strategy — it only bites a
+            # real, measured divergence (the safety net for the accepted venue gap).
+            "enabled": True,
             "max_divergence_pct": 2.0,
             "block_when_missing": False,
             "staleness_hours": 24,

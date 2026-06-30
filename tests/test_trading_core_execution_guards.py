@@ -374,3 +374,47 @@ def test_reconcile_exchange_positions_flags_duplicate_sqlite_trades(forven_db, m
 
     discrepancy_types = {item["type"] for item in result["discrepancies"]}
     assert "duplicate_sqlite_trades" in discrepancy_types
+
+
+_MAIN = "0x1111111111111111111111111111111111111111"
+_AGENT = "0x2222222222222222222222222222222222222222"
+
+
+def test_mainnet_refuses_master_key(monkeypatch):
+    """Live mainnet with a master-account key (main == agent, or no separate main)
+    is refused — that key can sign withdraw3/usdSend and drain the account."""
+    pytest.importorskip("hyperliquid")
+    import forven.exchange.hyperliquid as hl
+
+    monkeypatch.delenv("FORVEN_HL_ALLOW_MASTER_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="master-account private key"):
+        hl._assert_withdrawal_safe_wallet_for_mainnet(False, _MAIN, _MAIN)
+    with pytest.raises(RuntimeError, match="master-account private key"):
+        hl._assert_withdrawal_safe_wallet_for_mainnet(False, "", _AGENT)
+
+
+def test_mainnet_allows_distinct_agent_wallet(monkeypatch):
+    """A separate agent wallet (main != agent) is withdrawal-incapable → allowed."""
+    pytest.importorskip("hyperliquid")
+    import forven.exchange.hyperliquid as hl
+
+    monkeypatch.delenv("FORVEN_HL_ALLOW_MASTER_KEY", raising=False)
+    hl._assert_withdrawal_safe_wallet_for_mainnet(False, _MAIN, _AGENT)  # no raise
+
+
+def test_testnet_never_blocks_on_wallet_type(monkeypatch):
+    """Paper/testnet has no real funds and no withdrawal risk — never blocked."""
+    pytest.importorskip("hyperliquid")
+    import forven.exchange.hyperliquid as hl
+
+    monkeypatch.delenv("FORVEN_HL_ALLOW_MASTER_KEY", raising=False)
+    hl._assert_withdrawal_safe_wallet_for_mainnet(True, _MAIN, _MAIN)  # no raise
+
+
+def test_mainnet_master_key_explicit_override(monkeypatch):
+    """The operator can knowingly accept withdrawal exposure via the env opt-in."""
+    pytest.importorskip("hyperliquid")
+    import forven.exchange.hyperliquid as hl
+
+    monkeypatch.setenv("FORVEN_HL_ALLOW_MASTER_KEY", "1")
+    hl._assert_withdrawal_safe_wallet_for_mainnet(False, _MAIN, _MAIN)  # no raise

@@ -24,8 +24,10 @@ _API_EXEMPT_PATH_PREFIXES = (
     # /api/shutdown has its own 127.0.0.1-only check and is called by the
     # local launcher/controller on close; keeping it auth-exempt lets a local
     # process trigger a graceful uvicorn teardown without needing the per-launch
-    # key. Worst case: a local process DoS's our own app — annoying, not a
-    # data/wallet risk.
+    # key. The browser drive-by this used to enable (a visited page POSTing from
+    # the loopback socket) is now blocked by CsrfOriginMiddleware and a local
+    # Origin backstop in the handler, so the residual is only a genuine local
+    # process triggering our own teardown.
     "/api/shutdown",
 )
 
@@ -116,19 +118,25 @@ def assert_safe_bind_host(bind_host: str) -> None:
     """Refuse to start an UNAUTHENTICATED API on a non-loopback interface.
 
     Auth is fail-open on loopback, which is safe for the documented single-user
-    localhost setup. But binding to 0.0.0.0 / a LAN IP without an API key would
-    expose the code-execution and order-management endpoints to the network, so
-    we fail closed there: an exposed bind must come with FORVEN_API_KEY (or an
-    explicit FORVEN_AUTH_REQUIRED=true).
+    localhost setup. But binding to 0.0.0.0 / a LAN IP without keys would expose
+    the code-execution and order-management endpoints to the network, so we fail
+    closed there. An exposed bind must come with BOTH FORVEN_API_KEY and
+    FORVEN_OPERATOR_KEY (audit P1.6): with only the API key, every operator route
+    (trade/system/update/MCP) would pass on the API key alone and the two-tier
+    auth would silently collapse to one.
     """
     if is_loopback_host(bind_host):
         return
-    if _read_env_secret("FORVEN_API_KEY") or _auth_required():
+    has_api = bool(_read_env_secret("FORVEN_API_KEY")) or _auth_required()
+    has_operator = bool(_read_env_secret("FORVEN_OPERATOR_KEY"))
+    if has_api and has_operator:
         return
     raise RuntimeError(
         f"Refusing to start: the API is bound to {bind_host!r} (reachable beyond "
-        "localhost) but FORVEN_API_KEY is not set. Set FORVEN_API_KEY (and "
-        "FORVEN_OPERATOR_KEY) in your .env, or bind to 127.0.0.1."
+        "localhost) but is not fully authenticated. A non-loopback bind requires "
+        "BOTH FORVEN_API_KEY and FORVEN_OPERATOR_KEY (or bind to 127.0.0.1). Without "
+        "the operator key the API key alone would unlock trade/system/update "
+        "endpoints — the two-tier auth would collapse to one."
     )
 
 
@@ -178,7 +186,11 @@ def require_operator_access(request: HTTPConnection) -> None:
     require_api_access(request)
     expected_operator_key = _read_env_secret("FORVEN_OPERATOR_KEY")
     if not expected_operator_key:
-        if _auth_required():
+        # Fail closed once ANY auth is enabled: if an API key is configured (or
+        # auth is required) but no operator key is set, operator routes must NOT be
+        # reachable on the API key alone — that collapses the two-tier model
+        # (audit P1.6). Only the fully-keyless localhost default stays open.
+        if _auth_required() or _read_env_secret("FORVEN_API_KEY"):
             raise HTTPException(status_code=503, detail="Operator key not configured")
         return
     if _request_secret_matches(request, expected_operator_key, header_names=(_OPERATOR_KEY_HEADER,)):
@@ -273,3 +285,79 @@ def get_allowed_cors_origins() -> list[str]:
         seen.add(origin)
         origins.append(origin)
     return origins
+
+
+_CSRF_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
+
+
+def _csrf_protection_enabled() -> bool:
+    """CSRF protection is ON by default. ``FORVEN_CSRF_PROTECT=false`` is a
+    documented escape hatch for an exotic deployment whose legitimate app origin
+    cannot be expressed via FORVEN_CORS_ORIGINS (e.g. a custom webview scheme)."""
+    value = _normalize_secret(os.environ.get("FORVEN_CSRF_PROTECT"))
+    if not value:
+        return True
+    return value.lower() in _TRUTHY
+
+
+def _request_target_origin(request: Request) -> str:
+    """The origin the request was actually addressed to, from the (already
+    TrustedHost-validated) Host header. Used to recognise same-origin requests."""
+    host = _normalize_secret(request.headers.get("host"))
+    if not host:
+        return ""
+    scheme = (request.url.scheme or "http")
+    return f"{scheme}://{host}".rstrip("/")
+
+
+def is_cross_site_state_change(request: Request) -> bool:
+    """True iff this is an unsafe-method request carrying a browser Origin/Referer
+    that is neither same-origin nor in the CORS allowlist — i.e. a drive-by CSRF.
+
+    Deliberately NOT flagged: a request with no Origin AND no Referer. Those are
+    non-browser callers (the local launcher, CLI, server-to-server) which a hostile
+    web page cannot emulate — browsers force an Origin header on every cross-site
+    state-changing fetch. This keeps the launcher/`/api/shutdown` path working while
+    closing the browser drive-by, and it can never be stricter than CORS already is:
+    any origin the legitimate app uses must be same-origin or CORS-allowlisted, or
+    the browser could not read API responses today."""
+    if request.method.upper() in _CSRF_SAFE_METHODS:
+        return False
+    stated = _normalize_secret(request.headers.get("origin"))
+    if not stated:
+        # A few browsers omit Origin but send Referer on same-site requests.
+        stated = _normalize_secret(request.headers.get("referer"))
+        if not stated:
+            return False  # non-browser caller — not a CSRF vector
+    source = _normalize_origin(stated)
+    if not source:
+        return False
+    if source == _request_target_origin(request):
+        return False  # same-origin is not CSRF by definition
+    return source not in set(get_allowed_cors_origins())
+
+
+class CsrfOriginMiddleware(BaseHTTPMiddleware):
+    """Reject cross-site state-changing requests (drive-by CSRF).
+
+    The API is reachable from a browser at 127.0.0.1, so a page the operator visits
+    could fire a ``fetch`` POST at it. Starlette's CORSMiddleware only withholds the
+    *response* from a disallowed origin; it does not stop the side effect from
+    landing. This guard does."""
+
+    async def dispatch(self, request: Request, call_next):
+        if _csrf_protection_enabled() and is_cross_site_state_change(request):
+            origin = _normalize_secret(request.headers.get("origin")) or _normalize_secret(
+                request.headers.get("referer")
+            )
+            log.warning(
+                "CSRF: rejected cross-site %s %s from origin %r",
+                request.method,
+                request.url.path,
+                origin,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Cross-origin state-changing request rejected"},
+            )
+        return await call_next(request)

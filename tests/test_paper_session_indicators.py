@@ -38,11 +38,12 @@ def test_session_indicators_follow_requested_timeframe_and_classify_panels(monke
 
     monkeypatch.setattr(paper_domain, "_find_compat_paper_session", lambda session_id, include_deployed=True: session)
 
-    def _fake_fetch(asset: str, *, bars: int = 300, interval: str = "1h", end_time=None, clean: bool = False):
+    def _fake_fetch(asset: str, *, bars: int = 300, interval: str = "1h", end_time=None,
+                    clean: bool = False, include_unclosed: bool = False, **_):
         requested_intervals.append(interval)
         return frame.tail(bars)
 
-    monkeypatch.setattr(paper_domain, "fetch_hyperliquid_candles", _fake_fetch)
+    monkeypatch.setattr(paper_domain, "fetch_market_candles",_fake_fetch)
 
     result = paper_domain.get_paper_session_indicators(
         "compat:strategy:S00338",
@@ -95,7 +96,7 @@ def test_session_indicators_use_container_default_periods(monkeypatch):
     )
 
     monkeypatch.setattr(paper_domain, "_find_compat_paper_session", lambda session_id, include_deployed=True: session)
-    monkeypatch.setattr(paper_domain, "fetch_hyperliquid_candles", lambda *_args, **_kwargs: frame)
+    monkeypatch.setattr(paper_domain, "fetch_market_candles",lambda *_args, **_kwargs: frame)
 
     result = paper_domain.get_paper_session_indicators(
         "compat:strategy:S-DEFAULT-PARAMS",

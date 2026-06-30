@@ -72,7 +72,7 @@ def _reject_bootstrap_quant_research_assignment(agent_id: str, task_type: str) -
     name="assign_agent_task",
     description=(
         "Assign a task to one of your agents. Only the Brain can do this. "
-        "Agents: quant-researcher, simulation-agent, strategy-developer, risk-manager, execution-trader, "
+        "Agents: quant-researcher, simulation-agent, strategy-developer, risk-manager, "
         "full-stack-engineer, brain. "
         "The agent will execute the task with tool access and report back."
     ),
@@ -83,7 +83,7 @@ def _reject_bootstrap_quant_research_assignment(agent_id: str, task_type: str) -
                 "type": "string",
                 "description": (
                     "Agent to assign to: quant-researcher, simulation-agent (backtest-engineer alias), strategy-developer, "
-                    "risk-manager, execution-trader, full-stack-engineer, brain."
+                    "risk-manager, full-stack-engineer, brain."
                 ),
                 "enum": BRAIN_AGENT_IDS,
             },

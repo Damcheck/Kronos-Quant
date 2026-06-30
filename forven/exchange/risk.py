@@ -1769,20 +1769,38 @@ def _norm_addr(value: object) -> str | None:
     return addr or None
 
 
+# DIRECTION-BOOKS-3: sentinel returned when a BOOKED trade's routing address can't be
+# resolved reliably (a 'database is locked' settings read). It never equals a real scope
+# address (None master / a sub-account), so the reconcile scope EXCLUDES the trade instead
+# of mis-scoping it into the master ghost-close pass and auto-closing a real position.
+_UNRESOLVABLE_ROUTE = "__route_unresolvable__"
+
+
 def _trade_routed_address(trade: dict) -> str | None:
     """The sub-account address a trade routes to (None = master wallet).
 
     Resolved from the trade's stored direction `book` via the books settings.
     NULL/"main" book and an unconfigured long book resolve to None.
+
+    DIRECTION-BOOKS-3: a BOOKED (long/short) trade must resolve from a RELIABLE settings
+    read. books._settings() swallows a locked-DB read to {}, which would resolve a real
+    sub-account trade to None (master) and let the master reconcile pass ghost-close it.
+    Read settings via the re-raising kv_get and return _UNRESOLVABLE_ROUTE on any read
+    failure so the scope filter skips the trade this pass (never defaults it to master).
     """
     book = trade.get("book")
-    if not book:
-        return None
+    if not book or str(book).strip().lower() in ("", "main"):
+        return None  # genuinely the master wallet
+    try:
+        raw = kv_get("forven:settings", {})
+        settings = raw if isinstance(raw, dict) else {}
+    except Exception:
+        return _UNRESOLVABLE_ROUTE  # locked/unreadable settings — DO NOT assume master
     try:
         from forven.exchange import books
-        return _norm_addr(books.book_address(book))
+        return _norm_addr(books.book_address(book, settings=settings))
     except Exception:
-        return None
+        return _UNRESOLVABLE_ROUTE
 
 
 def _recover_exit_from_fills(
@@ -2020,6 +2038,45 @@ def reconcile_exchange_positions(
                         continue
                     ghost_trades.append(trade)
 
+        # LIVE-EXCHANGE-RECONCILE-6: a user_state read can SUCCEED at the HTTP level yet
+        # return an empty/partial assetPositions (valid JSON, no exception). That makes
+        # every tracked live position look absent and would mass-ghost-close real
+        # positions — fabricated PnL, stripped protective stops, abandoned positions.
+        # Require N CONSECUTIVE empty-while-holding reads before mass-ghost-closing: a
+        # single glitch is skipped (retry), while a genuine simultaneous flatten (sustained
+        # empty) still reconciles. The streak persists in KV per routed account.
+        _real_ghosts = [t for t in ghost_trades if not is_local_only_paper_trade(t)]
+        _empty_streak_key = f"reconcile_empty_read_streak:{scope_address or 'master'}"
+        if _real_ghosts and not normalized_positions:
+            try:
+                _empty_streak = int(kv_get(_empty_streak_key, 0) or 0) + 1
+            except Exception:
+                _empty_streak = 1
+            try:
+                _empty_confirm = max(int((_load_risk_settings() or {}).get("reconcile_empty_read_confirm_count", 2) or 2), 1)
+            except Exception:
+                _empty_confirm = 2
+            if _empty_streak < _empty_confirm:
+                kv_set_best_effort(_empty_streak_key, _empty_streak, timeout_seconds=_RISK_WRITE_TIMEOUT_SECONDS)
+                log.error(
+                    "Reconcile: exchange returned ZERO positions while %d open live trade(s) are "
+                    "tracked on this account — SUSPICIOUS empty read (%d/%d). Skipping ghost-close "
+                    "to avoid fabricated closes / stripped stops; will retry next pass.",
+                    len(_real_ghosts), _empty_streak, _empty_confirm,
+                )
+                return {
+                    "error": "exchange returned no positions while open trades exist (suspicious empty read)",
+                    "error_kind": "fetch_unavailable",
+                    "suspicious_empty_read_streak": _empty_streak,
+                }
+            log.warning(
+                "Reconcile: %d consecutive empty reads (>= %d) while holding %d open trade(s) — "
+                "treating as a genuine flatten and proceeding with ghost reconciliation.",
+                _empty_streak, _empty_confirm, len(_real_ghosts),
+            )
+        # Non-suspicious read (positions present, or confirmed flatten): reset the streak.
+        kv_set_best_effort(_empty_streak_key, 0, timeout_seconds=_RISK_WRITE_TIMEOUT_SECONDS)
+
         for asset, position in hl_by_asset.items():
             if asset in db_by_asset:
                 local_trades = db_by_asset.get(asset, [])
@@ -2195,9 +2252,48 @@ def reconcile_exchange_positions(
                 db_by_asset.setdefault(asset, []).append({"id": adopted["trade_id"], "asset": asset})
                 continue
 
+            # LIVE-EXCHANGE-RECONCILE-1: a real exchange position with no matching SQLite
+            # trade that appears DURING a run (an open whose DB insert crashed, a
+            # partial-fill survivor, a manual position) must NOT sit naked until the next
+            # restart's adopt pass. Even when we do NOT adopt it here (periodic pass,
+            # adopt_missing_in_sqlite False), place/repair an EMERGENCY protective stop so
+            # an unmanaged orphan can't ride to liquidation. Tracking/adoption is still
+            # surfaced as a discrepancy for operator review.
+            _orphan_protection = None
+            try:
+                _orphan_repair_kwargs = {"account_address": account_address} if account_address else {}
+                _orphan_protection, open_orders = _repair_position_protection(
+                    position,
+                    matched_trade=None,
+                    open_orders=open_orders,
+                    price_map=price_map,
+                    testnet=testnet,
+                    **_orphan_repair_kwargs,
+                )
+            except Exception as _orphan_prot_exc:
+                log.error(
+                    "Could not place emergency protective stop on orphan %s %s: %s",
+                    position.get("direction"), asset, _orphan_prot_exc,
+                )
+            _orphan_placed = (_orphan_protection or {}).get("placed_order_id") if isinstance(_orphan_protection, dict) else None
+            _orphan_prot_status = (_orphan_protection or {}).get("status") if isinstance(_orphan_protection, dict) else None
+            if _orphan_placed:
+                resolved_actions.append({
+                    "type": "protection_restored",
+                    "asset": asset,
+                    "trade_id": None,
+                    "action": "placed_emergency_stop_on_untracked_orphan",
+                    "stop_order_id": _orphan_placed,
+                    "stop_source": (_orphan_protection or {}).get("stop_source"),
+                    "stop_price": (_orphan_protection or {}).get("stop_price"),
+                })
             discrepancies.append({
                 "type": "missing_in_sqlite",
-                "details": f"Exchange has {position['direction']} {asset} size={position['size']} but no matching SQLite trade",
+                "details": (
+                    f"Exchange has {position['direction']} {asset} size={position['size']} but no matching "
+                    f"SQLite trade — emergency protective stop "
+                    f"{'placed' if _orphan_placed else (_orphan_prot_status or 'attempted')} (not adopted)"
+                ),
             })
 
     if ghost_trades:
@@ -2725,6 +2821,11 @@ def _recompute_daily_halt_from_equity(account_equity: float) -> bool:
 _MAX_PLAUSIBLE_EQUITY = 1e12  # $1T — no real or testnet account reaches this
 _EQUITY_JUMP_REJECT_MULT = 100.0  # a single-tick 100x jump from the last good equity is suspect
 _EQUITY_JUMP_MAX_CONSECUTIVE_REJECTS = 5  # ...unless it persists this many ticks (a real deposit/regime change)
+# KS-CACHE-LOG: log (do NOT reject) any accepted single-tick move >= this mult or
+# <= its reciprocal. The 2026-06-29 false kill-switch was a ~28x inflated read that
+# latched a corrupt HWM while staying under the 100x hard-reject ceiling; this
+# leaves a durable trail at the moment such an inflation enters the risk state.
+_EQUITY_NOTABLE_MOVE_MULT = 2.0
 
 
 def _validate_equity_sample(account_equity: object, state: dict) -> tuple[bool, str]:
@@ -2786,6 +2887,7 @@ def _rejected_equity_result(state: dict, reason: str) -> dict:
 
 def _update_equity_locked(account_equity: float, source: str) -> dict:
     state = _get_risk_state()
+    prev_last_equity = float(state.get("last_equity") or 0.0)  # KS-CACHE-LOG: detect sharp accepted moves
 
     # Sanity guard: never let an implausible equity reading mutate the risk state
     # (high-water mark / kill-switch). A garbage sample is ignored and the next
@@ -2814,29 +2916,63 @@ def _update_equity_locked(account_equity: float, source: str) -> dict:
         state["daily_loss_halt_date"] = None
 
     prev_source = state.get("equity_source", "paper")
+
+    # DAEMON-EQUITY-FEED-RISK-STATE-1: in a LIVE session, a transient PAPER-source
+    # fallback (exchange briefly unreachable, daemon falls back to a paper equity)
+    # must NOT mutate the live risk state. Otherwise the subsequent paper->live
+    # "recovery" transition below re-baselines the HWM and CLEARS an already-fired
+    # daily-loss halt — silently lifting a halt the operator believes is in force.
+    # Ignore the sample entirely when the execution MODE is live but the sample is
+    # paper-sourced (a genuine paper-mode session keeps processing paper samples).
+    try:
+        from forven.config import get_execution_mode as _get_execution_mode
+        _exec_mode = str(_get_execution_mode() or "paper").strip().lower()
+    except Exception:
+        _exec_mode = "paper"
+    if source == "paper" and prev_source != "paper" and _exec_mode != "paper":
+        log.warning(
+            "Ignoring transient paper-source equity sample during a live session "
+            "(would flap the source basis and re-baseline/clear the kill-switch); risk state unchanged."
+        )
+        log_activity(
+            "warning", "risk",
+            "Ignored a transient paper-source equity reading during a live session; "
+            "kill-switch / daily-halt / high-water mark unchanged.",
+        )
+        _save_risk_state(state, best_effort=True)
+        return _rejected_equity_result(state, "transient paper sample in live session")
+
     state["equity_source"] = source
     hwm = state.get("high_water_mark", 0.0)
 
-    # PNL-1: re-baseline on ANY paper -> non-paper transition, not just the
-    # literal "exchange" source. The direction-books work introduced a new
-    # live source string ("books_aggregate"); a hardcoded == "exchange" check
-    # silently missed it, leaving the paper HWM (~$10k) in place against a live
-    # books equity (~$675) and arming a false kill-switch/daily-halt for the
-    # whole soak. Any real (non-paper) source must rebaseline.
-    if prev_source == "paper" and source != "paper" and hwm > 0:
+    # Re-baseline the HWM (and the daily-loss denominator) on ANY change of the real
+    # equity-source BASIS:
+    #   * PNL-1: paper -> non-paper (live just connected) — a hardcoded == "exchange"
+    #     check missed the "books_aggregate" source, leaving the ~$10k paper HWM
+    #     against ~$675 live equity and arming a false kill-switch.
+    #   * RISK-STATE-2: live <-> live basis change (e.g. books_aggregate <-> exchange
+    #     when books are toggled) sums a DIFFERENT set of accounts, so a stale HWM
+    #     from the other basis computes a phantom ~100% drawdown that force-flattens
+    #     live positions. Re-baseline the denominator.
+    # The daily-loss HALT is cleared ONLY on the initial paper->live connect; a
+    # live<->live basis flip must NOT lift an already-fired halt (RISK-STATE-1).
+    _initial_live_connect = (prev_source == "paper" and source != "paper")
+    _live_basis_changed = (source != prev_source and source != "paper" and prev_source != "paper")
+    if (_initial_live_connect or _live_basis_changed) and hwm > 0:
         log.info(
-            "Equity source changed: paper -> %s. "
-            "Re-baselining HWM ($%.2f -> $%.2f) and daily tracking.",
-            source, hwm, account_equity,
+            "Equity source basis changed: %s -> %s. Re-baselining HWM ($%.2f -> $%.2f) and daily tracking%s.",
+            prev_source, source, hwm, account_equity,
+            " (initial live connect — clearing any paper halt)" if _initial_live_connect else " (halt preserved)",
         )
         log_activity("info", "risk", (
-            f"Live equity connected ({source}) - source changed from paper. "
+            f"Equity source changed {prev_source} -> {source}. "
             f"HWM re-baselined: ${hwm:,.2f} -> ${account_equity:,.2f}."
         ))
         hwm = account_equity
         state["high_water_mark"] = hwm
-        state["daily_loss_halt"] = False
-        state["daily_loss_halt_date"] = None
+        if _initial_live_connect:
+            state["daily_loss_halt"] = False
+            state["daily_loss_halt_date"] = None
         kv_set_best_effort(
             sim_kv_key("daily_risk"),
             {"date": today, "start_equity": account_equity},
@@ -2867,6 +3003,19 @@ def _update_equity_locked(account_equity: float, source: str) -> dict:
     state["drawdown_pct"] = round(drawdown_pct, 6)
     state["last_equity"] = float(account_equity)
     state["updated_at"] = get_now().isoformat()
+
+    # KS-CACHE-LOG: durable trail when an accepted sample moves equity sharply in
+    # one tick. This only LOGS (does not reject), so an inflation that stays under
+    # the hard-reject ceiling (the 2026-06-29 ~28x books_aggregate read) is still
+    # visible in api.log at the moment it latches the HWM / arms a drawdown.
+    if prev_last_equity > 0 and account_equity > 0:
+        move = account_equity / prev_last_equity
+        if move >= _EQUITY_NOTABLE_MOVE_MULT or move <= 1.0 / _EQUITY_NOTABLE_MOVE_MULT:
+            log.warning(
+                "equity sample %.2fx last good in one tick (source=%s): $%.2f -> $%.2f; "
+                "HWM=$%.2f drawdown=%.1f%%",
+                move, source, prev_last_equity, account_equity, hwm, drawdown_pct * 100,
+            )
 
     daily_state = kv_get(sim_kv_key("daily_risk"))
     if (
@@ -2919,12 +3068,12 @@ def _update_equity_locked(account_equity: float, source: str) -> dict:
         _save_risk_state(state)
 
         log.critical(
-            "KILL SWITCH TRIGGERED - drawdown %.1f%% (equity $%.2f, HWM $%.2f)",
-            drawdown_pct * 100, account_equity, hwm,
+            "KILL SWITCH TRIGGERED - drawdown %.1f%% (equity $%.2f, HWM $%.2f, source=%s)",
+            drawdown_pct * 100, account_equity, hwm, source,
         )
         log_activity("critical", "risk", (
             f"KILL SWITCH: drawdown {drawdown_pct:.1%} from HWM ${hwm:,.2f}. "
-            f"Equity: ${account_equity:,.2f}. All positions will be closed."
+            f"Equity: ${account_equity:,.2f} (source={source}). All positions will be closed."
         ))
         return result
 

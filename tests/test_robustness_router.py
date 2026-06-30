@@ -472,7 +472,10 @@ def test_param_jitter_reruns_disable_strategy_state_sync(forven_db, monkeypatch)
     )
 
     assert result["n_iterations"] == 5
-    assert len(captured) == 5
+    # 5 perturbed reruns + 1 unperturbed same-window reference run (for the degradation
+    # baseline). ALL must keep strategy-state sync disabled (no auto-promote / metric
+    # overwrite) — that invariant is the point of this test.
+    assert len(captured) == 6
     assert all(call.get("sync_strategy_state") is False for call in captured), (
         "param-jitter rerun left sync_strategy_state enabled: "
         f"{[call.get('sync_strategy_state') for call in captured]}"

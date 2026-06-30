@@ -1,8 +1,14 @@
 """Engine-level tests for the manual-backtest execution model.
 
-Covers the opt-in stops + position-sizing path added to
-``_run_directional_signal_series`` and asserts the legacy (no-controls) path is
-byte-identical, so the autonomous/paper pipeline is unaffected.
+Covers the stops + position-sizing path in ``_run_directional_signal_series``.
+
+Parity overhaul note: a strategy with no actionable execution profile (None / {} /
+bare ``sizing_mode="full"``) is now sized by the default RISK ENGINE — 1% risk over a
+2x-ATR stop (``sizing_mode="atr"``), which the kernel both sizes off AND places as a
+real stop — via the shared ``execution_kernel`` (the SAME path the live/paper scanner
+uses). This replaces the old flat-1%-notional degeneracy (the "$100 on a $10k
+portfolio" bug) and is what makes paper reproduce the backtest for profile-less
+strategies (the common case). The tests below assert that unified behavior.
 """
 from __future__ import annotations
 
@@ -66,10 +72,10 @@ def test_normalize_coerces_and_clamps():
 
 
 # ---------------------------------------------------------------------------
-# Legacy invariance: no controls → identical to the historical implementation
+# No actionable profile → default ATR risk engine (parity with the scanner)
 # ---------------------------------------------------------------------------
 
-def test_legacy_path_unchanged_when_no_controls():
+def test_no_controls_uses_default_risk_sizing():
     df = _frame([100, 101, 102, 103, 104, 103, 102, 101, 100, 99])
     sig = _signals(df, entries=[1], exits=[5])
     trades = bt._run_directional_signal_series(df, sig, warmup=0, leverage=1.0, fee_bps=0.0, slippage_bps=0.0)
@@ -78,19 +84,28 @@ def test_legacy_path_unchanged_when_no_controls():
     # Entry fills next bar open after signal[1] -> bar 2 open=102; exit signal[5] -> bar 6 open=102.
     assert t["entry_price"] == pytest.approx(102.0)
     assert t["exit_price"] == pytest.approx(102.0)
-    assert "size_fraction" not in t  # legacy trades carry no sizing field
+    # No profile -> default ATR risk engine: risk-based sizing (NOT the old flat 1%
+    # notional). With a tight ATR stop the fraction clamps toward 1.0; the exact risk
+    # math is pinned in test_sizing.py. The key property: it's no longer piddly.
+    assert t["size_fraction"] > 0.01
+    assert t["size_fraction"] <= 1.0
+    assert t["exit_reason"] == "signal"
 
 
-def test_legacy_and_full_sizing_match():
-    """sizing_mode='full' with no stops normalises to None → identical trades."""
+def test_no_controls_and_full_sizing_match():
+    """Both None and bare sizing_mode='full' are 'no actionable profile' → identical
+    trades under the default ATR risk engine."""
     df = _frame([100, 101, 103, 102, 104, 101, 100])
     sig = _signals(df, entries=[1], exits=[4])
-    legacy = bt._run_directional_signal_series(df, sig, warmup=0, leverage=2.0, fee_bps=3.5, slippage_bps=2.0)
+    none_ctrl = bt._run_directional_signal_series(df, sig, warmup=0, leverage=2.0, fee_bps=3.5, slippage_bps=2.0)
     full = bt._run_directional_signal_series(
         df, sig, warmup=0, leverage=2.0, fee_bps=3.5, slippage_bps=2.0,
         execution_controls={"sizing_mode": "full"},
     )
-    assert [t["pnl_pct"] for t in legacy] == [t["pnl_pct"] for t in full]
+    assert [t["pnl_pct"] for t in none_ctrl] == [t["pnl_pct"] for t in full]
+    # Both resolve to the SAME default engine, so sizing matches and is risk-based.
+    assert none_ctrl[0]["size_fraction"] == pytest.approx(full[0]["size_fraction"])
+    assert none_ctrl[0]["size_fraction"] > 0.01
 
 
 # ---------------------------------------------------------------------------
@@ -255,22 +270,15 @@ def test_kelly_sizing_bounded():
 def test_fixed_sizing_scales_pnl():
     df = _frame([100, 100, 100, 110, 110])
     sig = _signals(df, entries=[1], exits=[3])
-    full = bt._run_directional_signal_series(
-        df, sig, warmup=0, leverage=1.0, fee_bps=0.0, slippage_bps=0.0,
-        execution_controls={"sizing_mode": "full"},
-    )
     sized = bt._run_directional_signal_series(
         df, sig, warmup=0, leverage=1.0, fee_bps=0.0, slippage_bps=0.0,
         execution_controls={"sizing_mode": "fixed", "fixed_size": 2500},
         initial_capital=10000.0,
     )
-    # fixed 2500/10000 = 0.25 of equity → quarter the pnl.
+    # Entry bar2 open=100, exit bar4 open=110 -> raw return 0.10; fixed 2500/10000 = 0.25
+    # of equity → a quarter of the raw return.
     assert sized[0]["size_fraction"] == pytest.approx(0.25)
-    # full path normalises to legacy (no size_fraction field); compare raw pnl.
-    legacy = bt._run_directional_signal_series(
-        df, sig, warmup=0, leverage=1.0, fee_bps=0.0, slippage_bps=0.0,
-    )
-    assert sized[0]["pnl_pct"] == pytest.approx(legacy[0]["pnl_pct"] * 0.25, rel=1e-3)
+    assert sized[0]["pnl_pct"] == pytest.approx(0.10 * 0.25, rel=1e-3)
 
 
 def test_fraction_risk_sizing_uses_stop_distance():

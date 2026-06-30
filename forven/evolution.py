@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from forven.brain import assign_task, transition_stage
 from forven.db import (
     append_strategy_event,
+    block_cross_asset_symbol_rehome,
     build_strategy_container_name,
     get_db,
     get_strategies,
@@ -784,11 +785,24 @@ def _execute_gauntlet_step(
 
         from forven.strategies.optimization_acceptance import apply_optimized_params_if_accepted
 
+        # Merge the swept overrides over the CURRENT params (preferring the optimizer's
+        # merged best_full_params). Writing the overrides ALONE would wipe every
+        # non-swept param from the strategy — the gauntlet apply path merges
+        # ({**current, **best}); mirror it so evaluation and the write use the same
+        # full param set.
+        current_params = params if isinstance(params, dict) else {}
+        full_params = None
+        for payload in (config_payload, metrics_payload):
+            if isinstance(payload, dict) and isinstance(payload.get("best_full_params"), dict) and payload["best_full_params"]:
+                full_params = dict(payload["best_full_params"])
+                break
+        new_params = {**current_params, **(full_params or best_params)}
+
         def _write_best_params(decision):
             with get_db() as conn:
                 conn.execute(
                     "UPDATE strategies SET params = ?, updated_at = ? WHERE id = ?",
-                    (json.dumps(best_params), datetime.now(timezone.utc).isoformat(), strategy_id),
+                    (json.dumps(new_params), datetime.now(timezone.utc).isoformat(), strategy_id),
                 )
             append_strategy_event(
                 strategy_id=strategy_id,
@@ -796,15 +810,15 @@ def _execute_gauntlet_step(
                 to_state=from_state,
                 actor="system",
                 reason="Applied optimized params (passed out-of-sample acceptance gate)",
-                details={"params": best_params, "motion": "params_applied", "acceptance": decision.as_record()},
+                details={"params": new_params, "motion": "params_applied", "acceptance": decision.as_record()},
             )
 
         outcome = apply_optimized_params_if_accepted(
             strategy_id=strategy_id,
             asset=symbol,
             strategy_type=strategy_type,
-            current_params=params if isinstance(params, dict) else {},
-            candidate_params=best_params,
+            current_params=current_params,
+            candidate_params=new_params,
             write_fn=_write_best_params,
             optimization_metrics=optimization_metrics,
             from_state=from_state,
@@ -1581,6 +1595,14 @@ def _sweep_pipeline_hygiene() -> dict[str, int]:
                                   OR se.reason LIKE 'Duplicate with active strategy%'
                               )
                               AND se.reason NOT LIKE '%canonical backtest%'
+                              -- Only count a gate failure EARNED in the strategy's
+                              -- CURRENT stage tenure. A failure that predates this
+                              -- stage entry is stale: a freshly revived/recovered
+                              -- strategy must get a fresh verdict, not be archived on
+                              -- the pre-revival reason that killed it last time.
+                              AND se.created_at >= COALESCE(
+                                  s.stage_changed_at, s.created_at, '1970-01-01T00:00:00+00:00'
+                              )
                             ORDER BY se.created_at DESC, se.id DESC
                             LIMIT 1
                           ) AS latest_gate_reason
@@ -1970,17 +1992,32 @@ def _run_testing_step_impl(code_first: bool = True) -> dict:
                     strategy_id=strat_id,
                 )
                 with get_db() as conn:
-                    conn.execute(
-                        "UPDATE strategies SET metrics = ?, symbol = ?, timeframe = ?, name = ?, updated_at = ? WHERE id = ?",
-                        (
-                            json.dumps(merged_metrics),
-                            selected_symbol,
-                            selected_timeframe,
-                            updated_name,
-                            datetime.now(timezone.utc).isoformat(),
-                            strat_id,
-                        ),
-                    )
+                    # Traded-asset freeze: if this strategy is already paper/live, keep
+                    # its promoted asset — still refresh metrics, but do not re-home it
+                    # onto a higher-scoring cross-asset context.
+                    if block_cross_asset_symbol_rehome(
+                        conn, strat_id, selected_symbol, source="evolution_context_select"
+                    ):
+                        conn.execute(
+                            "UPDATE strategies SET metrics = ?, updated_at = ? WHERE id = ?",
+                            (
+                                json.dumps(merged_metrics),
+                                datetime.now(timezone.utc).isoformat(),
+                                strat_id,
+                            ),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE strategies SET metrics = ?, symbol = ?, timeframe = ?, name = ?, updated_at = ? WHERE id = ?",
+                            (
+                                json.dumps(merged_metrics),
+                                selected_symbol,
+                                selected_timeframe,
+                                updated_name,
+                                datetime.now(timezone.utc).isoformat(),
+                                strat_id,
+                            ),
+                        )
 
                 promoted_now = False
                 gate_reason = "No gate evaluation recorded"

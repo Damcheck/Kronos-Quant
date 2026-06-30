@@ -393,8 +393,27 @@ class BatchTransitionBody(BaseModel):
 
 @router.post("/api/strategies/batch-transition")
 def batch_transition_strategies(body: BatchTransitionBody):
-    """Transition multiple strategies to a target stage in one call."""
+    """Transition multiple strategies to a target stage in one call.
+
+    This is an OPERATOR-initiated batch from the Forge, so it force-bypasses the
+    dethrone-approval / WIP / backtest-verification gates exactly like the single-row
+    Move Stage (which promotes with actor=api, force=True) — the operator's click IS
+    the approval. Without force, a bulk Archive of paper/live strategies only QUEUED
+    dethrone approvals and silently reported "failed", so nothing visibly happened.
+    Hard guards that force does NOT bypass (the VALID_TRANSITIONS graph, ghost-
+    container protection) still surface per-id in ``failed`` so the UI can show why.
+    """
     from forven.brain import transition_stage
+
+    # An operator batch may force past the dethrone-approval / WIP / backtest-verification
+    # gates for ARCHIVE / reject / demote / lateral moves — the click is the approval. But a
+    # PROMOTION to a capital stage must STILL pass evaluate_promotion: transition_stage only
+    # runs the gate when force is False (brain.py), so a blanket force=True here would let any
+    # caller bulk-promote unvetted strategies straight to paper/live, bypassing the gate.
+    # Never force a promotion to a capital stage; those go through the gate and surface in
+    # ``failed`` with a blocked_reason if they don't qualify.
+    _CAPITAL_STAGES = {"paper", "paper_trading", "deployed", "live_graduated"}
+    _force = str(body.stage or "").strip().lower() not in _CAPITAL_STAGES
 
     succeeded: list[str] = []
     failed: list[dict] = []
@@ -405,7 +424,7 @@ def batch_transition_strategies(body: BatchTransitionBody):
                 target_stage=body.stage,
                 reason=body.reason,
                 actor="ui",
-                force=False,
+                force=_force,
             )
             # transition_stage never raises for a *blocked* move (WIP cap,
             # approval-required, gate failure, …); it returns a dict whose
@@ -441,6 +460,25 @@ def update_strategy_default_params(strategy_id: str, body: PatchResultParamsBody
         pinned_backtest_id=body.pinned_backtest_id,
         actor="ui",
     )
+
+
+class PatchDisplayNameBody(BaseModel):
+    # None/blank clears the override and falls back to the canonical name.
+    display_name: str | None = Field(default=None, max_length=140)
+
+
+@router.patch("/api/strategies/{strategy_id}/display-name")
+def update_strategy_display_name(strategy_id: str, body: PatchDisplayNameBody):
+    return lifecycle.set_strategy_display_name(strategy_id, body.display_name, actor="ui")
+
+
+@router.get("/api/strategies/{strategy_id}/open-position")
+def get_strategy_open_position(strategy_id: str):
+    """Is this strategy currently in a trade? Drives the pre-edit warning so the
+    operator knows an execution-setting change will update the open position."""
+    from forven.api_domains.paper_control import open_position_summary
+
+    return open_position_summary(strategy_id)
 
 @router.get("/api/results")
 def get_backtest_results(

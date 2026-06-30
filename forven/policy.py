@@ -155,6 +155,10 @@ DEFAULT_PIPELINE_CONFIG = {
         "param_jitter_deadline_seconds": 240,  # wall-clock safety net; 0 disables
         "cost_stress_min_sharpe": 0.3,
         "regime_split_profitable_min": 0.50,
+        # Minimum trades a regime must hold to COUNT toward the regime-split diversity
+        # verdict. A 1-trade regime is statistically meaningless and must not satisfy the
+        # ≥2-regime gate or dilute the profitable-share. Plain integer.
+        "regime_split_min_trades_per_regime": 5,
         # DEPRECATED: the gauntlet gate now reads wfa_fold_pass_rate_min (below) as
         # the single fold-pass-rate floor. Retained only for back-compat with any
         # persisted KV payloads; no longer consulted by _evaluate_gauntlet_gate.
@@ -246,7 +250,11 @@ DEFAULT_PIPELINE_CONFIG = {
 PIPELINE_PRESETS = {
     "default": {},
     "relaxed": {
-        "quick_screen": {"min_trades": 5, "min_robustness_score": 0, "min_profit_factor": 1.0},
+        # min_is_sharpe MUST be listed even at 0.0: presets are re-applied as deltas over
+        # a fully-materialized stored config, so omitting it would let a prior preset's
+        # value (strict sets 0.2) survive a strict→relaxed switch, leaving "relaxed"
+        # stricter than default on the IS-Sharpe axis.
+        "quick_screen": {"min_trades": 5, "min_robustness_score": 0, "min_profit_factor": 1.0, "min_is_sharpe": 0.0},
         "gauntlet": {
             "min_trades": 5,
             "min_sharpe": 0.0,
@@ -332,6 +340,11 @@ _RATIO_THRESHOLD_PATHS = (
     # may enter 40 / 0.40 (or 60 / 0.60) interchangeably for the gauntlet->paper gate.
     ("gauntlet", "mc_max_dd_p95"),
     ("robustness_thresholds", "param_jitter_pass_rate_min"),
+    # Same fraction-in-[0,1] shape and same %-habit risk as the rails above: a
+    # percent-style entry (65 / 50) would otherwise be compared against a 0–1 measurement
+    # and silently break the Monte-Carlo / regime-split gates.
+    ("robustness_thresholds", "monte_carlo_percentile_min"),
+    ("robustness_thresholds", "regime_split_profitable_min"),
     # safety_floors ratio rails — accept percent (40) or fraction (0.40) like the gate
     # twins above, so a percent-habit entry can't store a raw 40 and silently no-op a
     # rail (incl. the real-money live_max_drawdown_pct ceiling).
@@ -593,12 +606,19 @@ def validate_backtest_metrics(metrics: dict) -> tuple[bool, float, str]:
     oos_sharpe = metrics.get("oos_sharpe")
     
     if is_sharpe is not None and oos_sharpe is not None:
-        gap = is_sharpe - oos_sharpe
+        # The IS/OOS Sharpe gap is a DIVERGENCE magnitude — instability is bad in BOTH
+        # directions: classic overfit (IS >> OOS) AND lucky-OOS noise (OOS >> IS, e.g.
+        # IS -1.58 / OOS +2.34 on a handful of trades). The old SIGNED `is - oos` only
+        # caught IS >> OOS, so a lucky-OOS context (signed value negative) sailed under
+        # the threshold, scored high on its OOS-weighted fitness, won the cross-asset
+        # "best" selection, got the strategy re-homed onto the wrong asset, and was then
+        # rejected by the promotion gate — archiving good strategies. abs() catches both.
+        gap = abs(is_sharpe - oos_sharpe)
         if gap > 1.5:
             rejection_reason = f"IS/OOS Sharpe gap too large: {gap:.2f} > 1.5 (is_sharpe={is_sharpe:.2f}, oos_sharpe={oos_sharpe:.2f})"
             log.warning(f"Strategy rejected: {rejection_reason}")
             return False, 0.0, rejection_reason
-        
+
         # Robustness penalty: IS/OOS gap > 0.50
         if gap > 0.50:
             penalty += 20.0
@@ -620,6 +640,35 @@ def validate_backtest_metrics(metrics: dict) -> tuple[bool, float, str]:
         log.warning(f"Robustness penalties applied: -{penalty:.1f} points. {rejection_reason}")
     
     return True, penalty, rejection_reason
+
+
+def is_degenerate_backtest_metrics(
+    metrics: dict, *, min_total_trades: int = 10, min_is_trades: int = 1
+) -> bool:
+    """True for a statistically meaningless backtest slice: too few trades OR zero
+    in-sample trades.
+
+    Such a slice yields a lucky high Sharpe (few all-winning OOS trades, IS Sharpe
+    0.00). In the Sharpe-dominated timeframe-sweep selector that lucky slice OUTSCORES
+    an honest 100+-trade run, so its contaminated metrics get persisted to
+    strategies.metrics — which the gate then reads as IS Sharpe 0.00 / <5 trades and
+    rejects, re-archiving an otherwise-healthy strategy on every retry. Used both to
+    keep a degenerate slice from winning the sweep AND from locking out an honest
+    rerun via the best-of-Sharpe merge. Fail-safe (returns False on any error)."""
+    try:
+        if not isinstance(metrics, dict) or not metrics:
+            return False
+        total = float(metrics.get("total_trades") or metrics.get("num_trades") or 0)
+        is_block = metrics.get("in_sample") if isinstance(metrics.get("in_sample"), dict) else {}
+        is_trades = float(
+            is_block.get("total_trades")
+            or is_block.get("num_trades")
+            or is_block.get("trades")
+            or 0
+        )
+        return total < float(min_total_trades) or is_trades < float(min_is_trades)
+    except Exception:
+        return False
 
 
 def score_strategy(metrics: dict) -> float:
@@ -701,11 +750,16 @@ def _normalize_pipeline_stage(value: str | None) -> str:
     return normalize_stage(value)
 
 
-def _to_percent_points(value: object, default: float = 0.0) -> float:
+def _to_percent_points(value: object, default: float = 0.0, *, always_scale: bool = False) -> float:
     try:
         parsed = float(value)
     except Exception:
         parsed = float(default)
+    if always_scale:
+        # The input is a known RATIO (e.g. total_return_pct = equity-1.0), which can
+        # exceed 1.0 for a >100% return; the |x|<=1 heuristic would under-scale it
+        # (a 1.5 ratio = +150% would be read as 1.5%). Scale unconditionally.
+        return parsed * 100.0
     if abs(parsed) <= 1.0:
         return parsed * 100.0
     return parsed
@@ -1181,6 +1235,18 @@ def _check_paper_duration(strategy_id: str) -> tuple[bool, str]:
         return False, "Could not parse stage timestamp"
 
 
+# PROMOTION-GATE-PARITY-2/3: the paper→live gate compounds per-trade pnl as an
+# equity-fraction (compute_live_metrics: equity *= 1+pnl). Only KERNEL-managed
+# faithful closes write pnl_pct as a net equity-fraction (flagged
+# pnl_is_equity_fraction); legacy/manual/converge closes write a leverage-MARGIN
+# return (~1/size_fraction larger) and are explicitly flagged non-parity ("must not
+# be promoted on these numbers"). Counting ONLY equity-fraction parity rows stops the
+# gate from compounding mixed units or promoting on non-parity legacy fills. Requires
+# a paper re-baseline (reset + re-open) so books are kernel-managed; on a non-rebased
+# book this fails CLOSED (too few parity rows -> no promotion), the safe direction.
+_PARITY_PNL_FILTER = " AND json_extract(signal_data, '$.pnl_is_equity_fraction') = 1"
+
+
 def _check_paper_trades(strategy_id: str) -> tuple[bool, str]:
     """Check if strategy has enough closed paper trades."""
     config = load_pipeline_config()
@@ -1201,6 +1267,7 @@ def _check_paper_trades(strategy_id: str) -> tuple[bool, str]:
             "WHERE COALESCE(strategy_id, strategy) = ? "
             "AND status = 'CLOSED' AND pnl_pct IS NOT NULL "
             "AND LOWER(COALESCE(execution_type, '')) LIKE 'paper%'"
+            + _PARITY_PNL_FILTER
             + where_since,
             tuple(params),
         ).fetchone()
@@ -1227,6 +1294,7 @@ def _check_paper_return(strategy_id: str) -> tuple[bool, str]:
             "WHERE COALESCE(strategy_id, strategy) = ? "
             "AND status = 'CLOSED' AND pnl_pct IS NOT NULL "
             "AND LOWER(COALESCE(execution_type, '')) LIKE 'paper%'"
+            + _PARITY_PNL_FILTER
             + where_since,
             tuple(params),
         ).fetchall()
@@ -1258,6 +1326,7 @@ def _check_paper_drawdown(strategy_id: str) -> tuple[bool, str]:
             "WHERE COALESCE(strategy_id, strategy) = ? "
             "AND status = 'CLOSED' AND pnl_pct IS NOT NULL "
             "AND LOWER(COALESCE(execution_type, '')) LIKE 'paper%'"
+            + _PARITY_PNL_FILTER
             + where_since,
             tuple(params),
         ).fetchall()
@@ -1697,6 +1766,23 @@ def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> 
         status = str(metrics_blob.get("status") or config_blob.get("status") or "").strip().lower()
         if status in {"pending", "queued", "running", "started", "submitted"}:
             continue
+        # An ERRORED validation job is a NON-RESULT, not a quality verdict — skip it
+        # exactly like a pending one. Example: a walk_forward that could not run because
+        # "lookback (210) exceeds available bars per split (84)" on an incompatible
+        # (e.g. stale-container 1d) timeframe, a worker crash, or a data gap. Such a row
+        # carries status='failed'/'error' + an `error` string and NO splits/verdict.
+        # Reading it as a verdict turns a missing run into a PHANTOM merit FAIL — folds
+        # default to 0 ("Walk-forward has 0 folds" S00552 reject), trades to 0
+        # (degenerate reject) — which then ARCHIVES a strategy whose genuine (succeeded)
+        # validation on the correct timeframe actually passed (the S03523 case: a valid
+        # 5-fold BTC-1h walk_forward existed, but the errored BTC-1d row drove the gate).
+        # Genuine PASS/FAIL verdicts use status='succeeded' with splits + a verdict and
+        # carry NO error field, so they are unaffected.
+        error_text = str(metrics_blob.get("error") or config_blob.get("error") or "").strip()
+        if error_text or status in {
+            "failed", "error", "errored", "cancelled", "canceled", "timeout", "timed_out", "crashed",
+        }:
+            continue
         payload = _validation_row_to_verdict_payload(normalized_type, metrics_blob, config_blob)
         legitimacy_payload = dict(config_blob)
         legitimacy_payload.update(metrics_blob)
@@ -1843,7 +1929,8 @@ def _evaluate_source_divergence_gate(strategy_id: str, general_settings: Any) ->
 
     Fail-open by design: a missing / stale / insufficient-overlap reading allows the
     promotion (unless the operator sets ``block_when_missing``) so a never-reconciled
-    strategy never jams the funnel. Ships inert (``enabled=False``).
+    strategy never jams the funnel. Enabled by default (the Binance↔HyperLiquid venue
+    gap is real); fail-open keeps it from blocking until a divergence is measured.
     """
     cfg: dict[str, Any] = {}
     if isinstance(general_settings, dict):
@@ -3042,10 +3129,18 @@ def _evaluate_quick_screen_gate(strategy_id: str, config: dict) -> tuple[bool, s
     if has_distinct_oos and sharpe_gap > 1.5:
         return False, f"S00552 REJECT: IS/OOS Sharpe gap {sharpe_gap:.2f} exceeds 1.5 limit (gauntlet entry blocked)"
     
-    # === S00552 GUARDRAIL 2: Pre-Gauntlet Robustness Gate (≥ 25/100) ===
+    # === S00552 GUARDRAIL 2: Pre-Gauntlet Robustness Gate (editable) ===
+    # Read the wired quick_screen.min_robustness_score knob (default 0 — the composite
+    # robustness is EARNED inside the gauntlet, so a non-zero quick-screen floor is a
+    # catch-22; strict raises it to 40). The old hardcoded 10 ignored the knob and
+    # contradicted the documented default, so relaxed/strict couldn't tune this axis.
     robustness = _resolve_robustness_points(metrics)
-    if robustness < 10.0:
-        return False, f"S00552 REJECT: Robustness {robustness:.1f}/100 below 10 minimum (pre-gauntlet gate failed)"
+    min_qs_robustness = float(gate.get("min_robustness_score", _qs_defaults.get("min_robustness_score", 0.0)) or 0.0)
+    if robustness < min_qs_robustness:
+        return False, (
+            f"S00552 REJECT: Robustness {robustness:.1f}/100 below {min_qs_robustness:.0f} "
+            "minimum (pre-gauntlet gate failed)"
+        )
     
     # === S00552 GUARDRAIL 3: Profit Factor Floor at BOTH IS and OOS ===
     # M-15 (2026-06-09 audit): honor the wired quick_screen.min_profit_factor
@@ -3089,7 +3184,7 @@ def _evaluate_quick_screen_gate(strategy_id: str, config: dict) -> tuple[bool, s
     if isinstance(oos_metrics, dict) and oos_metrics:
         target_metrics.update({k: v for k, v in oos_metrics.items() if v is not None})
 
-    total_return_pct = _to_percent_points(target_metrics.get("total_return_pct", 0.0))
+    total_return_pct = _to_percent_points(target_metrics.get("total_return_pct", 0.0), always_scale=True)
     max_dd = _to_ratio(target_metrics.get("max_drawdown_pct", 1.0), 1.0)
     sharpe = float(target_metrics.get("sharpe", 0.0) or 0.0)
 
@@ -3366,7 +3461,9 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
     has_win_rate = target_metrics.get("win_rate") is not None
 
     if has_total_return:
-        total_return_pct = _to_percent_points(target_metrics.get("total_return_pct", target_metrics.get("total_return", 0.0)))
+        total_return_pct = _to_percent_points(
+            target_metrics.get("total_return_pct", target_metrics.get("total_return", 0.0)), always_scale=True
+        )
         if total_return_pct < min_return:
             return False, f"Gauntlet return too low: {total_return_pct:.2f}% (minimum {min_return:.2f}%)"
     if has_max_dd:
@@ -3687,6 +3784,7 @@ def _evaluate_paper_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
             "AND status = 'CLOSED' "
             "AND pnl_pct IS NOT NULL "
             "AND LOWER(COALESCE(execution_type, '')) LIKE 'paper%'"
+            + _PARITY_PNL_FILTER
             + where_since,
             tuple(params),
         ).fetchall()

@@ -1621,7 +1621,6 @@ _DEFAULT_SETTINGS_PAYLOAD = {
     "notify_health_reports": True,
     "notify_errors": True,
     "scanner_execution_enabled": True,
-    "execution_fast_path_enabled": True,
     "relaxed_trade_filters_enabled": False,
     "strict_regime_gating": True,
     "regime_min_confidence": 0.3,
@@ -1641,6 +1640,10 @@ _DEFAULT_SETTINGS_PAYLOAD = {
     "scanner_signal_interval_minutes": 5,
     "scanner_execution_interval_minutes": 5,
     "scanner_allow_direct_market_fetch": True,
+    # Market-data exchange for paper data/prices/chart. 'binance' (the lead exchange,
+    # default) makes paper trade on the SAME real series the backtest validates on;
+    # 'hyperliquid' reverts to the HL feed. Execution stays in-app regardless.
+    "market_data_source": "binance",
     "daemon_candle_cache_refresh_seconds": 90,
     "paper_test_mode_enabled": False,
     "paper_test_high_activity_enabled": False,
@@ -1688,6 +1691,11 @@ _DEFAULT_SETTINGS_PAYLOAD = {
     "alert_on_degradation_pct": 20,
     "backtest_fee_bps": 4.5,
     "backtest_slippage_bps": 2.0,
+    # Fallback leverage when a strategy declares no `leverage` param. ONE default
+    # shared by the gauntlet confirmation/robustness backtests, the execution-profile
+    # selection, and the live/paper scanner so leverage-sensitive sizing matches
+    # (the parity invariant). 1x = unlevered; operator-editable.
+    "default_leverage": 1.0,
     "backtest_timeframe": "1h",
     "backtest_symbol": "BTC/USDT",
     # DEFAULT backtest window (calendar days, ending now). Used directly by ad-hoc /
@@ -2373,6 +2381,13 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
         if private_key_payload_key:
             private_key = str(payload.get(private_key_payload_key) or "").strip()
             if private_key:
+                # Normalize to a 0x-prefixed key at the storage boundary so every
+                # later read is 0x-anchored and the log redactor (which matches
+                # 0x + 64 hex) always catches the funds-controlling key if it ever
+                # leaks. A bare 64-hex key would slip past the redactor (audit P1.5).
+                private_key = private_key.strip("'\"").strip()
+                if private_key and not private_key.lower().startswith("0x"):
+                    private_key = "0x" + private_key
                 secrets["hyperliquid_private_key"] = private_key
                 # Only auto-derive if the payload and existing settings do not already pin an API address.
                 if not api_address_payload_key and not str(updates.get("hyperliquid_api_address") or "").strip():
@@ -2587,10 +2602,15 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
         if "discord_bot_token" in payload:
             bot_token = str(payload.get("discord_bot_token") or "").strip()
             if bot_token:
-                # Save main bot token to config.json (used by get_bot_token())
+                # Save main bot token to config.json (used by get_bot_token()),
+                # ENCRYPTED at rest like every other secret — never plaintext. The
+                # Discord webhook two blocks below already routes through the
+                # encrypted secrets store; the bot token must not be the lone
+                # cleartext credential on disk (audit P1.5).
                 from forven.config import load_config, save_config
+                from forven.secret_storage import encrypt_secret
                 cfg = load_config()
-                cfg["discord_token"] = bot_token
+                cfg["discord_token"] = encrypt_secret(bot_token)
                 save_config(cfg)
         if "discord_webhook_url" in payload:
             webhook_url = str(payload.get("discord_webhook_url") or "").strip()
@@ -2646,8 +2666,6 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
                 payload.get("scanner_execution_enabled"),
                 bool(updates.get("scanner_execution_enabled", True)),
             )
-        if "execution_fast_path_enabled" in payload:
-            updates["execution_fast_path_enabled"] = _coerce_bool(payload.get("execution_fast_path_enabled"), updates["execution_fast_path_enabled"])
         if "auto_restart_on_crash" in payload:
             updates["auto_restart_on_crash"] = _coerce_bool(payload.get("auto_restart_on_crash"), updates["auto_restart_on_crash"])
         if "auto_approve_code_edits" in payload:
@@ -2732,6 +2750,9 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
                 payload.get("scanner_allow_direct_market_fetch"),
                 bool(updates.get("scanner_allow_direct_market_fetch", True)),
             )
+        if "market_data_source" in payload:
+            _src = str(payload.get("market_data_source") or "").strip().lower()
+            updates["market_data_source"] = _src if _src in ("binance", "hyperliquid") else "binance"
         if "daemon_candle_cache_refresh_seconds" in payload:
             updates["daemon_candle_cache_refresh_seconds"] = _coerce_bounded_int(
                 payload.get("daemon_candle_cache_refresh_seconds"),
@@ -2863,6 +2884,9 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
             updates["backtest_fee_bps"] = _coerce_float(payload.get("backtest_fee_bps"), updates.get("backtest_fee_bps", 4.5))
         if "backtest_slippage_bps" in payload:
             updates["backtest_slippage_bps"] = _coerce_float(payload.get("backtest_slippage_bps"), updates.get("backtest_slippage_bps", 2.0))
+        if "default_leverage" in payload:
+            _lev = _coerce_float(payload.get("default_leverage"), updates.get("default_leverage", 1.0))
+            updates["default_leverage"] = float(_lev) if (_lev is not None and _lev > 0) else 1.0
         if "backtest_timeframe" in payload:
             updates["backtest_timeframe"] = str(payload.get("backtest_timeframe") or "1h").strip()
         if "backtest_symbol" in payload:
@@ -7551,7 +7575,8 @@ _PROTECTED_AGENT_IDS: frozenset[str] = frozenset(
         "quant-researcher",
         "simulation-agent",
         "risk-manager",
-        "execution-trader",
+        # execution-trader retired 2026-06-30 (deleted via deprecated_agents) —
+        # no longer a protected system agent.
         "full-stack-engineer",
         "strategy-developer",
     }
@@ -8098,6 +8123,39 @@ def update_strategy_default_params(
     if certification_error:
         raise HTTPException(status_code=422, detail=certification_error)
 
+    # Refuse a cross-asset pin onto a capital-adjacent strategy fail-fast, BEFORE any
+    # write: its traded asset is frozen, so pinning a different-asset backtest is
+    # meaningless and would mislead the operator (the symbol sync would no-op anyway).
+    if pinned_backtest_id:
+        _pin_id = pinned_backtest_id.strip() if isinstance(pinned_backtest_id, str) else ""
+        if _pin_id:
+            from forven.db import capital_adjacent_pin_asset_conflict
+            from forven.strategy_lifecycle import _extract_symbol_timeframe_from_config
+
+            with get_db() as conn:
+                _pin_row = conn.execute(
+                    "SELECT symbol, config_json FROM backtest_results "
+                    "WHERE result_id = ? AND strategy_id = ?",
+                    (_pin_id, strategy_id),
+                ).fetchone()
+                if _pin_row is not None:
+                    _cfg_symbol, _ = _extract_symbol_timeframe_from_config(_pin_row["config_json"])
+                    _pin_symbol = _cfg_symbol or (
+                        str(_pin_row["symbol"]).strip() if _pin_row["symbol"] else None
+                    )
+                    conflict, _stage, _cur = capital_adjacent_pin_asset_conflict(
+                        conn, strategy_id, _pin_symbol
+                    )
+                    if conflict:
+                        raise HTTPException(
+                            status_code=422,
+                            detail=(
+                                f"Cannot pin a {_pin_symbol} backtest to {strategy_id}: it is "
+                                f"{_stage} and its traded asset ({_cur}) is frozen. Pin a "
+                                "same-asset backtest, or re-home the strategy before promotion."
+                            ),
+                        )
+
     canonical_params = dict(certification.canonical_params)
     update_strategy_params(strategy_id, canonical_params, actor=actor)
 
@@ -8153,8 +8211,16 @@ def update_strategy_default_params(
                         sync_cols.append("timeframe = ?")
                         sync_vals.append(pin_timeframe)
                     if pin_symbol:
-                        sync_cols.append("symbol = ?")
-                        sync_vals.append(pin_symbol)
+                        # Traded-asset freeze: a pinned backtest on a different asset
+                        # must not flip a running paper/live strategy's traded coin.
+                        # (Timeframe still syncs above — only the asset is frozen.)
+                        from forven.db import block_cross_asset_symbol_rehome
+
+                        if not block_cross_asset_symbol_rehome(
+                            conn, strategy_id, pin_symbol, source="pinned_backtest_sync"
+                        ):
+                            sync_cols.append("symbol = ?")
+                            sync_vals.append(pin_symbol)
                     if sync_cols:
                         sync_vals.append(strategy_id)
                         conn.execute(
@@ -8166,11 +8232,34 @@ def update_strategy_default_params(
     # Research recovery: on param edit, try re-certification for research_only strategies
     _try_research_recovery_on_edit(strategy_id)
 
+    # Propagate execution-setting changes onto an OPEN paper/live position so the
+    # edit "takes" on the running trade. Only when the strategy is in an
+    # operator-owned (paper/live) stage AND the execution_profile actually changed —
+    # a pure alpha-param edit leaves the open position's SL/TP alone. Best-effort:
+    # never fail the param save on a downstream exchange hiccup.
+    open_position_update = None
+    try:
+        from forven.brain import stage_is_param_locked
+        from forven.strategies import sizing as _sizing
+
+        if stage_is_param_locked(row["stage"]):
+            old_ep = _sizing.normalize_execution_controls(_sizing.extract_execution_profile(existing_params))
+            new_ep = _sizing.normalize_execution_controls(_sizing.extract_execution_profile(canonical_params))
+            if old_ep != new_ep:
+                from forven.api_domains.paper_control import apply_execution_profile_to_open_position
+
+                open_position_update = apply_execution_profile_to_open_position(
+                    strategy_id, canonical_params, actor=actor
+                )
+    except Exception:  # noqa: BLE001 — propagation is best-effort; the save already succeeded
+        log.warning("execution-profile propagation to open position failed for %s", strategy_id, exc_info=True)
+
     return {
         "ok": True,
         "strategy_id": strategy_id,
         "params": canonical_params,
         "pinned_backtest_id": pin_written,
+        "open_position_update": open_position_update,
     }
 
 
@@ -10409,7 +10498,9 @@ def _is_canonical_backtest_submit(
     if str(body.trade_mode or "").strip() or body.allow_shorting is not None:
         return False
     if body.leverage is not None:
-        stored_leverage = _coerce_float(execution_params.get("leverage"), 3.0) or 3.0
+        stored_leverage = _coerce_float(execution_params.get("leverage"), None)
+        if stored_leverage is None or stored_leverage <= 0:
+            stored_leverage = float(settings.get("default_leverage", 1.0) or 1.0)
         if abs(float(body.leverage) - float(stored_leverage)) > 1e-9:
             return False
 
@@ -10526,8 +10617,11 @@ def post_backtest_submit(body: BacktestSubmitBody, *, skip_auto_trash: bool = Fa
 
     leverage_value = _coerce_float(body.leverage, None)
     if leverage_value is None:
-        leverage_value = _coerce_float(execution_params.get("leverage"), 3.0)
-    leverage_value = float(leverage_value or 3.0)
+        leverage_value = _coerce_float(execution_params.get("leverage"), None)
+    if leverage_value is None or leverage_value <= 0:
+        # Operator-configurable default (1x) shared with paper/selection for parity.
+        leverage_value = float(get_settings().get("default_leverage", 1.0) or 1.0)
+    leverage_value = float(leverage_value)
 
     settings = get_settings()
     default_backtest_timeframe = str(settings.get("backtest_timeframe") or "1h").strip() or "1h"

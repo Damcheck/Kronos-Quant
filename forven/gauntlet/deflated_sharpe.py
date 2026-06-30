@@ -184,9 +184,17 @@ def compute_strategy_dsr(strategy_id: str, *, default_trials: int | None = None)
         for tr in trades:
             if not isinstance(tr, dict):
                 continue
+            # Prefer the scale-invariant per-trade RETURN fields. ``pnl`` is compounded
+            # dollars off a growing equity base — a TIME-VARYING scale that distorts
+            # sr_hat/skew/kurt (and thus the DSR + its SR0 benchmark). ``return_pct``
+            # (= ratio*100, present on every normalized trade) is a constant scale of the
+            # true ratio, so it yields the intended scale-invariant DSR; demote ``pnl``
+            # to a last resort.
             r = tr.get("net_pnl_pct")
             if r is None:
                 r = tr.get("pnl_pct")
+            if r is None:
+                r = tr.get("return_pct")
             if r is None:
                 r = tr.get("pnl")
             if r is None:

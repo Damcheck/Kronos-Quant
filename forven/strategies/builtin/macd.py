@@ -40,11 +40,34 @@ class MACDStrategy(BaseStrategy):
             f"Sells on the reverse crossover."
         )
 
-    def generate_signal(self, df: pd.DataFrame) -> Signal:
-        from forven.scanner import adx, atr
+    def generate_signals(self, df: pd.DataFrame):
+        """Vectorized twin of generate_signal — the SINGLE source of entry/exit logic."""
+        from forven.strategies.indicators import adx
         p = self.params
         close = df["close"]
-        
+
+        ema_fast = close.ewm(span=p["fast"], adjust=False).mean()
+        ema_slow = close.ewm(span=p["slow"], adjust=False).mean()
+        macd = ema_fast - ema_slow
+        macd_signal = macd.ewm(span=p["signal"], adjust=False).mean()
+        ema_regime = close.ewm(span=p.get("ema_regime", 200), adjust=False).mean()
+        adx_val = adx(df, p.get("adx_period", 14))
+
+        prev_macd = macd.shift(1)
+        prev_macd_signal = macd_signal.shift(1)
+
+        cross_up = (prev_macd <= prev_macd_signal) & (macd > macd_signal)
+        cross_down = (prev_macd >= prev_macd_signal) & (macd < macd_signal)
+        entry = cross_up & (close > ema_regime) & (adx_val >= p.get("adx_min", 20))
+        exit_ = cross_down
+
+        return entry.fillna(False), exit_.fillna(False)
+
+    def generate_signal(self, df: pd.DataFrame) -> Signal:
+        from forven.strategies.indicators import adx, atr
+        p = self.params
+        close = df["close"]
+
         ema_fast = close.ewm(span=p["fast"], adjust=False).mean()
         ema_slow = close.ewm(span=p["slow"], adjust=False).mean()
         macd = ema_fast - ema_slow
@@ -55,17 +78,14 @@ class MACDStrategy(BaseStrategy):
 
         curr_close = float(close.iloc[-1])
         curr_macd = float(macd.iloc[-1])
-        prev_macd = float(macd.iloc[-2])
         curr_macd_signal = float(macd_signal.iloc[-1])
-        prev_macd_signal = float(macd_signal.iloc[-2])
         curr_ema_regime = float(ema_regime.iloc[-1])
         curr_adx = float(adx_val.iloc[-1])
         curr_atr = float(atr_14.iloc[-1])
 
-        cross_up = prev_macd <= prev_macd_signal and curr_macd > curr_macd_signal
-        cross_down = prev_macd >= prev_macd_signal and curr_macd < curr_macd_signal
-        entry = cross_up and curr_close > curr_ema_regime and curr_adx >= p.get("adx_min", 20)
-        exit_ = cross_down
+        entries, exits = self.generate_signals(df)
+        entry = bool(entries.iloc[-1])
+        exit_ = bool(exits.iloc[-1])
 
         return Signal(
             entry_signal=bool(entry), exit_signal=bool(exit_),

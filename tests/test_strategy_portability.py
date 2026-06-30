@@ -8,6 +8,7 @@ a custom strategy's source file and re-registers it on import.
 from __future__ import annotations
 
 import importlib
+import json
 import sys
 
 import pytest
@@ -222,89 +223,91 @@ def test_export_bundles_source_code_for_code_class(forven_db, monkeypatch, tmp_p
     assert f"TYPE_NAME = '{type_name}'" in sc["content"]
 
 
-def test_code_class_round_trip_registers_on_fresh_machine(forven_db, monkeypatch, tmp_path):
-    temp_custom_dir = _isolate_custom_dir(monkeypatch, tmp_path)
-    type_name = "portability_probe_rt"
-    strategy_file = temp_custom_dir / f"{type_name}.py"
-    _write_custom_strategy(strategy_file, type_name=type_name, class_name="PortabilityProbeRt")
-    sys.modules.pop(f"forven.strategies.custom.{type_name}", None)
-
-    reg = intake_mod.register_custom_strategy_file(file_path=str(strategy_file), source="ai_dropzone")
-    source_id = reg["strategy_id"]
-    env = lifecycle.build_container_export(source_id)
-    assert "source_code" in env
-
-    # Simulate a fresh machine: the file, the registered class, and the source
-    # container don't exist on the importing side.
-    strategy_file.unlink()
-    with get_db() as conn:
-        conn.execute("DELETE FROM strategies WHERE id = ?", (source_id,))
-    registry.reset()
-    sys.modules.pop(f"forven.strategies.custom.{type_name}", None)
-    importlib.invalidate_caches()
-    assert not strategy_file.exists()
-
-    result = lifecycle.import_strategy_container(env)
-
-    assert result["ok"] is True, result.get("error")
-    new_id = result["strategy_id"]
-    assert new_id and new_id != source_id
-    assert result["stage"] == "quick_screen"
-    # The source file was rewritten and the container recreated.
-    assert strategy_file.exists()
-    with get_db() as conn:
-        row = conn.execute(
-            "SELECT type, source, stage FROM strategies WHERE id = ?", (new_id,)
-        ).fetchone()
-    assert row is not None
-    assert row["type"] == type_name
-    assert row["source"] == "import"
-    assert row["stage"] == "quick_screen"
+_SANDBOX_PROBE_SRC = "\n".join(
+    [
+        "import pandas as pd",
+        "from forven.strategies.base import BaseStrategy, Signal, DirectionalSignals",
+        "TYPE_NAME = 'portability_sandbox_probe_type'",
+        "class PortabilitySandboxProbe(BaseStrategy):",
+        "    @property",
+        "    def name(self): return 'Sandbox Probe'",
+        "    @property",
+        "    def asset(self): return 'BTC'",
+        "    @property",
+        "    def strategy_type(self): return TYPE_NAME",
+        "    @property",
+        "    def default_params(self): return {'fast': 8, 'slow': 21}",
+        "    def parameter_space(self): return {'fast': (4, 12, 2), 'slow': (16, 30, 2)}",
+        "    def generate_signal(self, df):",
+        "        return Signal(price=float(df['close'].iloc[-1]) if len(df.index) else 0.0)",
+        "    def generate_signals(self, df):",
+        "        f = df['close'].ewm(span=8).mean(); s = df['close'].ewm(span=21).mean()",
+        "        le = ((f > s) & (f.shift(1) <= s.shift(1))).fillna(False)",
+        "        lx = ((f < s) & (f.shift(1) >= s.shift(1))).fillna(False)",
+        "        z = pd.Series(False, index=df.index)",
+        "        return DirectionalSignals(long_entries=le, long_exits=lx, short_entries=z, short_exits=z)",
+        "STRATEGY_CLASS = PortabilitySandboxProbe",
+    ]
+)
 
 
-def test_code_class_round_trip_handles_string_strategy_class(forven_db, monkeypatch, tmp_path):
-    # Reproduces the reported "Class validation failed: not a class" failure: a
-    # strategy whose STRATEGY_CLASS is the class *name* (a string). Both creating
-    # the source and importing it must now succeed.
-    temp_custom_dir = _isolate_custom_dir(monkeypatch, tmp_path)
-    type_name = "portability_probe_strslip"
-    strategy_file = temp_custom_dir / f"{type_name}.py"
-    _write_custom_strategy(
-        strategy_file,
-        type_name=type_name,
-        class_name="PortabilityProbeStr",
-        strategy_class_as_string=True,
-    )
-    sys.modules.pop(f"forven.strategies.custom.{type_name}", None)
+def test_code_class_import_is_sandboxed(forven_db):
+    """R2: a code-bundled import is registered SANDBOX-ONLY — written to
+    forven/strategies/imported/ (never custom/), validated OUT-OF-PROCESS, marked
+    sandbox_only, and its module is NEVER imported into the trusted parent."""
+    from pathlib import Path
 
-    reg = intake_mod.register_custom_strategy_file(file_path=str(strategy_file), source="ai_dropzone")
-    source_id = reg["strategy_id"]
-    env = lifecycle.build_container_export(source_id)
-    assert "source_code" in env
+    from forven.strategies import imported as imported_pkg
+    from forven.sandbox.strategy_worker import _reset_worker
 
-    # Fresh machine: drop the file, the class, and the source container.
-    strategy_file.unlink()
-    with get_db() as conn:
-        conn.execute("DELETE FROM strategies WHERE id = ?", (source_id,))
-    registry.reset()
-    sys.modules.pop(f"forven.strategies.custom.{type_name}", None)
-    importlib.invalidate_caches()
+    module_name = "portability_sandbox_probe"
+    env = {
+        "forven_export": {"kind": "strategy_container", "version": "1.0", "source_strategy_id": "S00001"},
+        "configuration": {
+            "type": "portability_sandbox_probe_type",
+            "symbol": "BTC",
+            "timeframe": "1h",
+            "params": {"fast": 8, "slow": 21},
+        },
+        "source_code": {"module_name": module_name, "filename": f"{module_name}.py", "content": _SANDBOX_PROBE_SRC},
+    }
+    imported_dir = Path(imported_pkg.__file__).resolve().parent
+    target = imported_dir / f"{module_name}.py"
+    try:
+        result = lifecycle.import_strategy_container(env)
+        assert result["ok"] is True, result.get("error")
+        assert result.get("sandbox_only") is True
+        sid = result["strategy_id"]
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT type, runtime_type, sandbox_only, source FROM strategies WHERE id = ?",
+                (sid,),
+            ).fetchone()
+        assert row["sandbox_only"] == 1
+        assert row["runtime_type"] == f"imported__{module_name}"
+        assert row["source"] == "import"
+        assert target.exists()  # written to imported/, NOT custom/
+        # The trusted parent must NEVER import the untrusted module.
+        assert f"forven.strategies.imported.{module_name}" not in sys.modules
+        registry.discover()
+        assert row["runtime_type"] not in registry._TYPE_MAP
+    finally:
+        if target.exists():
+            target.unlink()
+        registry.reset()
+        try:
+            _reset_worker()
+        except Exception:
+            pass
 
-    result = lifecycle.import_strategy_container(env)
 
-    assert result["ok"] is True, result.get("error")
-    assert result["stage"] == "quick_screen"
-    assert strategy_file.exists()
-    with get_db() as conn:
-        row = conn.execute(
-            "SELECT type, source FROM strategies WHERE id = ?", (result["strategy_id"],)
-        ).fetchone()
-    assert row["type"] == type_name
-    assert row["source"] == "import"
+def test_code_class_import_rejects_unsafe_source(forven_db):
+    """Obviously-unsafe bundled code is rejected by the pre-write AST scan BEFORE it
+    is ever written to imported/ or sent to the worker."""
+    from pathlib import Path
 
+    from forven.strategies import imported as imported_pkg
 
-def test_code_class_import_rejects_unsafe_source(forven_db, monkeypatch, tmp_path):
-    _isolate_custom_dir(monkeypatch, tmp_path)
     env = {
         "forven_export": {"kind": "strategy_container", "version": "1.0", "source_strategy_id": "S1"},
         "configuration": {"type": "evil_strat", "symbol": "BTC", "timeframe": "1h", "params": {}},
@@ -319,5 +322,145 @@ def test_code_class_import_rejects_unsafe_source(forven_db, monkeypatch, tmp_pat
         lifecycle.import_strategy_container(env)
 
     assert exc.value.status_code == 400
-    # Nothing unsafe should have been written to the custom dir.
-    assert not (tmp_path / "custom" / "evil_strat.py").exists()
+    target = Path(imported_pkg.__file__).resolve().parent / "evil_strat.py"
+    assert not target.exists()  # nothing written, nothing executed
+
+
+# A safe (passes the AST guard) but CROSS-ASSET strategy: it declares a second asset
+# in data_requirements(). The sandbox cannot supply a second asset's series, so this
+# must be rejected at import rather than silently run on incomplete data.
+_CROSS_ASSET_SRC = "\n".join(
+    [
+        "import pandas as pd",
+        "from forven.strategies.base import BaseStrategy, Signal, DirectionalSignals",
+        "TYPE_NAME = 'portability_cross_asset_type'",
+        "class PortabilityCrossAsset(BaseStrategy):",
+        "    @property",
+        "    def name(self): return 'Cross Asset'",
+        "    @property",
+        "    def asset(self): return 'ETH'",
+        "    @property",
+        "    def strategy_type(self): return TYPE_NAME",
+        "    @property",
+        "    def default_params(self): return {'window': 20}",
+        "    def data_requirements(self):",
+        "        return [",
+        "            {'asset': 'ETH', 'exchange': 'any', 'timeframe': '1h', 'min_bars': 720},",
+        "            {'asset': 'BTC', 'exchange': 'any', 'timeframe': '1h', 'min_bars': 720},",
+        "        ]",
+        "    def generate_signal(self, df):",
+        "        return Signal(price=float(df['close'].iloc[-1]) if len(df.index) else 0.0)",
+        "    def generate_signals(self, df):",
+        "        z = pd.Series(False, index=df.index)",
+        "        return DirectionalSignals(long_entries=z, long_exits=z, short_entries=z, short_exits=z)",
+        "STRATEGY_CLASS = PortabilityCrossAsset",
+    ]
+)
+
+
+def test_code_class_import_rejects_cross_asset(forven_db):
+    """A multi-asset imported strategy is rejected at import: the sandbox worker is
+    network/DB-jailed (R3) and there is no parent-side cross-asset enrichment, so it
+    could only run on a single-asset frame and silently emit garbage. The orphaned
+    file written for worker validation must be cleaned up, and no container created."""
+    from pathlib import Path
+
+    from forven.strategies import imported as imported_pkg
+    from forven.sandbox.strategy_worker import _reset_worker
+
+    module_name = "portability_cross_asset"
+    env = {
+        "forven_export": {"kind": "strategy_container", "version": "1.0", "source_strategy_id": "S00009"},
+        "configuration": {
+            "type": "portability_cross_asset_type",
+            "symbol": "ETH",
+            "timeframe": "1h",
+            "params": {"window": 20},
+        },
+        "source_code": {"module_name": module_name, "filename": f"{module_name}.py", "content": _CROSS_ASSET_SRC},
+    }
+    target = Path(imported_pkg.__file__).resolve().parent / f"{module_name}.py"
+    try:
+        with pytest.raises(HTTPException) as exc:
+            lifecycle.import_strategy_container(env)
+        assert exc.value.status_code == 400
+        assert "cross-asset" in str(exc.value.detail).lower()
+        assert not target.exists()  # orphaned validation file cleaned up
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM strategies WHERE runtime_type = ?", (f"imported__{module_name}",)
+            ).fetchone()
+        assert row is None  # no container was created
+    finally:
+        if target.exists():
+            target.unlink()
+        registry.reset()
+        try:
+            _reset_worker()
+        except Exception:
+            pass
+
+
+def test_sandbox_only_param_space_uses_stored_then_falls_back_empty():
+    """The optimizer tunes a sandbox-only strategy from the captured _parameter_space,
+    and falls back to an empty space (evaluate author params as-is) when none was
+    recorded — never introspecting the absent class. No worker needed."""
+    from forven.strategies.optimizer import _get_param_space
+
+    space = {"window": [10, 30, 5]}
+    assert _get_param_space("S1", "imported__x", {"window": 20, "_parameter_space": space}) == space
+    assert _get_param_space("S2", "imported__y", {"window": 20}) == {}
+
+
+def test_imported_single_asset_proxy_reports_real_data_requirements(forven_db):
+    """A single-asset import is accepted, and the parent-side proxy reports the REAL
+    declared data_requirements (captured by the worker, stored under _data_requirements)
+    instead of silently assuming the BaseStrategy default."""
+    from pathlib import Path
+
+    from forven.strategies import imported as imported_pkg
+    from forven.strategies.sandbox_proxy import make_sandbox_proxy
+    from forven.sandbox.strategy_worker import _reset_worker
+
+    module_name = "portability_sandbox_probe"
+    env = {
+        "forven_export": {"kind": "strategy_container", "version": "1.0", "source_strategy_id": "S00001"},
+        "configuration": {
+            "type": "portability_sandbox_probe_type",
+            "symbol": "BTC",
+            "timeframe": "1h",
+            "params": {"fast": 8, "slow": 21},
+        },
+        "source_code": {"module_name": module_name, "filename": f"{module_name}.py", "content": _SANDBOX_PROBE_SRC},
+    }
+    target = Path(imported_pkg.__file__).resolve().parent / f"{module_name}.py"
+    try:
+        result = lifecycle.import_strategy_container(env)
+        assert result["ok"] is True, result.get("error")
+        sid = result["strategy_id"]
+        with get_db() as conn:
+            params_json = conn.execute(
+                "SELECT params FROM strategies WHERE id = ?", (sid,)
+            ).fetchone()["params"]
+        params = json.loads(params_json)
+        reqs = params.get("_data_requirements")
+        assert isinstance(reqs, list) and len(reqs) == 1
+        assert str(reqs[0]["asset"]).upper() == "BTC"
+        # The proxy reports the captured requirement, not the BaseStrategy default.
+        proxy = make_sandbox_proxy(sid, params, f"imported__{module_name}")
+        assert proxy.data_requirements() == reqs
+        # parameter_space() was captured too (tuples are lists after JSON), so the
+        # optimizer can tune the imported strategy instead of silently never doing so.
+        ps = params.get("_parameter_space")
+        assert isinstance(ps, dict) and len(ps.get("fast", [])) == 3
+        from forven.strategies.optimizer import _get_param_space
+
+        assert _get_param_space(sid, f"imported__{module_name}", params) == ps
+    finally:
+        if target.exists():
+            target.unlink()
+        registry.reset()
+        try:
+            _reset_worker()
+        except Exception:
+            pass

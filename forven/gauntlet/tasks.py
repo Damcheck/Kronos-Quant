@@ -210,6 +210,10 @@ def _metric(metrics: dict[str, Any], *keys: str, default: float = 0.0) -> float:
 def _quick_screen_failures(metrics: dict[str, Any], cfg: dict[str, Any]) -> list[str]:
     failures: list[str] = []
     total_return = _metric(metrics, "total_return_pct", "total_return", default=0.0)
+    # total_return_pct is stored as a RATIO (0.12 == 12%) while min_total_return_pct is
+    # in percent POINTS — convert before comparing (the authoritative gauntlet gate does
+    # the same); otherwise a 0.0–1.0 ratio is compared to e.g. a 5.0 threshold.
+    total_return_pp = total_return * 100.0
     sharpe = _metric(metrics, "sharpe_ratio", "sharpe", default=0.0)
     max_dd = _ratio(metrics.get("max_drawdown_pct", metrics.get("max_drawdown")), 0.0)
     win_rate = _ratio(metrics.get("win_rate"), 0.0)
@@ -221,8 +225,8 @@ def _quick_screen_failures(metrics: dict[str, Any], cfg: dict[str, Any]) -> list
     min_win_rate = _ratio(cfg.get("min_win_rate"), 0.0)
     min_profit_factor = _as_float(cfg.get("min_profit_factor"), 0.0)
 
-    if total_return < min_total_return:
-        failures.append(f"total_return_pct {total_return:.2f} < {min_total_return:.2f}")
+    if total_return_pp < min_total_return:
+        failures.append(f"total_return_pct {total_return_pp:.2f}% < {min_total_return:.2f}%")
     if sharpe < min_sharpe:
         failures.append(f"sharpe {sharpe:.2f} < {min_sharpe:.2f}")
     if max_dd > max_drawdown:
@@ -232,6 +236,33 @@ def _quick_screen_failures(metrics: dict[str, Any], cfg: dict[str, Any]) -> list
     if min_profit_factor > 0 and profit_factor < min_profit_factor:
         failures.append(f"profit_factor {profit_factor:.2f} < {min_profit_factor:.2f}")
     return failures
+
+
+def _persist_strategy_symbol(strategy_id: str, symbol: str) -> None:
+    """Persist a canonicalized market symbol onto the strategy row so the gauntlet,
+    confirmation, and the paper/live runtime all resolve the SAME liquid, full-history
+    dataset (bare ``ETH`` → ``ETH/USDT``). Best-effort: never block the screen."""
+    sym = str(symbol or "").strip()
+    if not strategy_id or not sym:
+        return
+    try:
+        from datetime import datetime, timezone
+
+        from forven.db import block_cross_asset_symbol_rehome, get_db
+
+        now = datetime.now(timezone.utc).isoformat()
+        with get_db() as conn:
+            # Traded-asset freeze: never re-home a running paper/live strategy onto a
+            # different asset (a no-op for the pre-capital stages quick_screen runs in).
+            if not block_cross_asset_symbol_rehome(
+                conn, strategy_id, sym, source="gauntlet_quick_screen"
+            ):
+                conn.execute(
+                    "UPDATE strategies SET symbol = ?, updated_at = ? WHERE id = ?",
+                    (sym, now, strategy_id),
+                )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("quick_screen: failed to persist canonical symbol for %s: %s", strategy_id, exc)
 
 
 def run_quick_screen(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
@@ -246,14 +277,40 @@ def run_quick_screen(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str
     try:
         from forven.api_core import BacktestSubmitBody, stage_backtest_duration_days
 
+        required_days = stage_backtest_duration_days("quick_screen")
+        raw_symbol = row.get("symbol") or "BTC/USDT"
+        timeframe = row.get("timeframe") or "1h"
+
+        # Self-healing data coverage: canonicalize the symbol (bare ETH → ETH/USDT, the
+        # liquid full-history dataset) and ensure enough OHLCV history exists for the
+        # screen window. A genuinely-missing series triggers an async backfill and the
+        # step defers (awaiting_data_backfill — drain-exempt) until the data lands, so a
+        # strategy is never rejected for "too few trades" on a stunted or empty window.
+        from forven.dataeng.coverage import ensure_coverage
+
+        coverage = ensure_coverage(raw_symbol, timeframe, required_days)
+        if coverage.get("status") == "backfilling":
+            return {
+                "status": "blocked_data",
+                "message": (
+                    f"backfilling {coverage.get('symbol')} {timeframe} history "
+                    f"(have {float(coverage.get('coverage_days') or 0):.0f}d, need {required_days}d)"
+                ),
+                "retryable": True,
+                "reason_code": "awaiting_data_backfill",
+            }
+        symbol = str(coverage.get("symbol") or raw_symbol)
+        if symbol != raw_symbol:
+            _persist_strategy_symbol(str(row["id"]), symbol)
+
         response = _submit_backtest(
             BacktestSubmitBody(
                 strategy_id=row["id"],
                 strategy_name=row.get("name"),
-                symbol=row.get("symbol") or "BTC/USDT",
-                timeframe=row.get("timeframe") or "1h",
+                symbol=symbol,
+                timeframe=timeframe,
                 params=params,
-                duration_days=stage_backtest_duration_days("quick_screen"),
+                duration_days=required_days,
             ),
             skip_auto_trash=True,
         )
@@ -291,9 +348,38 @@ def _quick_screen_defer_to_optimization() -> bool:
 def run_quick_screen_gate(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
     settings = _workflow_settings(workflow)
     quick_cfg = settings.get("quick_screen") if isinstance(settings.get("quick_screen"), dict) else {}
+    strategy_id = str(workflow.get("strategy_id") or "")
     detail = _detail_for_workflow(str(workflow.get("id") or ""))
     quick_output = _step_output(detail, "quick_screen")
-    metrics = quick_output.get("metrics") if isinstance(quick_output.get("metrics"), dict) else {}
+    screen_metrics = quick_output.get("metrics") if isinstance(quick_output.get("metrics"), dict) else {}
+
+    # Best-of-N timeframe selection (definition v3): timeframe_sweep now runs BEFORE
+    # this gate, so judge the strategy on the timeframe where its edge actually lives
+    # rather than the single author-declared/default timeframe — a 4h edge no longer
+    # dies at a 1h screen. This does NOT relax any threshold: the SAME gate (Layer-A
+    # profitability + the brain's overfitting guardrails) runs, on the strategy's best
+    # REAL evidence. When no sweep evidence exists yet (in-flight older-version
+    # workflows, direct callers), fall back to the quick_screen result and change
+    # nothing. Best-of-N is an enhancement layered on the gate: if its lookup fails,
+    # degrade to the quick_screen result rather than crash the verdict.
+    metrics = screen_metrics
+    try:
+        row = _strategy_row(strategy_id)
+        fallback_tf = str(row.get("timeframe") or "") if row else ""
+        best_tf, _best_result_id, best_metrics = _best_sweep_result(strategy_id, fallback_tf or "1h")
+        if best_metrics:
+            metrics = best_metrics
+            # Promote the winning timeframe + its metrics onto the strategy row so the
+            # brain guardrails (which read strategies.metrics) judge the best timeframe,
+            # and every downstream step (optimization/confirmation/paper) runs on it.
+            _persist_quick_screen_winner(strategy_id, best_tf, best_metrics)
+    except Exception as exc:  # noqa: BLE001 - enhancement must never break the gate
+        log.warning(
+            "quick_screen_gate: best-of-N selection failed for %s, using quick_screen result: %s",
+            strategy_id, exc,
+        )
+        metrics = screen_metrics
+
     failures = _quick_screen_failures(metrics, quick_cfg)
     deferred_note: str | None = None
     if failures:
@@ -323,7 +409,7 @@ def run_quick_screen_gate(workflow: dict[str, Any], step: dict[str, Any]) -> dic
         # the full sweep/optimization/robustness pipeline on a strategy still sitting
         # in quick_screen, then errored at the paper gate with an invalid transition).
         transition = transition_stage(
-            strategy_id=str(workflow.get("strategy_id") or ""),
+            strategy_id=strategy_id,
             target_stage="gauntlet",
             reason="Gauntlet workflow quick-screen gate passed",
             actor="gauntlet_workflow",
@@ -462,13 +548,23 @@ def run_timeframe_sweep(workflow: dict[str, Any], step: dict[str, Any]) -> dict[
     }
 
 
-def _best_sweep_timeframe(strategy_id: str, fallback: str) -> str:
+def _best_sweep_result(strategy_id: str, fallback_tf: str) -> tuple[str, str | None, dict[str, Any]]:
+    """Return ``(best_timeframe, best_result_id, best_metrics)`` across all persisted
+    plain backtests for the strategy, scored sharpe-first with tie-breaks on trade
+    count and return.
+
+    This is the best-of-N timeframe selection: it lets a caller judge / optimize the
+    strategy on the timeframe where its edge actually lives rather than the single
+    author-declared/default timeframe. ``run_quick_screen_gate`` uses it (since the
+    timeframe_sweep now runs before the gate, definition v3) and so does
+    ``run_validation_optimization``. Rows with empty metrics are ignored; if none are
+    usable the fallback timeframe is returned with no result and empty metrics."""
     from forven.db import get_db
 
     with get_db() as conn:
         rows = conn.execute(
             """
-            SELECT timeframe, metrics_json
+            SELECT result_id, timeframe, metrics_json
             FROM backtest_results
             WHERE strategy_id = ?
               AND LOWER(TRIM(COALESCE(result_type, 'backtest'))) = 'backtest'
@@ -477,20 +573,71 @@ def _best_sweep_timeframe(strategy_id: str, fallback: str) -> str:
             (strategy_id,),
         ).fetchall()
 
-    best_tf = str(fallback or "1h").strip() or "1h"
+    best_tf = str(fallback_tf or "1h").strip() or "1h"
+    best_result_id: str | None = None
+    best_metrics: dict[str, Any] = {}
     best_score = float("-inf")
+    # Least-degenerate fallback, used ONLY if no context clears the validity floor —
+    # so a strategy that genuinely can't trade anywhere is judged (and failed) on its
+    # most-traded context, never crowned by a lucky 4-trade slice.
+    fb_tf, fb_result_id, fb_metrics, fb_trades = best_tf, None, {}, -1.0
+    from forven.policy import is_degenerate_backtest_metrics
     for row in rows:
         metrics = _loads(row["metrics_json"], {})
-        if not isinstance(metrics, dict):
+        if not isinstance(metrics, dict) or not metrics:
             continue
         trades = _metric(metrics, "total_trades", default=0.0)
         sharpe = _metric(metrics, "sharpe_ratio", "sharpe", default=0.0)
         total_return = _metric(metrics, "total_return_pct", "total_return", default=0.0)
+        tf = str(row["timeframe"] or best_tf).strip() or best_tf
+        rid = str(row["result_id"]) if row["result_id"] else None
+        if float(trades) > fb_trades:
+            fb_tf, fb_result_id, fb_metrics, fb_trades = tf, rid, metrics, float(trades)
+        # Validity floor: a too-few-trade / zero-in-sample-trade slice yields a lucky
+        # high Sharpe that swamps this Sharpe-dominated score and contaminates the
+        # strategy's stored metrics (the gate then reads IS Sharpe 0.00 and rejects).
+        # Such a slice can never be the sweep winner.
+        if is_degenerate_backtest_metrics(metrics):
+            continue
         score = sharpe * 10.0 + min(trades, 100.0) * 0.01 + total_return * 0.01
         if score > best_score:
             best_score = score
-            best_tf = str(row["timeframe"] or best_tf).strip() or best_tf
+            best_tf, best_result_id, best_metrics = tf, rid, metrics
+    if best_score == float("-inf"):
+        return fb_tf, fb_result_id, fb_metrics
+    return best_tf, best_result_id, best_metrics
+
+
+def _best_sweep_timeframe(strategy_id: str, fallback: str) -> str:
+    best_tf, _result_id, _metrics = _best_sweep_result(strategy_id, fallback)
     return best_tf
+
+
+def _persist_quick_screen_winner(strategy_id: str, timeframe: str, metrics: dict[str, Any]) -> None:
+    """Persist the best-of-N winning timeframe + its metrics onto the strategy row.
+
+    The brain's quick-screen overfitting guardrails read ``strategies.metrics`` (not a
+    specific backtest row), so to judge the BEST timeframe honestly — under the same
+    thresholds — we promote that timeframe's real metrics here before transitioning.
+    The timeframe is also persisted so every downstream step (optimization,
+    confirmation, walk-forward, paper) runs on the timeframe the strategy was judged on.
+    Best-effort: a persistence hiccup must never block the gate."""
+    tf = str(timeframe or "").strip()
+    if not strategy_id or not tf or not isinstance(metrics, dict) or not metrics:
+        return
+    try:
+        from datetime import datetime, timezone
+
+        from forven.db import get_db
+
+        now = datetime.now(timezone.utc).isoformat()
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE strategies SET timeframe = ?, metrics = ?, updated_at = ? WHERE id = ?",
+                (tf, json.dumps(metrics), now, strategy_id),
+            )
+    except Exception as exc:  # noqa: BLE001 - never block the gate on a metrics write
+        log.warning("quick_screen_gate: failed to persist best-of-N winner for %s: %s", strategy_id, exc)
 
 
 def _best_params_from_optimization_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1119,6 +1266,102 @@ def _transition_to_paper(**kwargs) -> dict[str, Any]:
     return transition_stage(**kwargs)
 
 
+def _execution_profile_selection_enabled() -> bool:
+    """Operator switch (default on): pick + freeze the best risk engine at promotion."""
+    try:
+        from forven.api_core import get_settings
+
+        return bool(get_settings().get("paper_select_execution_profile", True))
+    except Exception:
+        return True
+
+
+def _select_and_persist_execution_profile(workflow: dict[str, Any], strategy_id: str) -> dict[str, Any]:
+    """Pick the best RISK ENGINE for a strategy and FREEZE it onto its params so
+    paper/live size + stop EXACTLY like the engine the backtest chose.
+
+    Runs a bounded sizing/stop sweep through the shared kernel and scores by a
+    risk-adjusted objective (Sharpe). Idempotent — skips when a profile is already
+    present (manual or a prior selection) — and best-effort: any failure is logged
+    and promotion proceeds on the safe shared default (1% risk / 2x-ATR). This is
+    the chokepoint that makes "paper adheres to the chosen engine" true: every
+    strategy passes through the promotion gate before it is param-locked in paper.
+
+    Ordering note: selection runs at the END of the gate, AFTER the robustness battery
+    (WFA/MC/jitter/cost-stress). Those legs validate the strategy's SIGNAL generalization
+    — entry/exit timing, which is sizing-agnostic (the chosen profile changes position
+    SIZE and stop distance, not which bars fire). The chosen profile's risk-adjusted edge
+    is screened here (Sharpe + max-DD + min-trades over the confirmation window), and its
+    real out-of-sample validation is the PAPER forward-test it then enters. (A future
+    hardening could re-run WFA on the frozen profile before transitioning; tracked.)
+    """
+    if not _execution_profile_selection_enabled():
+        return {"skipped": True, "reason": "disabled by setting"}
+
+    from forven.db import get_db
+    from forven.strategies.execution_selection import select_execution_profile
+    from forven.strategies.sizing import normalize_execution_controls
+
+    row = _strategy_row(strategy_id)
+    if not row:
+        return {"skipped": True, "reason": "strategy not found"}
+    params = _loads(row.get("params"), {})
+    if not isinstance(params, dict):
+        params = {}
+    if isinstance(params.get("execution_profile"), dict) and params["execution_profile"]:
+        return {"skipped": True, "reason": "execution_profile already present"}
+    # Idempotency must also cover the case where the DEFAULT engine wins (chosen=None):
+    # no execution_profile is written then, so guarding only on params would re-run the
+    # full ~15-20-backtest sweep on EVERY gate retry (e.g. while waiting for a paper
+    # capital slot). The selection always records a marker, so honor that too.
+    _existing_metrics = _loads(row.get("metrics"), {})
+    if isinstance(_existing_metrics, dict) and isinstance(
+        _existing_metrics.get("gauntlet_selected_execution_profile"), dict
+    ):
+        return {"skipped": True, "reason": "execution profile already selected"}
+
+    selection = select_execution_profile(
+        strategy_id=strategy_id,
+        asset=str(row.get("symbol") or "BTC"),
+        strategy_type=str(row.get("type") or ""),
+        params=params,
+        timeframe=str(row.get("timeframe") or "1h"),
+        regime_gate=False,  # match the paper scanner's kernel call (the parity reference)
+        lean=True,          # bounded grid for promotion-time latency
+    )
+
+    metrics = _loads(row.get("metrics"), {})
+    if not isinstance(metrics, dict):
+        metrics = {}
+    chosen = selection.get("chosen")
+    marker = {
+        "objective": selection.get("objective"),
+        "chosen_label": selection.get("chosen_label"),
+        "chosen_score": selection.get("chosen_score"),
+        "n_candidates": selection.get("n_candidates"),
+        "n_eligible": selection.get("n_eligible"),
+    }
+    new_params = dict(params)
+    if isinstance(chosen, dict) and chosen:
+        normalized = normalize_execution_controls(chosen) or chosen
+        new_params["execution_profile"] = normalized
+        marker["profile"] = normalized
+    metrics["gauntlet_selected_execution_profile"] = marker
+
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE strategies SET params = ?, metrics = ?, updated_at = datetime('now') WHERE id = ?",
+            (json.dumps(new_params, sort_keys=True), json.dumps(metrics, sort_keys=True), strategy_id),
+        )
+    log.info(
+        "execution-profile selection for %s: chose %s (%s=%.4f over %d candidates, %d eligible)",
+        strategy_id, selection.get("chosen_label"), selection.get("objective"),
+        float(selection.get("chosen_score") or 0.0),
+        int(selection.get("n_candidates") or 0), int(selection.get("n_eligible") or 0),
+    )
+    return {"skipped": False, "selection": marker}
+
+
 def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
     from forven.gauntlet.status import get_strategy_gauntlet_status
 
@@ -1147,6 +1390,19 @@ def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> 
     # (the authoritative numeric gate); composite_robustness_score remains a
     # UI/ranking number only (still surfaced in `status`).
 
+    # Pick + freeze the best risk engine BEFORE the transition so the strategy
+    # enters paper sized/stopped by the engine the backtest chose (best-effort;
+    # never blocks promotion). After it transitions to paper its params are
+    # operator-locked, so this is the moment to record it.
+    try:
+        profile_selection = _select_and_persist_execution_profile(workflow, strategy_id)
+    except Exception as exc:  # noqa: BLE001 — selection must never block promotion
+        log.warning(
+            "execution-profile selection failed for %s (promoting on the default engine): %s",
+            strategy_id, exc,
+        )
+        profile_selection = {"error": str(exc)}
+
     transition = _transition_to_paper(
         strategy_id=strategy_id,
         target_stage="paper",
@@ -1156,7 +1412,7 @@ def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> 
     )
     target = str(transition.get("to") or transition.get("target_stage") or "").strip().lower()
     if target == "paper":
-        return {"status": "passed", "transition": transition, "gauntlet_status": status}
+        return {"status": "passed", "transition": transition, "gauntlet_status": status, "execution_profile_selection": profile_selection}
     reason_code = str(transition.get("reason_code") or "").strip()
     if transition.get("approval_id") or reason_code == "operator_promotion_approval_required":
         return {
@@ -1178,6 +1434,39 @@ def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> 
             # block without digging into the transition payload: gate_contention must
             # never burn down to a terminal failed_gate (see engine._NO_DRAIN_REASON_CODES).
             "reason_code": "gate_contention",
+            "transition": transition,
+            "gauntlet_status": status,
+        }
+    _blocked_text = str(
+        transition.get("blocked_reason") or transition.get("reason") or transition.get("message") or ""
+    ).lower()
+    if (
+        reason_code in {"stale_validation", "artifacts_pending"}
+        or "ordering violation" in _blocked_text
+        or "re-run after optimization" in _blocked_text
+        or "stale validation" in _blocked_text
+    ):
+        # PENDING RE-VALIDATION, not a merit failure. The gauntlet gate's artifact-
+        # ordering / freshness check fails when a validation (walk_forward) is older
+        # than the latest optimization — i.e. it ran in the transient window after
+        # optimization completed but before walk_forward re-ran on the new params. It
+        # self-resolves the moment the validation re-runs, so RETRY on a later tick;
+        # NEVER drain to a terminal failed_gate (which would auto-archive a genuinely-
+        # passing strategy via demote_failed_gate_strategies — the S03523 case, where
+        # the gate burned its retries in the ~20-min gap before walk_forward re-ran).
+        # reason_code is in engine._NO_DRAIN_REASON_CODES so requeue retries it on the
+        # bounded cadence; the 2-day un-promotable hygiene backstop catches any genuine
+        # deadlock where the validation truly never re-runs.
+        return {
+            "status": "blocked_runtime",
+            "message": str(
+                transition.get("blocked_reason")
+                or transition.get("reason")
+                or transition.get("message")
+                or "validation pending re-run after optimization"
+            ),
+            "retryable": True,
+            "reason_code": reason_code or "stale_validation",
             "transition": transition,
             "gauntlet_status": status,
         }

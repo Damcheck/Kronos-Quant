@@ -23,6 +23,13 @@ export interface SignalMarker {
 	direction?: 'long' | 'short' | string;
 	label?: string;
 	source?: 'trade' | 'signal' | string;
+	// Self-describing visuals forwarded from the backend marker payload. When
+	// present the chart renders straight from these; otherwise it derives from
+	// direction + entry/exit (backward-compatible).
+	side?: 'bull' | 'bear' | string;
+	action?: string;
+	shape?: 'arrowUp' | 'arrowDown' | string;
+	color?: string;
 }
 
 export interface ChartLayout {

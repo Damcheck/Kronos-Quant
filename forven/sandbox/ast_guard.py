@@ -8,102 +8,189 @@ Public API:
 - :func:`scan_file`   — read+scan a file from disk
 
 Both return an :class:`AstReport`. `ok` is True iff no findings were
-recorded. Forbidden categories: top-level imports of OS/network/file/
-subprocess/dynamic-exec stdlib modules, dynamic execution constructs
-(`eval`/`exec`/`compile`/`__import__('…')`/`getattr(__builtins__, …)`),
-and size caps (file bytes + line count).
+recorded. Findings cover: imports NOT on the allowlist (the import gate is an
+allowlist of numeric/data libs + pure-computation stdlib + the strategy-facing
+forven API — see :data:`ALLOWED_IMPORTS` / :data:`ALLOWED_FORVEN_PREFIXES`),
+re-export smuggling (`from pandas.io.common import os`) and attribute traversal
+to a dangerous module (`pd…subprocess.run`), dynamic execution constructs
+(`eval`/`exec`/`compile`/`__import__('…')`/`getattr(__builtins__, …)`), and size
+caps (file bytes + line count).
+
+NOT a complete trust boundary by itself — a static scan can never be. It is
+defense-in-depth that shrinks the surface; the real boundary is out-of-process
+execution (Phase 2, see docs/security-hardening-plan.md).
 """
 from __future__ import annotations
 
 import ast
+import codecs
+import io
+import re
+import tokenize
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
+
+# OHLCV column names a strategy legitimately indexes/getattrs (``df['open']``,
+# ``getattr(row, 'close')``). They are carved OUT of the dynamic-access denylists
+# below so the new subscript/getattr hardening never false-flags real strategies.
+_OHLCV_NAMES: frozenset[str] = frozenset(
+    {"open", "high", "low", "close", "volume", "vwap", "funding", "oi"}
+)
+
+# PEP 263 source-encoding cookie. Mirrors CPython's tokenizer regex
+# (Lib/tokenize.py ``cookie_re``) so the guard rejects every cookie the
+# interpreter would actually honor. The scan/compile differential (the guard
+# parses a decoded ``str`` where ``ast.parse`` IGNORES the cookie, while
+# importlib compiles the on-disk BYTES and HONORS it) was a confirmed in-process
+# RCE — utf-7/unicode_escape re-decode a benign-looking comment into live code.
+# Fix: refuse any source whose declared encoding is not a plain utf-8/ascii.
+_CODING_COOKIE_RE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
+_SAFE_SOURCE_ENCODINGS: frozenset[str] = frozenset({"utf-8", "utf-8-sig", "ascii"})
 
 # Hard caps. Configurable via forven.config.sandbox in a later phase.
 MAX_FILE_BYTES: int = 100 * 1024  # 100 KB
 MAX_LINES: int = 1500
 
-FORBIDDEN_IMPORTS: frozenset[str] = frozenset(
+# P1.2 (audit 2026-06-28): the import gate is an ALLOWLIST, not a denylist. A
+# denylist of "dangerous" stdlib is unwinnable — `_winapi`, `http.client`,
+# `pdb.run`, `timeit`, `winreg`, `xmlrpc`, `poplib`, ... each reach code-exec or
+# network and a fresh one ships every Python release. A pure-OHLCV strategy only
+# ever needs numeric/data libraries, pure-computation stdlib, and the
+# strategy-facing forven API; everything else is rejected. (The prior denylist is
+# preserved in git history.)
+ALLOWED_IMPORTS: frozenset[str] = frozenset(
+    {
+        # Numeric / data / TA libraries the strategy corpus is built on.
+        "pandas",
+        "numpy",
+        "pandas_ta",
+        "scipy",
+        "sklearn",
+        # Pure-computation stdlib — none of these expose a filesystem, network,
+        # process, or dynamic-exec primitive.
+        "math",
+        "statistics",
+        "decimal",
+        "fractions",
+        "random",
+        "json",
+        "re",
+        "string",
+        "datetime",
+        "typing",
+        "dataclasses",
+        "abc",
+        "enum",
+        "collections",
+        "itertools",
+        "functools",
+        "warnings",
+        "__future__",
+    }
+)
+
+# The ONLY forven module prefixes an untrusted strategy may import: the strategy
+# base, the pure-indicator facade, the composite/builtin strategies it may compose,
+# the read-only market-data view, and the pure TA helpers. This EXCLUDES
+# forven.exchange / forven.db / forven.secret_storage / forven.config / forven.auth /
+# forven.brain — which expose orders, the database, and credentials.
+#
+# REMOVED for R3 (docs/strategy-share-security-audit-2026-06-29.md):
+#  • forven.scanner — re-exports get_db / kv_get / _execute_direct (DB + secret-decrypt
+#    + live-order sink). Strategies only ever needed its PURE indicator helpers
+#    (rsi/atr/adx/...), which are now re-exported by forven.strategies.indicators (a
+#    lazy facade). The builtin/composite corpus was migrated to import from there; the
+#    only files still importing forven.scanner are archived/dead customs (correctly
+#    scan-rejected on revival). The worker DB+network jail already made scanner inert
+#    inside the sandbox; de-allowlisting also removes it from the *intended* surface.
+#  • forven.strategies.sentiment — re-exports a live funding fetch (network/exchange).
+#    The one shipped user (builtin funding.py) was migrated to read the parent-enriched
+#    funding_rate column; remaining importers are archived/dead.
+#  • forven.data / forven.data_manager — ccxt client (SSRF), raw requests.Session
+#    (exfil egress), and pathlib.Path/shutil (arbitrary FS read/write — NOT covered by
+#    the DB+network jail). Only archived/dead customs imported them.
+ALLOWED_FORVEN_PREFIXES: tuple[str, ...] = (
+    "forven.strategies.base",
+    "forven.strategies.indicators",
+    "forven.strategies.composite",
+    "forven.strategies.builtin",
+    "forven.market_data_view",
+    "forven.ta",
+)
+
+# Module names that must never be bound as an imported SYMBOL
+# (`from pandas.io.common import os`) nor reached as an ATTRIBUTE
+# (`pd._config.localization.subprocess.run`) — the two re-export smuggling routes
+# back to os/subprocess through an otherwise-allowed package. Kept deliberately
+# TIGHT so it can never collide with a legitimate submodule of an allowed library
+# (numpy.random, scipy.signal, pandas.io, …): only names that are never such a
+# submodule appear here.
+_TRAVERSAL_BLOCK: frozenset[str] = frozenset(
     {
         "os",
         "subprocess",
         "socket",
-        "requests",
-        "httpx",
-        "aiohttp",
-        "urllib",
-        "urllib2",
-        "urllib3",
-        "ftplib",
-        "smtplib",
-        "telnetlib",
-        "ctypes",
-        "cffi",
-        "multiprocessing",
-        "threading",
-        "asyncio",
-        "concurrent",
-        "pathlib",
-        "shutil",
-        "tempfile",
-        "glob",
-        "fileinput",
-        "pickle",
-        "marshal",
-        "shelve",
-        "dbm",
-        "sqlite3",
-        "zipfile",
-        "tarfile",
-        "importlib",
-        "imp",
-        "pkgutil",
-        "pkg_resources",
-        # Gadget-source stdlib modules: each gives a generated strategy a route
-        # back to the builtins namespace / live objects / dynamic execution even
-        # though it imports cleanly. A pure-OHLCV strategy never needs any of them,
-        # so reaching for one is a strong escape signal (P-S audit 2026-06-22).
+        "sys",
         "builtins",
         "__builtin__",
-        "sys",
-        "gc",
-        "inspect",
-        "io",
-        "codecs",
-        "code",
-        "codeop",
-        "runpy",
-        "pty",
+        "__builtins__",
+        "ctypes",
+        "importlib",
+        "_winapi",
+        "_posixsubprocess",
         "posix",
         "nt",
-        "signal",
-        "mmap",
-        "fcntl",
-        "resource",
-        "webbrowser",
-        "platform",
-        "sysconfig",
-        "site",
-        "ast",
-        "dis",
-        # operator.attrgetter('__globals__')(fn) / operator.methodcaller reach the
-        # gadget chain and dynamic dispatch without a dotted attribute the guard
-        # can see. A pure-OHLCV strategy uses Python's native operators, never the
-        # `operator` module, so block it (P-S audit 2026-06-22).
-        "operator",
-        # Third-party (de)serializers that execute pickled callables on load.
-        "joblib",
-        "dill",
-        "cloudpickle",
-        "yaml",
-        # The `ta` technical-analysis library is permanently blocked at runtime by
-        # the import tripwire in forven/__init__.py. Reject it here too so a
-        # generated strategy that imports it fails fast during validation (and the
-        # codegen retry can fix it) instead of crashing mid-backtest.
-        "ta",
+        "msvcrt",
+        "winreg",
+        "pty",
+        "multiprocessing",
+        "popen",
+        # Native-FFI / build / shell submodules that live INSIDE allowlisted libs
+        # (numpy.ctypeslib -> ctypes.CDLL; numpy.distutils.exec_command -> shell;
+        # numpy.f2py.compile -> native build). The import allowlist only checks the
+        # top package, and these are reachable as plain attributes (``np.ctypeslib``)
+        # — block both the attribute hop and the dotted import (see _DENY_SUBMODULES).
+        "ctypeslib",
+        "distutils",
+        "f2py",
     }
 )
+
+# Dotted submodules of an ALLOWLISTED top package that are still forbidden: they
+# wrap native-code loaders, shell helpers, or pickle/IO that an OHLCV strategy
+# never needs. The import gate checks the top package only, so reject these by
+# full dotted prefix as well (confirmed gadgets: numpy.distutils.exec_command,
+# numpy.ctypeslib.load_library, numpy.f2py.compile).
+_DENY_SUBMODULES: tuple[str, ...] = (
+    "numpy.distutils",
+    "numpy.f2py",
+    "numpy.ctypeslib",
+    "numpy.testing",
+    "numpy.core",
+    "scipy.io",
+    "scipy.weave",
+    "scipy.misc",
+    "sklearn.externals",
+    "pandas.io.clipboard",
+)
+
+
+def _module_import_allowed(dotted: str) -> bool:
+    """Allowlist check for a (possibly dotted) module name."""
+    name = (dotted or "").strip()
+    if not name:
+        return False
+    if name.split(".")[0] == "forven":
+        return any(name == p or name.startswith(p + ".") for p in ALLOWED_FORVEN_PREFIXES)
+    if name.split(".")[0] not in ALLOWED_IMPORTS:
+        return False
+    # Top package is allowlisted, but a dangerous submodule is not (the gate must
+    # validate the FULL dotted path, not just split('.')[0]).
+    for bad in _DENY_SUBMODULES:
+        if name == bad or name.startswith(bad + "."):
+            return False
+    return True
 
 FORBIDDEN_CALLS: frozenset[str] = frozenset(
     {
@@ -144,6 +231,37 @@ FORBIDDEN_ATTRS: frozenset[str] = frozenset(
         "__import__",
         "__loader__",
         "__self__",
+        # Frame / generator / coroutine / async-gen / traceback introspection.
+        # A confirmed bypass reached the live builtins via
+        # ``(x for x in [1]).gi_frame.f_builtins['exec']`` and read the trusted
+        # PARENT frame's secrets via ``err.__traceback__.tb_frame.f_back.f_locals``.
+        # None of these are touched by an honest indicator strategy.
+        "gi_frame",
+        "gi_code",
+        "cr_frame",
+        "cr_code",
+        "ag_frame",
+        "ag_code",
+        "tb_frame",
+        "tb_next",
+        "f_back",
+        "f_builtins",
+        "f_globals",
+        "f_locals",
+        "f_code",
+        "__traceback__",
+        # Reflection dunders that reach class internals / re-create callables /
+        # unwrap decorators / expose function defaults — all gadget-chain hops a
+        # pure-computation strategy never needs. (``__dict__`` is intentionally NOT
+        # blocked: real strategies read ``StrategyParams().__dict__`` for defaults,
+        # and it is not load-bearing for any confirmed escape now that the frame
+        # attrs + __globals__/__builtins__ hops are blocked.)
+        "__reduce__",
+        "__reduce_ex__",
+        "__wrapped__",
+        "__func__",
+        "__defaults__",
+        "__kwdefaults__",
     }
 )
 
@@ -151,9 +269,9 @@ FORBIDDEN_ATTRS: frozenset[str] = frozenset(
 # blocked in BOTH bare-name form (``eval(x)``) AND attribute form
 # (``builtins.eval(x)``, ``b.open(...)``) — the attribute form was the verified
 # bypass of the old denylist, which only checked ``ast.Name`` callees. Most of
-# these are builtins reachable without an import, or live on modules already in
-# FORBIDDEN_IMPORTS, so the attribute check is defense-in-depth that closes the
-# "import a not-yet-banned module and reach the same primitive" gadget.
+# these are builtins reachable without an import, or live on modules the import
+# allowlist already blocks, so the attribute check is defense-in-depth that closes
+# the "reach the same primitive off a re-exported module" gadget.
 FORBIDDEN_CALL_ATTRS: frozenset[str] = frozenset(
     {
         "eval",
@@ -190,6 +308,34 @@ FORBIDDEN_CALL_ATTRS: frozenset[str] = frozenset(
         "spawnve",
         "spawnvp",
         "spawnvpe",
+        # Process-spawn / file-launch / env-read names the old list missed —
+        # reachable off a re-exported subprocess/os if the attribute traversal is
+        # somehow bypassed (audit P1.2). `.run`/`.call` are intentionally NOT here
+        # (too generic — a strategy may legitimately define a method named run);
+        # the `.subprocess`/`.os` attribute block is what stops `subprocess.run`.
+        "Popen",
+        "check_output",
+        "check_call",
+        "startfile",
+        "posix_spawn",
+        "posix_spawnp",
+        "getenv",
+        "putenv",
+        # Native-code loaders / FFI / build-shell gadgets reachable off allowlisted
+        # numeric libs (numpy.ctypeslib.load_library, ctypes.CDLL via ctypeslib,
+        # numpy.distutils.exec_command, numpy.f2py.compile). An honest strategy
+        # never loads a shared library or shells out a compiler.
+        "load_library",
+        "LoadLibrary",
+        "CDLL",
+        "WinDLL",
+        "OleDLL",
+        "PyDLL",
+        "cdll",
+        "windll",
+        "oledll",
+        "dlopen",
+        "exec_command",
     }
 )
 
@@ -231,6 +377,22 @@ FORBIDDEN_METHOD_NAMES: frozenset[str] = frozenset(
         "memmap",
         "savetxt",
         "fromregex",
+        # WRITE serializers the old denylist forgot. ndarray.tofile gives byte-exact
+        # arbitrary file write; the pandas to_* text writers all accept a path. A
+        # confirmed finding overwrote the never-scanned custom/__init__.py via
+        # ``np.frombuffer(...).tofile(__file__...)`` -> persistent RCE on restart. A
+        # strategy operates on the frame it is GIVEN; it never serializes to disk.
+        "to_csv",
+        "to_json",
+        "to_html",
+        "to_markdown",
+        "to_latex",
+        "to_xml",
+        "to_excel",
+        "save",
+        "savez",
+        "savez_compressed",
+        "tofile",
     }
 )
 
@@ -263,13 +425,62 @@ FORBIDDEN_NAME_LOADS: frozenset[str] = frozenset(
     }
 )
 
+# String constants that must never be the key of a getattr/setattr/delattr/hasattr.
+# The old check only blocked dunders in FORBIDDEN_ATTRS, so getattr(m, 'os') /
+# getattr(m, 'subprocess') / getattr(m, 'system') / getattr(m, 'environ') all
+# passed and reached the real module/builtin (confirmed bypass). Now reject every
+# dangerous name, MINUS the OHLCV column names a strategy legitimately getattrs.
+_FORBIDDEN_GETATTR_STR: frozenset[str] = frozenset(
+    (
+        FORBIDDEN_ATTRS
+        | _TRAVERSAL_BLOCK
+        | FORBIDDEN_CALL_ATTRS
+        | FORBIDDEN_METHOD_NAMES
+        | FORBIDDEN_NAMES
+        | {"__builtins__", "environ", "modules", "builtins"}
+    )
+    - _OHLCV_NAMES
+)
+
+# String constants that are never a legitimate subscript key (``d['__globals__']``,
+# ``builtins_dict['exec']``). Kept DELIBERATELY narrow — only dunder-form keys and
+# the three pure-exec builtins — so it can never collide with an OHLCV/data column
+# name like ``df['open']`` or ``df['close']``. Defense-in-depth behind the frame-attr
+# and __builtins__-name blocks, which already kill the known chains.
+_DANGEROUS_SUBSCRIPT_KEYS: frozenset[str] = frozenset({"exec", "eval", "compile"})
+
 FindingKind = Literal[
     "forbidden_import",
     "dynamic_exec",
+    "forbidden_encoding",
     "file_too_large",
     "too_many_lines",
     "syntax_error",
 ]
+
+
+def _offending_source_encoding(source: str) -> str | None:
+    """Return the declared NON-utf8/ascii source encoding (PEP 263 cookie), or None.
+
+    CPython's tokenizer honors a ``# coding: <enc>`` cookie on line 1 or 2 (and a
+    UTF-8 BOM); ``ast.parse`` on an already-decoded ``str`` does NOT. So a guard
+    that scans the decoded str sees a benign comment while importlib re-decodes the
+    file bytes under the cookie and runs different code. Honest strategy files are
+    plain utf-8/ascii, so any other declared codec is rejected outright.
+    """
+    body = source[1:] if source[:1] == "\ufeff" else source
+    for line in body.split("\n", 2)[:2]:
+        match = _CODING_COOKIE_RE.match(line)
+        if not match:
+            continue
+        declared = match.group(1)
+        try:
+            normalized = codecs.lookup(declared).name.replace("_", "-").lower()
+        except Exception:
+            return declared  # unknown codec — reject (the loader would too)
+        if normalized not in _SAFE_SOURCE_ENCODINGS:
+            return declared
+    return None
 
 
 @dataclass
@@ -300,14 +511,13 @@ class _GuardVisitor(ast.NodeVisitor):
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
-            top = alias.name.split(".")[0]
-            if top in FORBIDDEN_IMPORTS:
+            if not _module_import_allowed(alias.name):
                 self.findings.append(
                     Finding(
                         kind="forbidden_import",
                         lineno=node.lineno,
                         col=node.col_offset,
-                        message=f"Forbidden import: '{alias.name}'",
+                        message=f"Import not on the allowlist: '{alias.name}'",
                         node_repr=ast.dump(node),
                     )
                 )
@@ -315,17 +525,43 @@ class _GuardVisitor(ast.NodeVisitor):
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         module = node.module or ""
-        top = module.split(".")[0]
-        if top in FORBIDDEN_IMPORTS:
+        if getattr(node, "level", 0):
+            # Relative import — an untrusted strategy module has no package to
+            # reach into; reject so `from . import os` / `from .. import x` can't
+            # smuggle a sibling module past the dotted-name allowlist.
             self.findings.append(
                 Finding(
                     kind="forbidden_import",
                     lineno=node.lineno,
                     col=node.col_offset,
-                    message=f"Forbidden import: 'from {module} import ...'",
+                    message="Relative imports are not allowed",
                     node_repr=ast.dump(node),
                 )
             )
+        elif not _module_import_allowed(module):
+            self.findings.append(
+                Finding(
+                    kind="forbidden_import",
+                    lineno=node.lineno,
+                    col=node.col_offset,
+                    message=f"Import not on the allowlist: 'from {module} import ...'",
+                    node_repr=ast.dump(node),
+                )
+            )
+        # Smuggle guard: even from an allowed package, refuse to BIND a dangerous
+        # module as a symbol — `from pandas.io.common import os` has an allowed
+        # top package (pandas) but binds the real os module.
+        for alias in node.names:
+            if alias.name.split(".")[0] in _TRAVERSAL_BLOCK:
+                self.findings.append(
+                    Finding(
+                        kind="forbidden_import",
+                        lineno=node.lineno,
+                        col=node.col_offset,
+                        message=f"Forbidden imported symbol: '{alias.name}'",
+                        node_repr=ast.dump(node),
+                    )
+                )
         self.generic_visit(node)
 
     def _add(self, node: ast.AST, message: str) -> None:
@@ -377,6 +613,27 @@ class _GuardVisitor(ast.NodeVisitor):
                     ):
                         self._add(node, "Forbidden call: '.load(..., allow_pickle=...)' (pickle deserialization)")
                         break
+            elif func.attr == "query":
+                # pandas DataFrame.query routes an opaque attacker string through an
+                # evaluator. The 'python' engine allows attribute reads + method calls — a
+                # confirmed RCE gadget (df.query("close.__init__.__globals__[...]...")) — and
+                # when numexpr is not installed pandas SILENTLY DEFAULTS to the python
+                # engine, so an ABSENT or NON-CONSTANT engine is just as dangerous as an
+                # explicit engine="python". Allow ONLY a constant engine="numexpr" (numeric-
+                # only, no attribute access); reject every other form. (.eval is already a
+                # FORBIDDEN_CALL_ATTR.)
+                safe_numexpr = any(
+                    kw.arg == "engine"
+                    and isinstance(kw.value, ast.Constant)
+                    and kw.value.value == "numexpr"
+                    for kw in node.keywords
+                )
+                if not safe_numexpr:
+                    self._add(
+                        node,
+                        "Forbidden call: '.query(...)' without a constant engine=\"numexpr\" "
+                        "(the python engine — used by default when numexpr is absent — evals attacker strings)",
+                    )
 
         # Bare getattr/setattr/delattr with a NON-constant attribute key is the
         # dynamic-attribute escape primitive (e.g. getattr(b, 'ev'+'al')). The
@@ -403,18 +660,18 @@ class _GuardVisitor(ast.NodeVisitor):
             )
         elif isinstance(func, ast.Name) and func.id == "__import__":
             # A dynamic import is safe ONLY when its argument is a CONSTANT string
-            # naming a non-forbidden module — that is exactly equivalent to a plain
+            # naming an ALLOWLISTED module — that is exactly equivalent to a plain
             # `import <name>` and is a common codegen idiom (`__import__("pandas")`).
             # A non-constant argument (the real obfuscation/exfil primitive) or a
-            # forbidden module (os/socket/ctypes/…) stays blocked.
+            # non-allowlisted module (os/socket/ctypes/…) stays blocked.
             const_mod: str | None = None
             if (
                 node.args
                 and isinstance(node.args[0], ast.Constant)
                 and isinstance(node.args[0].value, str)
             ):
-                const_mod = node.args[0].value.split(".")[0]
-            if const_mod is None or const_mod in FORBIDDEN_IMPORTS:
+                const_mod = node.args[0].value
+            if const_mod is None or not _module_import_allowed(const_mod):
                 self.findings.append(
                     Finding(
                         kind="dynamic_exec",
@@ -454,7 +711,7 @@ class _GuardVisitor(ast.NodeVisitor):
                 if (
                     isinstance(_arg, ast.Constant)
                     and isinstance(_arg.value, str)
-                    and (_arg.value in FORBIDDEN_ATTRS or _arg.value == "__builtins__")
+                    and _arg.value in _FORBIDDEN_GETATTR_STR
                 ):
                     self.findings.append(
                         Finding(
@@ -483,6 +740,37 @@ class _GuardVisitor(ast.NodeVisitor):
                     node_repr=ast.dump(node),
                 )
             )
+        elif node.attr in _TRAVERSAL_BLOCK:
+            # Attribute-chain to a dangerous module re-exported off an allowed
+            # package, e.g. `pandas._config.localization.subprocess` — the `.subprocess`
+            # hop is caught here before any `.run(...)` can fire (audit P1.2).
+            self.findings.append(
+                Finding(
+                    kind="dynamic_exec",
+                    lineno=node.lineno,
+                    col=node.col_offset,
+                    message=f"Forbidden module attribute access: '.{node.attr}'",
+                    node_repr=ast.dump(node),
+                )
+            )
+        self.generic_visit(node)
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        # A constant dunder/exec-name subscript key is builtins-dict access reached
+        # without a blocked Name/Attribute (``some_dict['exec'](...)``). Narrowly
+        # scoped (dunder-form or exec/eval/compile) so it never collides with an
+        # OHLCV column key like ``df['open']``. Defense-in-depth behind the
+        # f_builtins / __builtins__ blocks.
+        key = node.slice
+        if (
+            isinstance(key, ast.Constant)
+            and isinstance(key.value, str)
+            and (
+                (key.value.startswith("__") and key.value.endswith("__"))
+                or key.value in _DANGEROUS_SUBSCRIPT_KEYS
+            )
+        ):
+            self._add(node, f"Forbidden subscript key: [{key.value!r}] (builtins/dunder access)")
         self.generic_visit(node)
 
 
@@ -497,6 +785,26 @@ def scan_source(source: str, file_size_bytes: int = 0) -> AstReport:
     )
 
     findings: list[Finding] = []
+
+    # PEP 263 coding-cookie / BOM smuggling: the interpreter compiles the file
+    # BYTES under the declared codec, but this guard parses the decoded str (which
+    # ignores the cookie). Refuse any non-utf8/ascii source encoding so the program
+    # we scan is the program that runs (confirmed utf-7/unicode_escape RCE).
+    offending_enc = _offending_source_encoding(source)
+    if offending_enc is not None:
+        findings.append(
+            Finding(
+                kind="forbidden_encoding",
+                lineno=1,
+                col=0,
+                message=(
+                    f"Forbidden source-encoding declaration: '{offending_enc}'. "
+                    "Only utf-8/ascii is allowed (a coding cookie lets the "
+                    "interpreter compile different bytes than were scanned)."
+                ),
+                node_repr="",
+            )
+        )
 
     if file_size_bytes > MAX_FILE_BYTES:
         findings.append(
@@ -566,12 +874,44 @@ def scan_source(source: str, file_size_bytes: int = 0) -> AstReport:
 
 
 def scan_file(path: Path | str) -> AstReport:
-    """Read *path* and scan it. UTF-8 with latin-1 fallback so we never
-    raise UnicodeDecodeError out of the guard."""
+    """Read *path* and scan EXACTLY the bytes the interpreter would compile.
+
+    Detect the source encoding from the raw bytes the same way CPython's loader
+    does (``tokenize.detect_encoding`` honors the PEP 263 cookie + BOM), reject any
+    non-utf8/ascii encoding, then decode under the detected codec so the scanned
+    program equals the compiled program. No silent latin-1 fallback — an
+    undecodable file is rejected, not reinterpreted."""
     p = Path(path)
     raw = p.read_bytes()
     try:
-        source = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        source = raw.decode("latin-1")
+        detected, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
+    except SyntaxError as exc:
+        return AstReport(
+            ok=False,
+            findings=[Finding("forbidden_encoding", 1, 0, f"Undecodable source: {exc}", "")],
+            file_size_bytes=len(raw),
+        )
+    normalized = detected.replace("_", "-").lower()
+    if normalized not in _SAFE_SOURCE_ENCODINGS:
+        return AstReport(
+            ok=False,
+            findings=[
+                Finding(
+                    "forbidden_encoding",
+                    1,
+                    0,
+                    f"Forbidden source encoding '{detected}' — only utf-8/ascii allowed.",
+                    "",
+                )
+            ],
+            file_size_bytes=len(raw),
+        )
+    try:
+        source = raw.decode(detected)
+    except UnicodeDecodeError as exc:
+        return AstReport(
+            ok=False,
+            findings=[Finding("forbidden_encoding", 1, 0, f"Undecodable source: {exc}", "")],
+            file_size_bytes=len(raw),
+        )
     return scan_source(source, file_size_bytes=len(raw))

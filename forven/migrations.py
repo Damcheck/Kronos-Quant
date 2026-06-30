@@ -201,6 +201,29 @@ def _m_2026_04_strategy_pinned_backtest(conn: sqlite3.Connection) -> None:
     )
 
 
+def _m_2026_06_strategy_sandbox_only(conn: sqlite3.Connection) -> None:
+    """Mark untrusted-origin (imported / shared) strategies as sandbox-only.
+
+    A strategy imported from another machine carries author-controlled Python that
+    must NEVER be imported into the trusted parent process. Its module lives in
+    forven/strategies/imported/ (invisible to in-process discovery) and this flag
+    is the durable, authoritative record that its execution must be routed through
+    the locked-down subprocess worker (the file path / source label are not a trust
+    boundary). See docs/strategy-share-security-audit-2026-06-29.md (R2).
+    """
+    strat_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(strategies)").fetchall()
+    }
+    if "sandbox_only" not in strat_cols:
+        conn.execute(
+            "ALTER TABLE strategies ADD COLUMN sandbox_only INTEGER NOT NULL DEFAULT 0"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_strategies_sandbox_only "
+        "ON strategies (sandbox_only) WHERE sandbox_only = 1"
+    )
+
+
 def _m_2026_06_portfolio_position_execution_type(conn: sqlite3.Connection) -> None:
     """Scope portfolio positions by execution type for per-session isolation.
 
@@ -392,6 +415,147 @@ def _m_2026_06_user_strategy_library(conn: sqlite3.Connection) -> None:
     )
 
 
+# The literal of forven.scanner.PAPER_BOOK_RESET_KV_KEY. Duplicated here (not imported) so
+# the boot migration path never pulls in the heavy scan stack; a unit test asserts the two
+# stay in sync.
+_PAPER_BOOK_RESET_KV_KEY = "paper:book_reset_at"
+
+
+def _m_2026_06_paper_book_go_live_stamp(conn: sqlite3.Connection) -> None:
+    """Anchor the kernel paper-recording GO-LIVE at upgrade time for existing installs.
+
+    The kernel paper engine records trades from a go-live cutoff =
+    ``max(stage_changed_at, paper-book reset stamp)``. A strategy promoted to paper BEFORE
+    the kernel engine shipped has an OLD ``stage_changed_at`` and no reset stamp, so the
+    first kernel scan after upgrade would backfill the kernel's ENTIRE would-be history
+    since then — flooding the book with synthetic trades and double-counting paper equity
+    (the existing-install upgrade hazard the operator reset script otherwise has to prevent
+    by hand).
+
+    Stamp the paper-book reset = now (the SAME key ``scripts/reset_paper_trades.py`` writes)
+    when it is unset, so the kernel records from upgrade FORWARD instead of replaying
+    history. Stored exactly like ``kv_set`` (json-encoded value) so ``kv_get`` /
+    ``_resolve_paper_go_live`` read it back. Any strategy promoted LATER keeps its own
+    (later) ``stage_changed_at`` because go-live = max(stage_changed_at, stamp).
+
+    Only stamps installs with an actual kernel-recordable book to protect — an existing paper
+    trade, or a strategy already promoted to paper/live (whose old ``stage_changed_at`` would
+    otherwise make the first scan replay history). A pristine install (no such strategy/trade,
+    including every test's fresh DB) is left unstamped: there go-live = stage_changed_at =
+    promotion time already handles recording with no flood, so the migration stays a true
+    no-op and never perturbs scanner tests. Idempotent: no-ops once the key exists (operator
+    reset, or a prior run) and is recorded once in schema_migrations.
+    """
+    if conn.execute(
+        "SELECT 1 FROM kv WHERE key = ? LIMIT 1", (_PAPER_BOOK_RESET_KV_KEY,)
+    ).fetchone() is not None:
+        return  # already stamped (operator reset, or this migration already ran) → leave it
+    has_book = conn.execute(
+        "SELECT 1 FROM trades WHERE COALESCE(execution_type, 'paper') = 'paper' LIMIT 1"
+    ).fetchone()
+    if has_book is None:
+        has_book = conn.execute(
+            "SELECT 1 FROM strategies "
+            "WHERE lower(COALESCE(stage, '')) IN "
+            "('paper', 'paper_trading', 'live', 'graduated', 'deployed') LIMIT 1"
+        ).fetchone()
+    if has_book is None:
+        return  # pristine install (nothing promoted/traded yet) → nothing to protect
+    now_iso = conn.execute("SELECT strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')").fetchone()[0]
+    conn.execute(
+        "INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)",
+        (_PAPER_BOOK_RESET_KV_KEY, json.dumps(now_iso), now_iso),
+    )
+    log.info("Stamped paper-book go-live = %s (kernel records forward; no pre-upgrade replay)", now_iso)
+
+
+# The PURE indicator helpers the forven.strategies.indicators facade re-exports — the only
+# forven.scanner names safe to redirect (no DB / network / deputy reach).
+_R3_FACADE_INDICATORS = frozenset(
+    {
+        "rsi", "adx", "atr", "stochastic", "williams_r", "vwap",
+        "oi_price_divergence", "funding_rate_zscore", "ema_cross_thresholds",
+    }
+)
+
+
+def redirect_pure_scanner_imports(text: str) -> str:
+    """Rewrite ``from forven.scanner import <pure indicators>`` -> the allowlisted
+    ``forven.strategies.indicators`` facade in ONE module's source. SAFE-ONLY: a line is
+    redirected only when it is a simple single-line ``from forven.scanner import …`` whose every
+    imported name is a pure facade indicator. A line importing a non-pure / deputy symbol
+    (fetch_candles, get_db, _execute_direct, …) — or a parenthesised/multiline import — is left
+    untouched, so a self-fetching / confused-deputy strategy stays rejected. Returns the
+    (possibly unchanged) source; idempotent (no matching line remains after one pass)."""
+    old_prefix = "from forven.scanner import "
+    new_prefix = "from forven.strategies.indicators import "
+    if old_prefix not in text:
+        return text
+    out: list[str] = []
+    for line in text.splitlines(keepends=True):
+        if line.lstrip().startswith(old_prefix) and "(" not in line:
+            names_part = line.split(old_prefix, 1)[1].split("#", 1)[0]
+            base_names = [n.split(" as ")[0].strip() for n in names_part.split(",") if n.strip()]
+            if base_names and all(bn in _R3_FACADE_INDICATORS for bn in base_names):
+                line = line.replace(old_prefix, new_prefix, 1)
+        out.append(line)
+    return "".join(out)
+
+
+def rewrite_custom_scanner_imports_in_dir(custom_dir) -> list[str]:
+    """Apply :func:`redirect_pure_scanner_imports` to every ``*.py`` in ``custom_dir`` (skipping
+    ``__init__``), writing back only the files that changed. Returns the changed filenames.
+    Best-effort per file (unreadable / unwritable files are skipped, never raised)."""
+    rewritten: list[str] = []
+    for path in sorted(custom_dir.glob("*.py")):
+        if path.name == "__init__.py":
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception:
+            continue  # non-utf8 / unreadable → already rejected by the byte-scan; leave it
+        new_text = redirect_pure_scanner_imports(text)
+        if new_text != text:
+            try:
+                path.write_text(new_text, encoding="utf-8")
+                rewritten.append(path.name)
+            except Exception as exc:  # noqa: BLE001 — never fail the upgrade on a file-write hiccup
+                log.warning("R3 custom-import migration: could not rewrite %s: %s", path.name, exc)
+    return rewritten
+
+
+def _m_2026_06_rewrite_custom_scanner_imports(conn: sqlite3.Connection) -> None:
+    """R3: ``forven.scanner`` was removed from the untrusted-strategy import allowlist (it
+    re-exports get_db / kv_get / _execute_direct); its PURE indicator helpers now live behind the
+    allowlisted ``forven.strategies.indicators`` facade. The shipped builtins/composites were
+    migrated in-tree, but a user's OWN custom strategies (``forven/strategies/custom/*.py`` —
+    local + gitignored) were not: an active custom doing ``from forven.scanner import rsi`` is now
+    scan-rejected and silently stops loading after the upgrade.
+
+    One-time, on upgrade: redirect those imports to the facade (pure-indicator lines only;
+    deputy/self-fetch imports stay rejected) so the strategies keep working. Idempotent; recorded
+    once in schema_migrations. ``conn`` is unused — strategy files live on disk, not in the DB."""
+    import os
+    from pathlib import Path
+
+    # This is the only migration with an on-disk side effect (it edits custom/ strategy files).
+    # Skip that under pytest so the migration-safety suite (which applies EVERY migration) never
+    # mutates a developer's local strategies — the rewrite logic itself is covered directly by
+    # test_custom_scanner_import_migration via rewrite_custom_scanner_imports_in_dir.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    custom_dir = Path(__file__).resolve().parent / "strategies" / "custom"
+    if not custom_dir.is_dir():
+        return
+    rewritten = rewrite_custom_scanner_imports_in_dir(custom_dir)
+    if rewritten:
+        log.info(
+            "R3 custom-import migration: redirected forven.scanner -> forven.strategies.indicators "
+            "in %d custom strategy file(s): %s%s",
+            len(rewritten), ", ".join(rewritten[:25]), " …" if len(rewritten) > 25 else "",
+        )
+
+
 # Append new migrations to the END of this list. Never reorder, rename, or
 # delete existing entries — doing so will cause migrations to re-run on
 # databases that already applied them under the old name, or to silently
@@ -419,6 +583,18 @@ MIGRATIONS: list[Migration] = [
     Migration(
         name="2026_06_user_strategy_library",
         up=_m_2026_06_user_strategy_library,
+    ),
+    Migration(
+        name="2026_06_paper_book_go_live_stamp",
+        up=_m_2026_06_paper_book_go_live_stamp,
+    ),
+    Migration(
+        name="2026_06_strategy_sandbox_only",
+        up=_m_2026_06_strategy_sandbox_only,
+    ),
+    Migration(
+        name="2026_06_rewrite_custom_scanner_imports",
+        up=_m_2026_06_rewrite_custom_scanner_imports,
     ),
 ]
 

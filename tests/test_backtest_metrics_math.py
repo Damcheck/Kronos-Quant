@@ -55,6 +55,21 @@ def test_compute_basic_metrics_single_trade_does_not_require_mean_return():
     assert float(metrics["sortino"]) == 0.0
 
 
+def test_sortino_uses_target_semideviation_about_zero():
+    """Downside deviation must be the RMS of the NEGATIVE returns about MAR=0, not
+    np.std (which mean-centers the downside list and overstates Sortino)."""
+    trades = [
+        {"pnl_pct": 0.10, "bars_held": 3},
+        {"pnl_pct": -0.20, "bars_held": 4},
+        {"pnl_pct": 0.30, "bars_held": 5},
+    ]
+    # mean = 0.0666667; downside RMS = sqrt(0.20**2 / 3) = 0.1154701; with total_bars ==
+    # bars_per_year, trades_per_year = 3 → sortino = (0.0666667/0.1154701)*sqrt(3) = 1.0
+    # exactly. The old mean-centered np.std denominator gave ~1.2247 (overstated).
+    m = _compute_basic_metrics(trades, total_bars=8760, timeframe="1h")
+    assert float(m["sortino"]) == pytest.approx(1.0, abs=1e-3)
+
+
 def test_sharpe_annualization_uses_timeframe():
     """With the same bar count, daily timeframe should yield lower Sharpe than hourly.
 

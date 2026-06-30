@@ -254,6 +254,33 @@ def _kill_executor_processes(executor):
         pass
 
 
+def _resolve_worker_strategy_class(original_strategy_type: str, family_strategy_type: str):
+    """Resolve a strategy class inside an isolated worker, importing the MINIMUM
+    registry slice needed.
+
+    Full ``discover()`` imports AND AST-security-scans every active custom strategy
+    module — measured at ~12s on EVERY spawn — which the optimizer grid and
+    parameter_jitter pay dozens-to-hundreds of times per run, dwarfing the actual
+    simulation. A BUILT-IN strategy (a vectorized/checker type) is never backed by a
+    custom module, so builtin-only discovery (~0.07s) resolves it identically. Custom
+    or unrecognized types fall back to full discovery, so their resolution is
+    byte-identical to before — throughput is never traded for correctness.
+    """
+    norm = str(original_strategy_type or "").strip().lower()
+    if norm in _VECTORIZABLE_TYPES or norm in SIGNAL_CHECKERS:
+        # Built-in original: builtin discovery alone resolves the class (or leaves it
+        # None for pure checker/vectorized types, which run via the checker path).
+        try:
+            from forven.strategies.registry import _TYPE_MAP, discover
+
+            discover(include_custom=False)
+            return _TYPE_MAP.get(norm)
+        except (ImportError, AttributeError, SyntaxError):
+            return None
+    # Custom or unrecognized type: full discovery (today's exact resolution).
+    return _resolve_strategy_class(original_strategy_type)
+
+
 def _isolated_backtest_worker(
     strategy_id: str,
     original_strategy_type: str,
@@ -277,23 +304,28 @@ def _isolated_backtest_worker(
     re-discovers strategy classes inside the child process so that
     module-level state is cleanly initialised.
     """
-    try:
-        from forven.strategies.registry import discover
-        discover()
-    except (ImportError, AttributeError, SyntaxError):
-        pass
-
     strategy_obj = None
     checker = SIGNAL_CHECKERS.get(family_strategy_type)
-    cls = _resolve_strategy_class(original_strategy_type)
-    if cls:
-        try:
-            strategy_obj = cls(strategy_id, params)
-        except Exception as e:
-            return {"error": f"Failed to instantiate strategy: {e}"}
+    from forven.strategies.sandbox_proxy import is_sandbox_only_type, SandboxOnlyStrategy
 
-    if strategy_obj is None and not checker and family_strategy_type not in _VECTORIZABLE_TYPES:
-        return {"error": f"Unknown strategy type: {original_strategy_type}"}
+    if is_sandbox_only_type(original_strategy_type):
+        # Untrusted-origin (imported) strategy: NEVER resolve/instantiate its real
+        # class in this process. Build the non-executing proxy — run_strategy_execution
+        # force-routes its signal generation to the locked-down sandbox worker.
+        strategy_obj = SandboxOnlyStrategy(strategy_id, params, runtime_type=original_strategy_type)
+        checker = None
+    else:
+        # Load only the registry slice this backtest needs: built-in strategies skip the
+        # ~12s custom-module import+AST-scan that full discover() pays on every spawn.
+        cls = _resolve_worker_strategy_class(original_strategy_type, family_strategy_type)
+        if cls:
+            try:
+                strategy_obj = cls(strategy_id, params)
+            except Exception as e:
+                return {"error": f"Failed to instantiate strategy: {e}"}
+
+        if strategy_obj is None and not checker and family_strategy_type not in _VECTORIZABLE_TYPES:
+            return {"error": f"Unknown strategy type: {original_strategy_type}"}
 
     split_idx = int(len(df) * 0.70)
     is_df = df.iloc[:split_idx]
@@ -380,15 +412,11 @@ def _isolated_walk_forward_worker(
     strategy's execution profile — stops/sizing — instead of legacy full-notional
     sizing. None preserves the byte-identical legacy path.
     """
-    try:
-        from forven.strategies.registry import discover
-        discover()
-    except (ImportError, AttributeError, SyntaxError):
-        pass
-
     strategy_obj = None
     checker = SIGNAL_CHECKERS.get(family_strategy_type)
-    cls = _resolve_strategy_class(original_strategy_type)
+    # Load only the registry slice this walk-forward needs: built-in strategies skip
+    # the ~12s custom-module import+AST-scan that full discover() pays on every spawn.
+    cls = _resolve_worker_strategy_class(original_strategy_type, family_strategy_type)
     if cls:
         try:
             strategy_obj = cls(strategy_id, params)
@@ -480,6 +508,16 @@ def _isolated_walk_forward_worker(
             "out_of_sample": {"trades": len(oos_trades), **oos_metrics},
         })
 
+    if not splits:
+        # Every fold was skipped (each in-sample slice fell below warmup+min-eval, or
+        # OOS was too short). Surface this as an explicit error so callers distinguish
+        # "window too small to evaluate" from a genuine robustness FAIL (which otherwise
+        # rejects every optimization candidate at the acceptance precheck).
+        return {"error": (
+            "walk-forward produced no evaluable folds: the window is too small for the "
+            "fold count (each fold needs >= warmup+min-eval in-sample bars). Use a longer "
+            "window or fewer folds."
+        )}
     return {"splits": splits, "all_oos_trades": all_oos_trades}
 
 
@@ -836,6 +874,24 @@ def get_strategy_supported_trade_modes(
     ).strip().lower()
     if side_hint == "short":
         supported.add("short_only")
+
+    # Untrusted-origin (sandbox-only / imported) strategies are never imported into the
+    # trusted parent, so this process can't read the real class's declared
+    # ``supported_trade_modes``. When called with only a type+params (no proxy
+    # ``strategy_obj``), honor the strategy's own validated ``trade_mode`` so an imported
+    # dual-side strategy isn't rejected as "does not support trade_mode='both'". Scoped to
+    # sandbox-only types so the strict guard is unchanged for first-party strategies we
+    # CAN introspect.
+    is_sandbox_only = bool(getattr(strategy_obj, "sandbox_only", False))
+    if not is_sandbox_only and strategy_type:
+        try:
+            from forven.strategies.sandbox_proxy import is_sandbox_only_type
+
+            is_sandbox_only = is_sandbox_only_type(strategy_type)
+        except Exception:
+            is_sandbox_only = False
+    if is_sandbox_only:
+        supported.add(_default_trade_mode_from_params(params))
 
     return supported
 
@@ -1539,14 +1595,28 @@ def _sync_strategy_metrics_and_promote_if_eligible(
                 # Still allow promotion check with existing metrics
                 metrics = existing_metrics
             else:
-                # --- Best-of rule ---
-                # Only update if new backtest is better (higher Sharpe) or if no existing metrics.
+                # --- Best-of rule (degeneracy-aware) ---
+                # Only keep the existing metrics over the new run if existing is GENUINELY
+                # better (higher Sharpe) AND not a degenerate slice. The raw best-of-Sharpe
+                # rule let a contaminated low-trade / zero-in-sample-trade blob (lucky high
+                # Sharpe) permanently lock out every honest rerun (lower Sharpe), so a
+                # healthy strategy stayed archived on every revive/retry. Now: a degenerate
+                # new run never overwrites honest stored metrics, and an honest rerun always
+                # unsticks a degenerate stored blob regardless of Sharpe.
+                from forven.policy import is_degenerate_backtest_metrics
                 existing_sharpe = float(existing_metrics.get("sharpe") or existing_metrics.get("sharpe_ratio") or 0)
                 new_sharpe = float(metrics.get("sharpe") or metrics.get("sharpe_ratio") or 0)
-                if existing_sharpe > 0 and new_sharpe < existing_sharpe:
+                existing_degenerate = is_degenerate_backtest_metrics(existing_metrics)
+                new_degenerate = is_degenerate_backtest_metrics(metrics)
+                keep_existing = (
+                    (new_degenerate and not existing_degenerate)
+                    or (existing_sharpe > 0 and new_sharpe < existing_sharpe and not existing_degenerate)
+                )
+                if keep_existing:
                     log.info(
-                        "Keeping better existing metrics for %s: existing Sharpe %.2f > new %.2f",
-                        strategy_id, existing_sharpe, new_sharpe,
+                        "Keeping existing metrics for %s: existing Sharpe %.2f vs new %.2f "
+                        "(existing_degenerate=%s, new_degenerate=%s)",
+                        strategy_id, existing_sharpe, new_sharpe, existing_degenerate, new_degenerate,
                     )
                     # Keep existing but still store the result in backtest_results (already done upstream)
                     metrics = existing_metrics
@@ -2109,35 +2179,53 @@ def load_multi_exchange_candles(
 
 
 
-def _enrich_with_market_data(df: pd.DataFrame, asset: str) -> pd.DataFrame:
-    """Join supplementary market data (funding rate, OI) into backtest DataFrame.
+def _resolve_market_data_series(normalized_asset: str, start_ms: int, end_ms: int):
+    """(funding, oi) as (timestamp_ms, value) lists from the configured market-data
+    source. Binance (default) keeps the backtest AND paper on ONE venue (no HL);
+    HyperLiquid is the opt-out (with its self-healing backfill)."""
+    from forven.market_data import resolve_market_data_source
 
-    Aligns market_data_history records to candle timestamps using
-    nearest-backward merge (each candle gets the most recent data point
-    at or before its timestamp).
+    if resolve_market_data_source() == "binance":
+        from forven.market_data import fetch_binance_funding_series, fetch_binance_oi_series
+
+        return (
+            fetch_binance_funding_series(normalized_asset, start_ms, end_ms),
+            fetch_binance_oi_series(normalized_asset, start_ms, end_ms),
+        )
+
+    from forven.market_data_collector import (
+        ensure_funding_history,
+        get_funding_rate_series,
+        get_open_interest_series,
+    )
+
+    # Self-healing backfill for the HL store so a fresh install converges.
+    try:
+        heal = ensure_funding_history(normalized_asset, start_ms)
+        if heal.get("action") == "backfilled":
+            log.info(
+                "Self-healed funding history for %s: %s records (oldest %s)",
+                normalized_asset, heal.get("stored"), heal.get("oldest_record"),
+            )
+    except Exception as exc:
+        log.debug("Funding self-heal skipped for %s: %s", normalized_asset, exc)
+
+    return (
+        get_funding_rate_series(normalized_asset, start_ms=start_ms, end_ms=end_ms),
+        get_open_interest_series(normalized_asset, start_ms=start_ms, end_ms=end_ms),
+    )
+
+
+def _enrich_with_market_data(df: pd.DataFrame, asset: str) -> pd.DataFrame:
+    """Join supplementary market data (funding rate, OI) into the candle DataFrame,
+    from the configured source (Binance by default — same venue as the candles, so
+    backtest and paper agree). Aligns records to candle timestamps via a
+    nearest-backward merge (each candle gets the most recent point at/before it).
     """
     if df is None or df.empty:
         return df
     try:
-        from forven.market_data_collector import get_funding_rate_series, get_open_interest_series
-
         normalized_asset = str(asset or "").strip().upper().replace("/USDT", "").replace("/USD", "")
-
-        # Self-healing: if stored funding history doesn't reach back to this
-        # window, backfill it from the exchange before merging. A fresh install
-        # (or factory reset) converges to full coverage on first use instead of
-        # silently running funding-blind until someone runs a CLI backfill.
-        try:
-            from forven.market_data_collector import ensure_funding_history
-
-            heal = ensure_funding_history(normalized_asset, int(df.index[0].timestamp() * 1000))
-            if heal.get("action") == "backfilled":
-                log.info(
-                    "Self-healed funding history for %s: %s records (oldest %s)",
-                    normalized_asset, heal.get("stored"), heal.get("oldest_record"),
-                )
-        except Exception as exc:
-            log.debug("Funding self-heal skipped for %s: %s", normalized_asset, exc)
 
         # pandas>=2 carries a datetime resolution (ns/us/ms) on each index, and
         # merge_asof REQUIRES both keys to share the exact same resolution. The
@@ -2151,8 +2239,10 @@ def _enrich_with_market_data(df: pd.DataFrame, asset: str) -> pd.DataFrame:
         start_ms = int(df.index[0].timestamp() * 1000)
         end_ms = int(df.index[-1].timestamp() * 1000)
 
+        # Source-aware funding + OI (Binance by default — no HyperLiquid).
+        funding_data, oi_data = _resolve_market_data_series(normalized_asset, start_ms, end_ms)
+
         # Funding rates
-        funding_data = get_funding_rate_series(normalized_asset, start_ms=start_ms, end_ms=end_ms)
         if funding_data:
             fr_df = pd.DataFrame(funding_data, columns=["timestamp_ms", "funding_rate"])
             fr_df["t"] = pd.to_datetime(fr_df["timestamp_ms"], unit="ms", utc=True)
@@ -2167,7 +2257,6 @@ def _enrich_with_market_data(df: pd.DataFrame, asset: str) -> pd.DataFrame:
             log.debug("Enriched %s with %d funding rate records", asset, len(fr_df))
 
         # Open interest
-        oi_data = get_open_interest_series(normalized_asset, start_ms=start_ms, end_ms=end_ms)
         if oi_data:
             oi_df = pd.DataFrame(oi_data, columns=["timestamp_ms", "open_interest"])
             oi_df["t"] = pd.to_datetime(oi_df["timestamp_ms"], unit="ms", utc=True)
@@ -6261,6 +6350,15 @@ def _apply_funding_to_trades(
     for t in trades:
         entry_bar = max(int(t.get("entry_bar", 0)), 0)
         bars_held = max(int(t.get("bars_held", 0)), 0)
+        if bars_held <= 0:
+            # Zero-bar trade (e.g. a final-bar entry force-closed at the same bar) holds
+            # no funding interval — it is trivially complete, not "funding-incomplete".
+            # Without this a single such trade would set funding_complete=False and
+            # spuriously block the strategy's promotion to live.
+            t["funding_cost_pct"] = 0.0
+            t["funding_applied"] = True
+            t["funding_complete"] = True
+            continue
         exit_bar = min(entry_bar + bars_held, n)
         window = fr.iloc[entry_bar:exit_bar]
         complete = bool(len(window)) and not bool(window.isna().any())
@@ -6268,8 +6366,10 @@ def _apply_funding_to_trades(
         sign = _trade_direction_sign(str(t.get("direction", "long")))
         # funding_pnl < 0 for a long when funding_rate > 0 (long pays the funding).
         # Funding accrues on the actual notional held, so it scales with the
-        # position's size_fraction (1.0 for the legacy full-notional path).
-        size_fraction = float(t.get("size_fraction", 1.0) or 1.0)
+        # position's size_fraction (1.0 for the legacy full-notional path). Read the
+        # FULL-precision size_fraction the price-PnL leg used (size_fraction_raw),
+        # falling back to the 4dp display value for non-kernel trade producers.
+        size_fraction = float(t.get("size_fraction_raw", t.get("size_fraction", 1.0)) or 1.0)
         funding_pnl = -sign * funding_sum * hours * lev * size_fraction
         t["funding_cost_pct"] = round(float(funding_pnl), 6)
         t["funding_applied"] = True
@@ -6281,6 +6381,7 @@ def _apply_funding_to_trades(
 
 
 from forven.strategies import sizing as _sizing
+from forven.strategies import execution_kernel as _kernel
 
 
 def _clamp01(value: float) -> float:
@@ -6382,12 +6483,19 @@ def _run_directional_signal_series(
     round_trip_drag = 2.0 * (max(float(fee_bps or 0.0), 0.0) + max(float(slippage_bps or 0.0), 0.0)) / 10000.0 * max(float(leverage), 0.0)
 
     ec = _normalize_execution_controls(execution_controls)
-    if ec is not None:
-        return _run_directional_signal_series_with_controls(
-            df, signals, warmup, leverage, regimes=regimes,
-            round_trip_drag=round_trip_drag, trade_mode=trade_mode,
-            allowed_modes=allowed_modes, ec=ec, initial_capital=initial_capital,
-        )
+    if ec is None:
+        # Parity overhaul (decision: unify + re-score): a strategy with NO execution
+        # profile is sized at the default 1% risk (fraction mode) via the SAME shared
+        # kernel the live/paper scanner uses — NOT the legacy full-notional path below.
+        # This is what makes paper reproduce the backtest for profile-less strategies
+        # (the common case for the autonomous pipeline). The legacy loop beneath is now
+        # dead code, retained temporarily and removed in cleanup.
+        ec = _sizing.default_controls()
+    return _run_controls_via_kernel(
+        df, signals, warmup, leverage, regimes=regimes,
+        round_trip_drag=round_trip_drag, trade_mode=trade_mode,
+        allowed_modes=allowed_modes, ec=ec, initial_capital=initial_capital,
+    )
 
     # Signals are derived from a bar's own close, which is only known once that
     # bar has finished. Acting on signal[idx] therefore requires filling at the
@@ -6533,6 +6641,9 @@ def _run_directional_signal_series_with_controls(
             "trade_mode": trade_mode,
             "position_model": "hedged" if trade_mode == "both" else "single_side",
             "size_fraction": round(size_fraction, 4),
+            # Full-precision fraction (the display field above is rounded to 4dp); the
+            # post-hoc funding pass reads this so its leg is scaled identically to price PnL.
+            "size_fraction_raw": size_fraction,
             "exit_reason": exit_reason,
         }
         if open_at_end:
@@ -6562,6 +6673,15 @@ def _run_directional_signal_series_with_controls(
 
             if ec["time_stop_bars"] and (idx - int(at["entry_bar"])) >= ec["time_stop_bars"]:
                 exit_price, exit_reason = fill_price, "time_stop"
+
+            # Signal-driven exit (decided at the prior bar's close → a market-on-open
+            # order that fills at THIS bar's open). Because the open is the first tick of
+            # the bar, it must pre-empt any intrabar stop/take-profit that would only
+            # trigger later within the same bar — evaluated here, before the stop/TP.
+            if exit_price is None:
+                exit_series = signals.long_exits if direction == "long" else signals.short_exits
+                if bool(exit_series.iloc[signal_idx]):
+                    exit_price, exit_reason = fill_price, "signal"
 
             # Combine fixed stop and trailing stop into the tighter effective level.
             # The trailing level uses the peak through the PRIOR bar (at["extreme"]);
@@ -6602,22 +6722,16 @@ def _run_directional_signal_series_with_controls(
                 # Still open — ratchet the trailing peak with THIS bar for the next bar.
                 at["extreme"] = max(at["extreme"], bar_high) if direction == "long" else min(at["extreme"], bar_low)
 
-        # (2) Signal-driven exits (fill at this bar's open).
-        for direction in allowed_modes:
-            exit_series = signals.long_exits if direction == "long" else signals.short_exits
-            at = active_trades.get(direction)
-            if at is None or not bool(exit_series.iloc[signal_idx]):
-                continue
-            _finalize(at, direction, fill_price, idx, current_time, "signal")
-            active_trades[direction] = None
-
-        # (3) Signal-driven entries (fill at this bar's open).
+        # (2) Signal-driven entries (fill at this bar's open).
         for direction in allowed_modes:
             entry_series = signals.long_entries if direction == "long" else signals.short_entries
             if active_trades.get(direction) is not None or not bool(entry_series.iloc[signal_idx]):
                 continue
             sign = _trade_direction_sign(direction)
-            stop_dist_pct = _entry_stop_dist_pct(idx, fill_price)
+            # Size/stop off the ATR through the LAST CLOSED bar (signal_idx = idx-1).
+            # Using atr_vals[idx] would read the entry bar's own (not-yet-realized)
+            # high/low/close at the open where the fill happens — a forward-looking read.
+            stop_dist_pct = _entry_stop_dist_pct(signal_idx, fill_price)
             stop_price = None
             if stop_dist_pct is not None and (ec["stop_loss_pct"] is not None or ec["sizing_mode"] == "atr"):
                 stop_price = fill_price * (1.0 - sign * stop_dist_pct)
@@ -6646,6 +6760,535 @@ def _run_directional_signal_series_with_controls(
         _finalize(at, direction, final_close, final_idx, final_time, "signal", open_at_end=True)
 
     return trades
+
+
+def _run_controls_via_kernel(
+    df: "pd.DataFrame",
+    signals: "DirectionalSignals",
+    warmup: int,
+    leverage: float,
+    *,
+    regimes: "pd.Series | None",
+    round_trip_drag: float,
+    trade_mode: str,
+    allowed_modes: tuple[str, ...],
+    ec: dict,
+    initial_capital: float,
+) -> list[dict]:
+    """Backtest execution via the shared kernel: run :func:`execution_kernel.simulate`
+    over the full history, then force-close any still-open position at the final close
+    (the backtest's accounting convention). Byte-identical to
+    :func:`_run_directional_signal_series_with_controls`; this is the path the scanner
+    also drives (without the force-close), so paper mirrors the backtest by construction.
+    """
+    res = _kernel.simulate(
+        df, signals, warmup, leverage,
+        regimes=regimes, round_trip_drag=round_trip_drag, trade_mode=trade_mode,
+        allowed_modes=allowed_modes, ec=ec, initial_capital=initial_capital,
+    )
+    return _kernel.force_close(res, df, leverage=leverage, round_trip_drag=round_trip_drag, trade_mode=trade_mode)
+
+
+def _allowed_modes_for(trade_mode: str) -> tuple[str, ...]:
+    if trade_mode == "both":
+        return ("long", "short")
+    if trade_mode == "short_only":
+        return ("short",)
+    return ("long",)
+
+
+def _per_bar_kernel_adapter_enabled() -> bool:
+    """Gate for the per-bar→kernel adapter (default ON). When on, a strategy that
+    exposes only a per-bar generate_signal (no vectorized generate_signals) is run on
+    the SHARED kernel via signal-walk adaptation — full backtest parity — instead of
+    the divergent legacy/full-notional slow path. Operator can disable to restore the
+    legacy slow path.
+
+    Reads the cheap scanner KV flag (one kv_get), NOT get_settings() — which rebuilds
+    preset bundles + loads regime/notification/secrets on every call — because this
+    runs on the per-scan hot path and the single backend worker can't afford it.
+    """
+    try:
+        from forven.scanner import _scanner_bool_setting
+        return _scanner_bool_setting("per_bar_kernel_adapter", True)
+    except Exception:
+        return True
+
+
+from collections import OrderedDict as _OrderedDict  # noqa: E402
+
+_PER_BAR_SIGNALS_CACHE: "_OrderedDict[tuple, DirectionalSignals]" = _OrderedDict()
+_PER_BAR_SIGNALS_CACHE_MAX = 256
+
+
+def _per_bar_params_signature(strategy_obj) -> str:
+    """Cheap stable signature of a strategy's params, folded into the adapter cache key
+    so a param change can't return stale signals (and a same-strategy_id param sweep
+    can't collide)."""
+    try:
+        params = getattr(strategy_obj, "params", {}) or {}
+        return repr(sorted((str(k), str(v)) for k, v in params.items()))[:300]
+    except Exception:
+        return ""
+
+
+def _per_bar_checker(obj):
+    if obj is None:
+        return None
+    return getattr(obj, "check_signal", None) or getattr(obj, "generate_signal", None)
+
+
+def _per_bar_sig_key(sig):
+    """Normalize a per-bar signal to a comparable (entry, exit, direction) tuple."""
+    if sig is None:
+        return None
+    if not isinstance(sig, dict):
+        to_dict = getattr(sig, "to_dict", None)
+        if not callable(to_dict):
+            return None
+        try:
+            sig = to_dict()
+        except Exception:
+            return "ERR"
+    return (bool(sig.get("entry_signal")), bool(sig.get("exit_signal")), str(sig.get("direction") or "").lower())
+
+
+def _clone_strategy(strategy_obj):
+    """A FRESH instance of the same strategy/params (for purity probing), or None."""
+    try:
+        return type(strategy_obj)(
+            getattr(strategy_obj, "strategy_id", "clone"),
+            dict(getattr(strategy_obj, "params", {}) or {}),
+        )
+    except Exception:
+        return None
+
+
+_PER_BAR_PURITY_CACHE: "_OrderedDict[tuple, bool]" = _OrderedDict()
+_PER_BAR_PURITY_CACHE_MAX = 512
+# Strategy ids already alerted as impure — so the operator notice (and warning log)
+# fires ONCE per strategy, not on every scan.
+_PER_BAR_IMPURE_LOGGED: set = set()
+
+
+def _probe_per_bar_pure(strategy_obj, df: "pd.DataFrame", warmup: int) -> bool:
+    """True when a strategy's per-bar generate_signal is PURE enough for the kernel —
+    i.e. the signal at a bar is a deterministic function of the trailing window only.
+
+    Catches the hazards that make a per-bar strategy SILENTLY WRONG on the kernel
+    (and across scan-reused instances / trailing-window replay):
+      (1) non-determinism — randomness, or per-call self-mutation that changes the
+          output: detected by evaluating the SAME window twice and requiring an
+          identical signal. NOTE this does NOT reliably catch wall-clock / external
+          reads that are STABLE across two back-to-back calls (e.g. a now() time-of-day
+          gate read in the same microsecond) — those need an AST/source check (a
+          follow-up); the legacy path is equally exposed to them.
+      (2) cross-bar state — output depends on bars seen earlier in the walk (state
+          accumulated in self): detected (best-effort, needs a clone) by checking a
+          sequential walk reproduces the cold per-bar value at sampled bars.
+
+    Determinism (1) runs on a CLONE so the probe never pollutes the instance the real
+    walk uses, and tolerates a bar that raises (skips it, like the walk's warmup-band
+    tolerance) — but requires at least one cleanly-evaluated bar to certify.
+    """
+    n = len(df)
+    lo = max(int(warmup), 0)
+    if n - lo < 3:
+        return True  # too few tradeable bars to probe — don't block (warmup region)
+    window = max(int(warmup) * 3, 1000)
+    span = n - 1 - lo
+    bars = sorted({lo + (span * j) // 5 for j in range(6)})
+
+    # (1) determinism / per-call statelessness (on a clone; warmup-band errors skipped)
+    det_obj = _clone_strategy(strategy_obj) or strategy_obj
+    chk = _per_bar_checker(det_obj)
+    if chk is None:
+        return False
+    clean = 0
+    for k in bars:
+        w = df.iloc[max(0, k + 1 - window): k + 1]
+        try:
+            a = _per_bar_sig_key(chk(w))
+            b = _per_bar_sig_key(chk(w))
+        except Exception:
+            continue  # a single bar (often the warmup edge) raising is not a verdict
+        if a == "ERR" or b == "ERR":
+            continue
+        clean += 1
+        if a != b:
+            return False  # non-deterministic
+    if clean == 0:
+        return False  # could not evaluate any sampled bar cleanly → cannot certify
+    # (2) cross-bar state independence (best-effort)
+    cold_obj = _clone_strategy(strategy_obj)
+    walk_obj = _clone_strategy(strategy_obj)
+    cold_chk = _per_bar_checker(cold_obj)
+    walk_chk = _per_bar_checker(walk_obj)
+    if cold_chk is not None and walk_chk is not None:
+        try:
+            cold = {}
+            for k in bars:
+                w = df.iloc[max(0, k + 1 - window): k + 1]
+                cold[k] = _per_bar_sig_key(cold_chk(w))
+            walk_vals = {}
+            for i in range(lo, n):
+                w = df.iloc[max(0, i + 1 - window): i + 1]
+                v = _per_bar_sig_key(walk_chk(w))
+                if i in cold:
+                    walk_vals[i] = v
+            for k in bars:
+                if cold.get(k) != walk_vals.get(k):
+                    return False
+        except Exception:
+            pass  # best-effort — determinism (1) already certified the dominant hazard
+    return True
+
+
+def _certify_per_bar_pure(strategy_obj, df: "pd.DataFrame", warmup: int) -> bool:
+    """Cached purity verdict (probed once per strategy+params).
+
+    A frame too short to probe (warmup band / a tiny WFA fold) returns True
+    TRANSIENTLY — WITHOUT caching — so a later real probe on a full frame supersedes
+    it (otherwise an impure strategy first seen on a tiny frame would be certified
+    pure forever and run on the kernel exactly where the guard meant to refuse it).
+    """
+    n = len(df)
+    lo = max(int(warmup), 0)
+    if n - lo < 3:
+        return True  # too few tradeable bars to probe — allow transiently, do NOT cache
+    sid = str(getattr(strategy_obj, "strategy_id", "") or id(strategy_obj))
+    key = (sid, _per_bar_params_signature(strategy_obj))
+    cached = _PER_BAR_PURITY_CACHE.get(key)
+    if cached is not None:
+        _PER_BAR_PURITY_CACHE.move_to_end(key)
+        return cached
+    verdict = _probe_per_bar_pure(strategy_obj, df, warmup)
+    _PER_BAR_PURITY_CACHE[key] = verdict
+    if len(_PER_BAR_PURITY_CACHE) > _PER_BAR_PURITY_CACHE_MAX:
+        _PER_BAR_PURITY_CACHE.popitem(last=False)
+    return verdict
+
+
+def per_bar_strategy_is_impure(strategy_obj, df: "pd.DataFrame", warmup: int) -> bool:
+    """True iff ``strategy_obj`` exposes a per-bar checker AND the purity guard refuses it
+    (non-deterministic / stateful).
+
+    KCOPY-3: when the kernel declines a strategy it returns None — indistinguishable from
+    a genuinely non-vectorizable one, which the scanner is allowed to trade on the legacy
+    per-bar engine. An IMPURE strategy is untrustworthy on EVERY engine, so the scanner
+    uses this to fail closed (quarantine, never legacy-fall-back) instead. Cheap: the
+    verdict was already cached by ``_certify_per_bar_pure`` during the kernel run. Any
+    error (e.g. probing a sandbox-only proxy whose generate_signal refuses in-parent) is
+    treated as 'not impure' so the caller keeps its normal None handling."""
+    try:
+        if _per_bar_checker(strategy_obj) is None:
+            return False
+        return not _certify_per_bar_pure(strategy_obj, df, warmup)
+    except Exception:
+        return False
+
+
+def _signals_from_per_bar(
+    strategy_obj, df: "pd.DataFrame", *, warmup: int, trade_mode: str = "long_only",
+) -> "DirectionalSignals | None":
+    """ADAPTER: build vectorized directional signals by walking a strategy's per-bar
+    ``generate_signal`` / ``check_signal`` across the frame, so the kernel can run
+    strategies that expose NO vectorized ``generate_signals``.
+
+    Each bar's signal is computed from a bounded TRAILING window (``iloc[i+1-W:i+1]``),
+    so the value at bar i is independent of any later bars — the prefix-stability the
+    kernel + scanner-replay parity relies on (the window matches the legacy slow path's
+    ``max(warmup*3, 1000)``, so a given timestamp yields the identical signal whether
+    over the backtest's full frame or the scanner's trailing window).
+
+    Direction routing:
+      - single-side modes (long_only / short_only): an ``entry_signal`` opens in the
+        MODE's direction (the per-bar ``Signal.direction`` is NOT consulted — it defaults
+        to 'long' on every Signal, so it can't distinguish an explicit long from a
+        defaulted one, which is why a short_only strategy that omitted direction used to
+        silently stop trading).
+      - ``both`` mode: each entry/exit is routed to the long OR short side BY the
+        signal's ``direction`` (matching the legacy 'both' loop, where a default-'long'
+        Signal is a long). One walk produces a proper directional 4-series that the
+        kernel runs as a single both-mode pass — NOT a long+short straddle on every bar.
+
+    Returns None when the strategy has no usable per-bar method, is impure (the purity
+    guard refuses it), or the walk errors on the latest bar or on most bars (a broken
+    strategy must be SURFACED/flagged, not silently emit an all-False "no trades").
+    """
+    mode = str(trade_mode or "long_only").strip().lower()
+    route_by_signal = (mode == "both")
+    is_short_mode = (mode == "short_only")
+
+    checker = _per_bar_checker(strategy_obj)
+    if checker is None or df is None or len(df) == 0:
+        return None
+
+    sid = str(getattr(strategy_obj, "strategy_id", "") or id(strategy_obj))
+    # PURITY GUARD: only run a per-bar strategy on the kernel if its generate_signal is
+    # a deterministic, stateless function of the trailing window. An impure one (random
+    # / cross-bar state / per-call mutation) would run SILENTLY WRONG on the kernel and
+    # diverge under scanner trailing-window replay — refuse it rather than trust it.
+    if not _certify_per_bar_pure(strategy_obj, df, warmup):
+        if sid not in _PER_BAR_IMPURE_LOGGED:
+            _PER_BAR_IMPURE_LOGGED.add(sid)
+            log.warning(
+                "per-bar adapter %s: generate_signal is non-deterministic/stateful — refusing the "
+                "kernel; its results are untrustworthy on ANY engine, fix or archive it",
+                sid,
+            )
+            try:  # operator-visible, distinct from a merely-non-vectorized strategy
+                from forven.db import log_activity
+                log_activity(
+                    "warning", "scanner",
+                    f"NON-DETERMINISTIC: {sid} generate_signal is non-deterministic/stateful — its "
+                    "backtest/paper/live results are untrustworthy; fix or archive it",
+                )
+            except Exception:
+                pass
+        return None
+
+    n = len(df)
+    idx = df.index
+    cache_key = (sid, _per_bar_params_signature(strategy_obj), mode, n, int(warmup), str(idx[0]), str(idx[-1]))
+    cached = _PER_BAR_SIGNALS_CACHE.get(cache_key)
+    if cached is not None:
+        _PER_BAR_SIGNALS_CACHE.move_to_end(cache_key)
+        return cached
+
+    long_e = np.zeros(n, dtype=bool)
+    long_x = np.zeros(n, dtype=bool)
+    short_e = np.zeros(n, dtype=bool)
+    short_x = np.zeros(n, dtype=bool)
+    window = max(int(warmup) * 3, 1000)
+    start = max(int(warmup), 0)
+    evaluated = 0
+    errors = 0
+    first_error: object = None
+    last_bar_errored = False
+    for i in range(start, n):
+        evaluated += 1
+        is_last = (i == n - 1)
+        w = df.iloc[max(0, i + 1 - window): i + 1]
+        try:
+            sig = checker(w)
+        except Exception as exc:  # noqa: BLE001
+            errors += 1
+            first_error = first_error or exc
+            last_bar_errored = last_bar_errored or is_last
+            continue
+        if sig is None:
+            continue
+        if not isinstance(sig, dict):
+            to_dict = getattr(sig, "to_dict", None)
+            if not callable(to_dict):
+                continue
+            try:
+                sig = to_dict()
+            except Exception as exc:  # noqa: BLE001
+                errors += 1
+                first_error = first_error or exc
+                last_bar_errored = last_bar_errored or is_last
+                continue
+        if route_by_signal:
+            # 'both': route to the side the signal names (default 'long'), so a
+            # directional 'both' strategy opens long OR short per bar — never both.
+            d = str(sig.get("direction") or "long").strip().lower()
+            side_short = d in ("short", "sell", "s")
+        else:
+            side_short = is_short_mode  # single-side: force the mode's direction
+        if sig.get("entry_signal"):
+            if side_short:
+                short_e[i] = True
+            else:
+                long_e[i] = True
+        if sig.get("exit_signal"):
+            if side_short:
+                short_x[i] = True
+            else:
+                long_x[i] = True
+
+    if errors:
+        log.warning(
+            "per-bar adapter %s: generate_signal raised on %d/%d bars (first: %r)",
+            sid, errors, evaluated, first_error,
+        )
+        # A broken strategy must be SURFACED, not silently turned into an all-False
+        # "no trades". Fail closed (→ None → flagged non-parity / legacy crashes loudly)
+        # when the LATEST bar (the one the scanner acts on) raised, or when most bars
+        # raised. Tolerate the occasional bad bar.
+        if last_bar_errored or errors * 2 >= max(evaluated, 1):
+            return None
+
+    result = DirectionalSignals(
+        long_entries=pd.Series(long_e, index=idx),
+        long_exits=pd.Series(long_x, index=idx),
+        short_entries=pd.Series(short_e, index=idx),
+        short_exits=pd.Series(short_x, index=idx),
+    )
+    _PER_BAR_SIGNALS_CACHE[cache_key] = result
+    if len(_PER_BAR_SIGNALS_CACHE) > _PER_BAR_SIGNALS_CACHE_MAX:
+        _PER_BAR_SIGNALS_CACHE.popitem(last=False)
+    return result
+
+
+def _isolated_strategy_exec_enabled() -> bool:
+    """Phase 2: route UNTRUSTED (custom) strategy signal generation through the
+    out-of-process worker. OFF by default. Returns False inside a worker
+    (FORVEN_IN_STRATEGY_WORKER) so the worker runs in-process and never recursively
+    spawns. Honors FORVEN_ISOLATED_STRATEGY_EXEC, else the cheap isolated_strategy_exec
+    KV flag (read like the per-bar-adapter gate, NOT get_settings(), on the hot path)."""
+    if os.environ.get("FORVEN_IN_STRATEGY_WORKER"):
+        return False
+    override = os.environ.get("FORVEN_ISOLATED_STRATEGY_EXEC")
+    if override is not None and override.strip() != "":
+        return override.strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        from forven.scanner import _scanner_bool_setting
+        return _scanner_bool_setting("isolated_strategy_exec", False)
+    except Exception:
+        return False
+
+
+def _strategy_should_isolate(strategy_obj) -> bool:
+    """Isolate untrusted strategies — locally-authored custom (forven.strategies.custom.*)
+    AND untrusted-origin imported (sandbox_only) ones. Builtins/composites are
+    first-party and run in-process. Requires a vectorized generate_signals; the
+    per-bar generate_signal path is also isolated when reached."""
+    if strategy_obj is None or not hasattr(strategy_obj, "generate_signals"):
+        return False
+    # Untrusted-origin (imported) strategies are ALWAYS sandboxed — the proxy never
+    # holds the real class, so its signals MUST come from the worker.
+    if getattr(strategy_obj, "sandbox_only", False):
+        return True
+    module = str(getattr(type(strategy_obj), "__module__", "") or "")
+    return ".custom." in module or module.endswith(".strategies.custom") or ".imported." in module
+
+
+def _force_isolated_exec(strategy_obj) -> bool:
+    """A sandbox-only strategy MUST run out-of-process regardless of the global
+    isolation flag — its code is never available in the trusted parent, so the
+    in-process fallback would fail closed (the proxy raises)."""
+    return bool(getattr(strategy_obj, "sandbox_only", False))
+
+
+def run_strategy_execution(
+    df: "pd.DataFrame",
+    strategy_obj,
+    *,
+    params: dict,
+    warmup: int,
+    leverage: float,
+    fee_bps: float = 4.5,
+    slippage_bps: float = 2.0,
+    regime_gate: bool = True,
+    trade_mode: str = "long_only",
+    execution_controls: dict | None = None,
+    initial_capital: float = 10000.0,
+    strategy_type: str | None = None,
+) -> "_kernel.KernelResult | None":
+    """The ONE signals→regime-mask→kernel pipeline, shared by the backtest's
+    vectorized walk and the live/paper scanner so paper reproduces the backtest by
+    SHARING this code rather than re-implementing it.
+
+    Resolves the strategy's vectorized signals (``generate_signals``), applies the
+    regime gate, resolves the execution profile (or the default 1% fraction sizing),
+    and runs :func:`execution_kernel.simulate`. Returns the :class:`KernelResult`
+    (closed trades + still-open positions) WITHOUT force-closing — the backtest
+    force-closes at the final bar (via :func:`execution_kernel.force_close`), the
+    scanner leaves the position live.
+
+    Returns ``None`` when the strategy exposes no vectorized ``generate_signals`` (the
+    caller falls back to the per-bar slow path); the unified vectorizable builtins all
+    provide one, so this is the common path.
+    """
+    runtime_params = _strategy_runtime_params(params, strategy_obj)
+    default_direction = "short" if trade_mode == "short_only" else str(
+        runtime_params.get("direction") or runtime_params.get("position") or "long"
+    ).strip().lower()
+
+    if (_isolated_strategy_exec_enabled() or _force_isolated_exec(strategy_obj)) and _strategy_should_isolate(strategy_obj):
+        # Run the untrusted strategy's signal logic OUT-OF-PROCESS (secret-free env,
+        # network denied, confined FS). The worker normalizes with this exact
+        # trade_mode/default_direction, so re-normalizing below is idempotent and the
+        # result is byte-identical to the in-process path. Returns None when the
+        # strategy has no vectorized generate_signals (→ per-bar path). A sandbox-only
+        # strategy is forced here regardless of the global flag (its class is never
+        # in this process). runtime_params (from the params ARG) is used, so a proxy
+        # object with no real params attr still ships the right params.
+        from forven.sandbox.strategy_worker import compute_directional_signals_isolated
+        _iso_type = getattr(strategy_obj, "strategy_type", None) or strategy_type
+        vectorized = compute_directional_signals_isolated(
+            df, str(_iso_type), dict(getattr(strategy_obj, "params", None) or runtime_params),
+            trade_mode=trade_mode, default_direction=default_direction,
+        )
+    else:
+        vectorized = _resolve_strategy_vectorized_signals(strategy_obj, df)
+    if vectorized is None and _per_bar_kernel_adapter_enabled():
+        # ADAPTER: the strategy has no vectorized generate_signals, but the kernel can
+        # still run it by walking its per-bar generate_signal into signal series — so
+        # per-bar strategies get FULL backtest parity (kernel entry/exit/sizing/costs)
+        # in the backtest, paper, AND live, instead of the divergent legacy slow path.
+        # trade_mode is threaded so a short_only strategy shorts and a 'both' strategy
+        # routes each entry/exit by the signal's direction (one both-mode kernel run, no
+        # long+short straddle). Backtest reaches this BEFORE _run_signal_walk's 'both'
+        # split (run_strategy_execution is tried first), so backtest+scanner agree.
+        if (_isolated_strategy_exec_enabled() or _force_isolated_exec(strategy_obj)) and _strategy_should_isolate(strategy_obj):
+            # Walk the untrusted strategy's per-bar generate_signal OUT-OF-PROCESS too —
+            # byte-identical (same _signals_from_per_bar runs in the worker).
+            from forven.sandbox.strategy_worker import compute_per_bar_signals_isolated
+            _iso_type = getattr(strategy_obj, "strategy_type", None) or strategy_type
+            vectorized = compute_per_bar_signals_isolated(
+                df, str(_iso_type), dict(getattr(strategy_obj, "params", None) or runtime_params),
+                warmup=warmup, trade_mode=trade_mode,
+            )
+        else:
+            vectorized = _signals_from_per_bar(strategy_obj, df, warmup=warmup, trade_mode=trade_mode)
+    if vectorized is None:
+        return None  # no vectorized AND no per-bar signals → caller uses the slow path
+    if len(df) < warmup + 2:
+        return _kernel.KernelResult()  # signals exist but not enough bars → no trades
+
+    sid = getattr(strategy_obj, "strategy_id", None) or strategy_type or "custom"
+    source = f"strategy:{sid}"
+    signals = _normalize_directional_signal_payload(
+        vectorized, df.index, default_direction=default_direction,
+        trade_mode=trade_mode, label_prefix=source,
+    )
+
+    regime_series = _precompute_regimes(df)
+    entry_allowed, forced_exit, regime_series = _build_regime_gate_masks(
+        df,
+        strategy_type or getattr(strategy_obj, "strategy_type", None),
+        runtime_params,
+        strategy_obj=strategy_obj,
+        regimes=regime_series,
+        regime_gate=regime_gate,
+    )
+    signals.long_entries = signals.long_entries & entry_allowed
+    signals.short_entries = signals.short_entries & entry_allowed
+    signals.long_exits = signals.long_exits | forced_exit
+    signals.short_exits = signals.short_exits | forced_exit
+
+    # Mirror _run_signal_backtest's copy + re-normalize before the kernel.
+    d = df.copy()
+    signals = _normalize_directional_signal_payload(
+        signals, d.index, trade_mode=trade_mode, label_prefix=f"{source}.signals",
+    )
+
+    ec = _normalize_execution_controls(execution_controls)
+    if ec is None:
+        # Honor the strategy's persisted execution_profile when the caller passed no
+        # explicit controls, so the backtest/gauntlet size & stop EXACTLY like paper
+        # (the scanner resolves the same profile via execution_controls_from_params).
+        # Falls back to the default 1% fraction sizing when the strategy has none.
+        ec = _normalize_execution_controls(execution_controls_from_params(params)) or _sizing.default_controls()
+    drag = _kernel.round_trip_drag(fee_bps, slippage_bps, leverage)
+    return _kernel.simulate(
+        d, signals, warmup, leverage,
+        regimes=regime_series, round_trip_drag=drag, trade_mode=trade_mode,
+        allowed_modes=_allowed_modes_for(trade_mode), ec=ec, initial_capital=initial_capital,
+    )
 
 
 
@@ -7027,6 +7670,39 @@ def _run_remote_backtest(
 
 
 
+def resolve_default_leverage(settings: dict | None = None) -> float:
+    """The operator-configured fallback leverage used when a strategy declares none.
+
+    ONE source of truth so the gauntlet confirmation/robustness backtests, the
+    execution-profile selection, and the live/paper scanner all size leverage-sensitive
+    profiles (full/fixed/kelly) identically — the parity invariant. Defaults to 1x.
+    """
+    try:
+        if settings is None:
+            from forven.api_core import get_settings
+            settings = get_settings()
+        v = float((settings or {}).get("default_leverage", 1.0))
+        return v if (np.isfinite(v) and v > 0) else 1.0
+    except Exception:
+        return 1.0
+
+
+def resolve_leverage(params: dict | None, explicit: float | None = None, *, settings: dict | None = None) -> float:
+    """Resolve leverage for a NEW backtest/trade: an explicit arg wins, then the
+    strategy's declared ``params['leverage']``, then the operator ``default_leverage``."""
+    candidates = [explicit]
+    if isinstance(params, dict):
+        candidates.append(params.get("leverage"))
+    for cand in candidates:
+        try:
+            v = float(cand)
+            if np.isfinite(v) and v > 0:
+                return v
+        except (TypeError, ValueError):
+            continue
+    return resolve_default_leverage(settings)
+
+
 def backtest_strategy(
 
 
@@ -7148,13 +7824,11 @@ def backtest_strategy(
     # reflect the leverage the strategy actually declares (e.g. 1.0). Falls back to 3.0
     # only when the strategy declares nothing usable, preserving prior behavior there.
     if leverage is None:
-        _declared_lev = params.get("leverage")
-        try:
-            leverage = float(_declared_lev)
-        except (TypeError, ValueError):
-            leverage = 3.0
-        if not np.isfinite(leverage) or leverage <= 0:
-            leverage = 3.0
+        # Use the strategy's declared leverage, else the operator-configurable
+        # default_leverage (1x) — the SAME default paper/selection use, so the
+        # confirmation/robustness backtests size leverage-sensitive profiles the way
+        # the strategy will actually trade (parity). Was a hardcoded 3x.
+        leverage = resolve_leverage(params)
     if bars is not None and (not isinstance(bars, int) or isinstance(bars, bool) or bars <= 0):
         raise ValueError(f"backtest_strategy: bars must be a positive int or None, got {bars!r}")
     if not isinstance(leverage, (int, float)) or isinstance(leverage, bool) or not np.isfinite(leverage) or leverage <= 0:
@@ -7238,12 +7912,21 @@ def backtest_strategy(
 
     params = canonical.params if hasattr(canonical, "params") else params
     strategy_probe = None
-    strategy_cls = _resolve_strategy_class(original_strategy_type)
-    if strategy_cls is not None:
-        try:
-            strategy_probe = strategy_cls(strategy_id, params)
-        except Exception:
-            strategy_probe = None
+    from forven.strategies.sandbox_proxy import is_sandbox_only_type, SandboxOnlyStrategy
+
+    if is_sandbox_only_type(original_strategy_type):
+        # Untrusted-origin (imported) strategy: a non-executing proxy stands in for
+        # the probe (trade-mode + metadata resolution). Its real class is never
+        # imported in the trusted parent; execution routes to the sandbox worker.
+        strategy_probe = SandboxOnlyStrategy(strategy_id, params, runtime_type=original_strategy_type)
+        strategy_cls = SandboxOnlyStrategy  # non-None → skips the orphan guard
+    else:
+        strategy_cls = _resolve_strategy_class(original_strategy_type)
+        if strategy_cls is not None:
+            try:
+                strategy_probe = strategy_cls(strategy_id, params)
+            except Exception:
+                strategy_probe = None
 
     # Orphan guard: if there is no class AND no known param family, the backtest
     # would silently produce zero signals (the `_vectorized_signals` ladder only
@@ -7742,7 +8425,14 @@ def backtest_strategy(
     # Run the AI's signal generation in a separate OS process so that
     # infinite loops, memory explosions, or uncaught exceptions in
     # strategy code cannot freeze the main Forven backend.
-    if _should_use_process_isolation():
+    #
+    # Sandbox-only (imported) strategies take the INLINE path instead: their signal
+    # generation is already force-routed to the dedicated sandbox worker by
+    # run_strategy_execution, so the generic backtest-isolation spawn would be a
+    # redundant (and secret-bearing) second subprocess. Inline → single isolation.
+    from forven.strategies.sandbox_proxy import is_sandbox_only_type as _is_sandbox_only
+
+    if _should_use_process_isolation() and not _is_sandbox_only(original_strategy_type):
         n_bars = len(df)
         backtest_timeout = _resolve_backtest_timeout(n_bars)
         log.info("Submitting backtest %s to isolated worker (timeout=%ds, bars=%d)", strategy_id, backtest_timeout, n_bars)
@@ -7902,6 +8592,12 @@ def backtest_strategy(
 
 
         "sharpe_is_reliable": bool(oos_metrics.get("sharpe_is_reliable", False)),
+
+
+        # Surface Sortino top-level too (mirrors "sharpe") so the execution-profile
+        # selector's --objective sortino actually scores by Sortino instead of
+        # silently falling back to Sharpe.
+        "sortino": oos_metrics.get("sortino", 0.0),
 
 
         "max_drawdown_pct": oos_metrics.get("max_drawdown_pct", 0.0),
@@ -8660,7 +9356,7 @@ def compute_metrics(
     metrics = _compute_basic_metrics(trades, total_bars, timeframe=timeframe, symbol=symbol)
 
 
-    backtest_months = _compute_backtest_months(start_date, end_date, total_bars)
+    backtest_months = _compute_backtest_months(start_date, end_date, total_bars, timeframe=timeframe)
 
 
     total_return_ratio = float(metrics.get("total_return_pct", 0.0))
@@ -8942,10 +9638,12 @@ def _compute_basic_metrics(trades: list[dict], total_bars: int, *, timeframe: st
     if len(pnls) > 1:
 
 
-        downside = [min(0, p) for p in pnls]
-
-
-        downside_std = float(np.std(downside))
+        # Target semideviation about MAR=0: the root-mean-square of the NEGATIVE
+        # returns (divided by the TOTAL observation count). NOT np.std — that would
+        # subtract the mean of the downside list, shrinking the denominator and
+        # systematically OVERSTATING Sortino.
+        downside_sq = [min(0.0, float(p)) ** 2 for p in pnls]
+        downside_std = float(np.sqrt(np.sum(downside_sq) / len(pnls)))
 
 
         trades_per_year = len(pnls) / (total_bars / bars_per_year) if total_bars > 0 else len(pnls)
@@ -9080,10 +9778,17 @@ def _compute_backtest_months(
     total_bars: int,
 
 
+    timeframe: str = "1h",
+
+
 ) -> float:
 
 
-    """Estimate backtest span in months from timestamps, falling back to bar count."""
+    """Estimate backtest span in months from timestamps, falling back to bar count.
+
+    The bar-count fallback is TIMEFRAME-AWARE: a bar is not always one hour. Using a
+    hardcoded 24 bars/day corrupts CAGR/monthly-return on every non-1h timeframe.
+    """
 
 
     months_from_dates = 0.0
@@ -9128,7 +9833,9 @@ def _compute_backtest_months(
         return 0.0
 
 
-    return float(total_bars) / (24.0 * 30.4375)
+    # Timeframe-aware: 12 months == bars_per_year bars for THIS timeframe.
+    bars_per_year = float(_BARS_PER_YEAR.get(str(timeframe or "1h").strip().lower(), 8760)) or 8760.0
+    return float(total_bars) / bars_per_year * 12.0
 
 
 
@@ -9392,7 +10099,7 @@ def walk_forward(
     n_splits: int | None = None,
 
 
-    leverage: float = 3.0,
+    leverage: float | None = None,
 
 
     fee_bps: float | None = None,
@@ -9493,6 +10200,11 @@ def walk_forward(
         raise ValueError(f"walk_forward: in_sample_pct must be a float in (0, 1) or None, got {in_sample_pct!r}")
     if n_splits is not None and (not isinstance(n_splits, int) or isinstance(n_splits, bool) or n_splits <= 0):
         raise ValueError(f"walk_forward: n_splits must be a positive int or None, got {n_splits!r}")
+    # None → strategy's declared leverage, else the operator default_leverage (1x),
+    # so a caller that omits leverage (e.g. the robustness WFA leg) matches the
+    # confirmation backtest rather than a hardcoded 3x.
+    if leverage is None:
+        leverage = resolve_leverage(params)
     if not isinstance(leverage, (int, float)) or isinstance(leverage, bool) or not np.isfinite(leverage) or leverage <= 0:
         raise ValueError(f"walk_forward: leverage must be a positive finite number, got {leverage!r}")
 
@@ -9548,12 +10260,21 @@ def walk_forward(
 
 
     strategy_probe = None
-    strategy_cls = _resolve_strategy_class(original_strategy_type)
-    if strategy_cls is not None:
-        try:
-            strategy_probe = strategy_cls(strategy_id, params)
-        except Exception:
-            strategy_probe = None
+    from forven.strategies.sandbox_proxy import is_sandbox_only_type, SandboxOnlyStrategy
+
+    if is_sandbox_only_type(original_strategy_type):
+        # Untrusted-origin (imported) strategy: a non-executing proxy stands in for
+        # the probe (trade-mode + metadata resolution). Its real class is never
+        # imported in the trusted parent; execution routes to the sandbox worker.
+        strategy_probe = SandboxOnlyStrategy(strategy_id, params, runtime_type=original_strategy_type)
+        strategy_cls = SandboxOnlyStrategy  # non-None → skips the orphan guard
+    else:
+        strategy_cls = _resolve_strategy_class(original_strategy_type)
+        if strategy_cls is not None:
+            try:
+                strategy_probe = strategy_cls(strategy_id, params)
+            except Exception:
+                strategy_probe = None
 
     # Orphan guard (walk-forward path). See backtest_strategy() for rationale.
     if strategy_cls is None:
@@ -9872,19 +10593,31 @@ def walk_forward(
 
     if "error" in worker_result:
         log.warning("Isolated walk-forward failed for %s: %s", strategy_id, worker_result["error"])
-        return {"error": worker_result["error"]}
+        # Preserve the risk-control parity warning even when the fold evaluation could
+        # not run (e.g. window too small for the fold count) — it is an independent
+        # pre-flight validation, not contingent on the WFA succeeding.
+        err_result = {"error": worker_result["error"]}
+        if risk_parity_warning:
+            err_result["warning"] = risk_parity_warning
+        return err_result
 
     splits = worker_result["splits"]
     all_oos_trades = worker_result["all_oos_trades"]
 
 
 
-    # Aggregate out-of-sample metrics
+    # Aggregate out-of-sample metrics.
+    # Time base = the SUMMED out-of-sample bar span (not the full IS+OOS window):
+    # all_oos_trades only span the OOS slices (~1-in_sample_pct of each fold), so using
+    # the full window deflates trades_per_year and understates the pooled OOS Sharpe.
+    # No dates are passed because the pooled OOS folds are non-contiguous in calendar
+    # time; the timeframe-aware bar→months conversion is the honest span.
+    oos_total_bars = sum(int(s.get("oos_bars", 0) or 0) for s in splits) or resolved_total_bars
 
 
     agg_oos = compute_metrics(
         all_oos_trades,
-        resolved_total_bars,
+        oos_total_bars,
         timeframe=resolved_timeframe,
         trade_mode=resolved_trade_mode,
     )
@@ -10103,113 +10836,26 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
     # The slow walk previously applied no costs, making fallback strategies look free.
     round_trip_drag = 2.0 * (max(float(fee_bps or 0.0), 0.0) + max(float(slippage_bps or 0.0), 0.0)) / 10000.0 * max(float(leverage), 0.0)
 
-    # Optional fast path for dynamic/custom strategies that expose vectorized signals.
-
-
-    vectorized_signals = _resolve_strategy_vectorized_signals(strategy_obj, df)
-
-
-    if vectorized_signals is not None:
-
-
-        source = f"strategy:{getattr(strategy_obj, 'strategy_id', strategy_type or 'custom')}"
-
-
-        try:
-
-
-            default_direction = "short" if trade_mode == "short_only" else str(
-                runtime_params.get("direction") or runtime_params.get("position") or "long"
-            ).strip().lower()
-            signals = _normalize_directional_signal_payload(
-                vectorized_signals,
-                df.index,
-                default_direction=default_direction,
-                trade_mode=trade_mode,
-                label_prefix=source,
-            )
-
-
-            regime_series = _precompute_regimes(df)
-
-
-            entry_allowed, forced_exit, regime_series = _build_regime_gate_masks(
-
-
-                df,
-
-
-                strategy_type or getattr(strategy_obj, "strategy_type", None),
-
-
-                runtime_params,
-
-
-                strategy_obj=strategy_obj,
-
-
-                regimes=regime_series,
-
-
-                regime_gate=regime_gate,
-
-
-            )
-
-
-            signals.long_entries = signals.long_entries & entry_allowed
-            signals.short_entries = signals.short_entries & entry_allowed
-            signals.long_exits = signals.long_exits | forced_exit
-            signals.short_exits = signals.short_exits | forced_exit
-            return _run_signal_backtest(
-
-
-                df,
-
-
-                signals,
-
-
-                warmup,
-
-
-                leverage,
-
-
-                with_regimes=True,
-
-
-                regimes=regime_series,
-
-
-                signal_source=source,
-
-
-                fee_bps=fee_bps,
-
-
-                slippage_bps=slippage_bps,
-
-
-                trade_mode=trade_mode,
-
-                execution_controls=execution_controls,
-
-                initial_capital=initial_capital,
-
-            )
-
-
-        except RuntimeError as exc:
-
-
-            if _VECTORIZED_PATH_UNAVAILABLE not in str(exc):
-
-
-                raise
-
-
-
+    # Optional fast path: a strategy exposing vectorized generate_signals runs
+    # through the SAME shared kernel pipeline (run_strategy_execution) the live/paper
+    # scanner drives — so paper reproduces the backtest by construction.
+    try:
+        _kernel_result = run_strategy_execution(
+            df, strategy_obj, params=params, warmup=warmup, leverage=leverage,
+            fee_bps=fee_bps, slippage_bps=slippage_bps, regime_gate=regime_gate,
+            trade_mode=trade_mode, execution_controls=execution_controls,
+            initial_capital=initial_capital, strategy_type=strategy_type,
+        )
+    except RuntimeError as exc:
+        if _VECTORIZED_PATH_UNAVAILABLE not in str(exc):
+            raise
+        _kernel_result = None
+    if _kernel_result is not None:
+        return _kernel.force_close(
+            _kernel_result, df, leverage=leverage,
+            round_trip_drag=_kernel.round_trip_drag(fee_bps, slippage_bps, leverage),
+            trade_mode=trade_mode,
+        )
 
 
     # Fast path: vectorized signal generation for built-in strategy types.
@@ -10688,12 +11334,19 @@ def preview_strategy_signals(
 
     family_type = str(strategy_type or "").strip()
     strategy_obj = None
-    try:
-        cls = _resolve_strategy_class(family_type)
-        if cls:
-            strategy_obj = cls("preview", params)
-    except Exception:
-        strategy_obj = None
+    from forven.strategies.sandbox_proxy import is_sandbox_only_type, SandboxOnlyStrategy
+
+    if is_sandbox_only_type(family_type):
+        # Untrusted-origin: the proxy stands in; _run_signal_walk → run_strategy_execution
+        # force-routes signal generation to the sandbox worker (never in-process here).
+        strategy_obj = SandboxOnlyStrategy("preview", params, runtime_type=family_type)
+    else:
+        try:
+            cls = _resolve_strategy_class(family_type)
+            if cls:
+                strategy_obj = cls("preview", params)
+        except Exception:
+            strategy_obj = None
     checker = SIGNAL_CHECKERS.get(family_type)
     if strategy_obj is None and not checker and family_type not in _VECTORIZABLE_TYPES:
         warnings.append(f"Unknown strategy type '{family_type}' — cannot preview signals.")

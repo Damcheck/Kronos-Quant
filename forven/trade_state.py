@@ -1,6 +1,6 @@
 import json
 
-from forven.db import get_db
+from forven.db import get_db_immediate
 from forven.sim.clock import get_now
 
 
@@ -83,7 +83,10 @@ def mark_trade_pending_close_reconcile(
         return None
 
     resolved_requested_at = str(requested_at or get_now().isoformat())
-    with get_db() as conn:
+    # H-D4: BEGIN IMMEDIATE upfront so a concurrent close_trade_record (or a second
+    # pending-close request) can't read this row as OPEN between this read and the
+    # write below — it blocks until this transaction commits, then sees the result.
+    with get_db_immediate() as conn:
         row = conn.execute("SELECT * FROM trades WHERE id = ?", (normalized_trade_id,)).fetchone()
         if not row:
             return None
@@ -110,12 +113,28 @@ def mark_trade_pending_close_reconcile(
             signal_data["pending_close_reason"] = str(close_reason)
         if close_price_source is not None:
             signal_data["pending_close_price_source"] = str(close_price_source)
-        if signal_exit_price is not None:
-            signal_data["pending_close_requested_exit_price"] = float(signal_exit_price)
+        normalized_signal_exit = _coerce_optional_float(signal_exit_price)
+        if normalized_signal_exit is None:
+            # No explicit exit price was supplied (e.g. an exchange close that
+            # returned no immediate fill, only a requested/mid price). Derive a
+            # usable exit from the pending-close metadata so the eventual close
+            # finalizes WITH a price instead of an "unknown"/incomplete close —
+            # the reconcile-sweep bug where a real price sat in signal_data but
+            # was never used. Order: requested execution price → mid.
+            for _fallback_key in (
+                "pending_close_requested_execution_price",
+                "pending_close_mid_price",
+            ):
+                _fallback_exit = _coerce_optional_float(signal_data.get(_fallback_key))
+                if _fallback_exit is not None:
+                    normalized_signal_exit = _fallback_exit
+                    break
+
+        if normalized_signal_exit is not None:
+            signal_data["pending_close_requested_exit_price"] = float(normalized_signal_exit)
         else:
             signal_data.pop("pending_close_requested_exit_price", None)
 
-        normalized_signal_exit = _coerce_optional_float(signal_exit_price)
         persisted_signal_exit = (
             round(float(normalized_signal_exit), 8)
             if normalized_signal_exit is not None
@@ -157,13 +176,19 @@ def close_trade_record(
     extra_signal_data: dict | None = None,
     closed_at: str | None = None,
     only_if_open: bool = True,
+    pnl_override: dict | None = None,
 ) -> dict | None:
     normalized_trade_id = str(trade_id or "").strip()
     if not normalized_trade_id:
         return None
 
     resolved_closed_at = str(closed_at or get_now().isoformat())
-    with get_db() as conn:
+    # H-D4: BEGIN IMMEDIATE upfront, not just on the eventual UPDATE — a manual close
+    # racing a kernel/auto close on the same trade must not both pass the `status ==
+    # OPEN` check below: the second caller blocks here until the first commits, then
+    # its own read sees status='CLOSED' and takes the no-op branch instead of
+    # clobbering the first close's exit_price/pnl with a stale recomputation.
+    with get_db_immediate() as conn:
         row = conn.execute("SELECT * FROM trades WHERE id = ?", (normalized_trade_id,)).fetchone()
         if not row:
             return None
@@ -266,8 +291,30 @@ def close_trade_record(
             pnl_usd = None
             if entry_price is not None and entry_price > 0:
                 pnl_pct = ((resolved_exit_price - entry_price) / entry_price) * signed * leverage
-                pnl_usd_multiplier = 1.0 if resolved_price_source == "fill_exit_price" else leverage
-                pnl_usd = (resolved_exit_price - entry_price) * size * signed * pnl_usd_multiplier
+                # ``size`` is contract UNITS, which already embed leverage
+                # (position_units = equity*leverage*size_fraction/entry). The dollar
+                # P&L is therefore just price_move * units; the old code multiplied by
+                # leverage AGAIN on the non-fill branch — a leverage^2 double-count
+                # that overstated pnl_usd (and the promotion-gate metrics it feeds).
+                pnl_usd = (resolved_exit_price - entry_price) * size * signed
+
+        # DB-1 / SCANAPPLY-2: a caller (the kernel close) can supply the authoritative
+        # NET pnl so the close + net_pnl_pct + the equity-fraction parity flag are written
+        # in ONE transaction below. Previously the kernel wrote the close, then OVERRODE the
+        # pnl in a second transaction — a crash in the gap left a CLOSED row at the wrong
+        # (margin) scale with a NULL net and no flag. Folding it here makes the close atomic.
+        net_pnl_pct_val = None
+        if pnl_override and not incomplete:
+            _ov_pnl_pct = _coerce_optional_float(pnl_override.get("pnl_pct"))
+            _ov_pnl_usd = _coerce_optional_float(pnl_override.get("pnl_usd"))
+            _ov_net = _coerce_optional_float(pnl_override.get("net_pnl_pct"))
+            if _ov_pnl_pct is not None:
+                pnl_pct = _ov_pnl_pct
+            if _ov_pnl_usd is not None:
+                pnl_usd = _ov_pnl_usd
+            net_pnl_pct_val = _ov_net if _ov_net is not None else _ov_pnl_pct
+            if pnl_override.get("equity_fraction"):
+                signal_data["pnl_is_equity_fraction"] = True
 
         if close_reason is not None:
             signal_data["close_reason"] = str(close_reason)
@@ -277,30 +324,59 @@ def close_trade_record(
         elif close_price_source:
             signal_data["close_price_source"] = str(close_price_source)
 
-        conn.execute(
-            """
-            UPDATE trades
-            SET status='CLOSED',
-                closed_at=?,
-                exit_price=?,
-                signal_exit_price=?,
-                pnl=?,
-                pnl_pct=?,
-                pnl_usd=?,
-                signal_data=?
-            WHERE id=?
-            """,
-            (
-                resolved_closed_at,
-                round(float(resolved_exit_price), 8) if resolved_exit_price is not None else None,
-                round(float(persisted_signal_exit_price), 8) if persisted_signal_exit_price is not None else None,
-                round(float(pnl_usd), 4) if pnl_usd is not None else None,
-                round(float(pnl_pct), 6) if pnl_pct is not None else None,
-                round(float(pnl_usd), 4) if pnl_usd is not None else None,
-                json.dumps(signal_data),
-                normalized_trade_id,
-            ),
-        )
+        if net_pnl_pct_val is not None:
+            # Atomic close WITH the caller-supplied net equity-fraction (kernel path).
+            conn.execute(
+                """
+                UPDATE trades
+                SET status='CLOSED',
+                    closed_at=?,
+                    exit_price=?,
+                    signal_exit_price=?,
+                    pnl=?,
+                    pnl_pct=?,
+                    pnl_usd=?,
+                    net_pnl_pct=?,
+                    signal_data=?
+                WHERE id=?
+                """,
+                (
+                    resolved_closed_at,
+                    round(float(resolved_exit_price), 8) if resolved_exit_price is not None else None,
+                    round(float(persisted_signal_exit_price), 8) if persisted_signal_exit_price is not None else None,
+                    round(float(pnl_usd), 4) if pnl_usd is not None else None,
+                    round(float(pnl_pct), 8) if pnl_pct is not None else None,
+                    round(float(pnl_usd), 4) if pnl_usd is not None else None,
+                    round(float(net_pnl_pct_val), 8),
+                    json.dumps(signal_data),
+                    normalized_trade_id,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE trades
+                SET status='CLOSED',
+                    closed_at=?,
+                    exit_price=?,
+                    signal_exit_price=?,
+                    pnl=?,
+                    pnl_pct=?,
+                    pnl_usd=?,
+                    signal_data=?
+                WHERE id=?
+                """,
+                (
+                    resolved_closed_at,
+                    round(float(resolved_exit_price), 8) if resolved_exit_price is not None else None,
+                    round(float(persisted_signal_exit_price), 8) if persisted_signal_exit_price is not None else None,
+                    round(float(pnl_usd), 4) if pnl_usd is not None else None,
+                    round(float(pnl_pct), 6) if pnl_pct is not None else None,
+                    round(float(pnl_usd), 4) if pnl_usd is not None else None,
+                    json.dumps(signal_data),
+                    normalized_trade_id,
+                ),
+            )
 
     return {
         "updated": True,

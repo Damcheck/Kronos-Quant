@@ -247,6 +247,114 @@ def test_manage_positions_closes_on_take_profit_without_exit_signal(monkeypatch)
     assert any("take_profit" in action for action in actions)
 
 
+def test_manage_positions_closes_short_on_directional_exit_without_exit_signal(monkeypatch):
+    """Regression: strategies whose real exit lives ONLY in generate_signals
+    (scalar Signal.exit_signal hardcoded False) must still close on their
+    vectorized short_exit. Without this the legacy engine never closes them on
+    strategy logic, so a live short rides until a resting stop or the kill switch
+    while the backtest/kernel exits cleanly — the backtest-vs-live divergence."""
+    open_trade = {
+        "id": "t-dir-short",
+        "asset": "APT",
+        "direction": "short",
+        "entry_price": 0.60,
+        "size": 100.0,
+        "risk_pct": 0.01,
+        "leverage": 1.0,
+    }
+    closed = {}
+    executed = {}
+
+    monkeypatch.setattr(scanner_mod, "_get_open_trades", lambda _sid: [open_trade])
+    monkeypatch.setattr(
+        scanner_mod,
+        "_execute_direct",
+        lambda **kwargs: executed.update(kwargs) or {"status": "ok"},
+    )
+    monkeypatch.setattr(scanner_mod, "release", lambda _trade_id: None)
+    monkeypatch.setattr(scanner_mod, "log_activity", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        scanner_mod,
+        "_close_trade_db",
+        lambda trade_id, exit_price, pnl_pct, pnl_usd, close_reason=None: closed.update(
+            {"trade_id": trade_id, "exit_price": exit_price, "close_reason": close_reason}
+        ),
+    )
+    monkeypatch.setattr("forven.config.get_execution_mode", lambda: "paper")
+
+    actions = manage_positions(
+        "S-DIR-SHORT",
+        # No stop_loss_pct/take_profit_pct -> no risk exit; the close must come
+        # purely from the strategy's vectorized short_exit.
+        {"asset": "APT", "params": {"risk_pct": 0.01, "leverage": 1.0}},
+        {
+            "price": 0.59,
+            "entry_signal": False,
+            "exit_signal": False,  # scalar exit hardcoded False (the bug condition)
+            "direction": "short",
+            "directional_signals": {
+                "long_entry": False,
+                "short_entry": False,
+                "long_exit": False,
+                "short_exit": True,  # the real exit, from generate_signals
+            },
+        },
+        account_equity=10_000.0,
+    )
+
+    assert closed.get("trade_id") == "t-dir-short"
+    assert closed.get("close_reason") == "signal"
+    assert executed.get("action") == "close"
+    assert any("APT" in str(action) for action in actions)
+
+
+def test_manage_positions_holds_when_directional_exit_is_for_other_side(monkeypatch):
+    """The directional exit must match the side actually held: a short_exit must
+    NOT close a LONG position."""
+    open_trade = {
+        "id": "t-dir-long",
+        "asset": "APT",
+        "direction": "long",
+        "entry_price": 0.60,
+        "size": 100.0,
+        "risk_pct": 0.01,
+        "leverage": 1.0,
+    }
+    closed = {"called": False}
+
+    monkeypatch.setattr(scanner_mod, "_get_open_trades", lambda _sid: [open_trade])
+    monkeypatch.setattr(scanner_mod, "_execute_direct", lambda **_kwargs: {"status": "ok"})
+    monkeypatch.setattr(scanner_mod, "release", lambda _trade_id: None)
+    monkeypatch.setattr(scanner_mod, "log_activity", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        scanner_mod,
+        "_close_trade_db",
+        lambda *_args, **_kwargs: closed.update({"called": True}),
+    )
+    monkeypatch.setattr("forven.config.get_execution_mode", lambda: "paper")
+
+    actions = manage_positions(
+        "S-DIR-LONG",
+        {"asset": "APT", "params": {"risk_pct": 0.01, "leverage": 1.0}},
+        {
+            "price": 0.601,
+            "entry_signal": False,
+            "exit_signal": False,
+            "direction": "long",
+            "directional_signals": {
+                "long_entry": False,
+                "short_entry": False,
+                "long_exit": False,  # long side says HOLD
+                "short_exit": True,  # short-side exit is irrelevant to a long
+            },
+        },
+        account_equity=10_000.0,
+    )
+
+    assert closed.get("called") is False
+    assert not any(str(action).startswith("CLOSED APT") for action in actions)
+
+
 def test_manage_positions_leaves_trade_open_when_close_execution_fails(monkeypatch):
     open_trade = {
         "id": "t-close-fail-1",
@@ -1013,12 +1121,14 @@ def test_manage_positions_uses_dynamic_position_sizing(monkeypatch):
         account_equity=10_000.0,
     )
 
-    # Mirror sizing: no execution profile → default 1% risk of the $10k paper
-    # sandbox over the 2% stop, at 2x leverage → size_fraction 0.01/(0.02*2)=0.25
-    # → 2.5 ETH (loss-at-stop = 2.5 * 40 = $100 = 1% of equity).
+    # Mirror sizing: no execution profile → default risk engine = 1% risk of the
+    # $10k paper sandbox over a 2x-ATR stop (here 2*20/2000 = 2%), at 2x leverage
+    # → size_fraction 0.01/(0.02*2)=0.25 → 2.5 ETH (loss-at-stop = 2.5*40 = $100 =
+    # 1% of equity). The default engine is `atr`, not `fraction` (the $100-notional
+    # bug fix), and it derives the same 2% distance from ATR here.
     assert opened["size"] == 2.5
     assert opened["signal_data"]["sizing"]["mirror_sized"] is True
-    assert opened["signal_data"]["sizing"]["sizing_mode"] == "fraction"
+    assert opened["signal_data"]["sizing"]["sizing_mode"] == "atr"
     assert opened["signal_data"]["sizing"]["source"] == "default_1pct"
     assert opened["signal_data"]["risk_plan"]["stop_loss_price"] == 1960.0
     assert opened["signal_data"]["risk_plan"]["take_profit_price"] == 2080.0
@@ -1084,11 +1194,13 @@ def test_manage_positions_derives_stop_from_sizing_when_strategy_has_no_stop(mon
         account_equity=10_000.0,
     )
 
-    assert opened["signal_data"]["stop_loss"] == 85.0
+    # Default risk engine derives a 2x-ATR stop (2*10 = 20) → stop at 100-20 = 80.0,
+    # aligned with the kernel (previously the legacy path used an ad-hoc 1.5x-ATR = 85).
+    assert opened["signal_data"]["stop_loss"] == 80.0
     assert opened["signal_data"]["stop_loss_source"] == "atr_fallback"
     assert opened["signal_data"]["exchange_stop_requested"] is True
     assert opened["signal_data"]["exchange_take_profit_requested"] is False
-    assert opened["signal_data"]["risk_plan"]["stop_loss_price"] == 85.0
+    assert opened["signal_data"]["risk_plan"]["stop_loss_price"] == 80.0
     assert opened["signal_data"].get("take_profit") is None
     assert [fill["fill_kind"] for fill in fills] == ["entry"]
     assert fills[0]["trade_id"] == "E-ATR-1"
@@ -1203,7 +1315,6 @@ def test_manage_positions_marks_trade_pending_reconcile_when_open_execution_fail
     # same way. Force routing through _execute_direct.
     monkeypatch.setattr(scanner_mod, "_paper_stage_local_execution_only_enabled", lambda: False)
     monkeypatch.setattr(scanner_mod, "_paper_test_mode_enabled", lambda: False)
-    monkeypatch.setattr(scanner_mod, "_execution_fast_path_enabled", lambda: True)
     monkeypatch.setattr("forven.config.get_execution_mode", lambda: "paper")
 
     actions = manage_positions(
@@ -2038,3 +2149,144 @@ def test_enrich_scan_frame_preserves_explicit_pair_symbol(monkeypatch):
     scanner_mod._enrich_scan_frame(df, "SOL/USDT", "1h")
 
     assert seen["symbol"] == "SOL/USDT"  # already a pair — left intact
+
+
+# ── kernel→legacy fallback hardening (no-auto-fallback parity stance) ─────────
+
+def _kernel_dispatch_fixture(monkeypatch, *, kernel_return):
+    """Wire _apply_execution_actions so a paper strategy is kernel-eligible and the
+    kernel returns `kernel_return`; track whether the legacy engine runs."""
+    legacy_calls: list[str] = []
+    monkeypatch.setattr(scanner_mod, "_get_account_equity", lambda: 10_000.0)
+    monkeypatch.setattr(scanner_mod, "_paper_kernel_execution_enabled", lambda: True)
+    monkeypatch.setattr(scanner_mod, "_is_kernel_paper_strategy", lambda _s: True)
+    monkeypatch.setattr(scanner_mod, "_live_kernel_execution_enabled", lambda: False)
+    monkeypatch.setattr(
+        scanner_mod, "manage_positions_via_kernel",
+        lambda *a, **k: kernel_return,
+    )
+    monkeypatch.setattr(
+        scanner_mod, "manage_positions",
+        lambda *a, **k: (legacy_calls.append(str(a[0])) or ["LEGACY-OPENED"]),
+    )
+    return legacy_calls
+
+
+def _one_signal_row():
+    return [{"strategy_id": "S-FB", "strategy": {"asset": "BTC", "stage": "paper"}, "signal": {}}]
+
+
+def test_transient_kernel_failure_skips_without_legacy(monkeypatch):
+    # KERNEL_SKIP_SCAN must NOT fall through to the divergent legacy engine.
+    legacy = _kernel_dispatch_fixture(monkeypatch, kernel_return=scanner_mod.KERNEL_SKIP_SCAN)
+    diag: dict = {}
+    actions = scanner_mod._apply_execution_actions(_one_signal_row(), diagnostics_out=diag)
+    assert actions == []
+    assert legacy == []  # legacy engine never ran
+
+
+def test_non_vectorizable_fails_closed_when_fallback_disabled(monkeypatch):
+    # Opt-out: with the fallback OFF, a non-vectorizable strategy is flagged
+    # non-parity and NOT traded on the divergent legacy engine.
+    legacy = _kernel_dispatch_fixture(monkeypatch, kernel_return=None)
+    monkeypatch.setattr(scanner_mod, "_paper_legacy_fallback_enabled", lambda: False)
+    diag: dict = {}
+    actions = scanner_mod._apply_execution_actions(_one_signal_row(), diagnostics_out=diag)
+    assert actions == []
+    assert legacy == []
+    assert diag["S-FB"]["execution_decision"] == "non_vectorizable_no_parity"
+
+
+def test_non_vectorizable_trades_on_legacy_and_is_flagged_by_default(monkeypatch):
+    # DEFAULT (fallback on): a non-vectorizable strategy trades on the legacy engine
+    # rather than silently never trading — and is FLAGGED non-parity (not silent).
+    legacy = _kernel_dispatch_fixture(monkeypatch, kernel_return=None)
+    monkeypatch.setattr(scanner_mod, "_paper_legacy_fallback_enabled", lambda: True)
+    diag: dict = {}
+    actions = scanner_mod._apply_execution_actions(_one_signal_row(), diagnostics_out=diag)
+    assert actions == ["LEGACY-OPENED"]
+    assert legacy == ["S-FB"]
+    assert diag["S-FB"]["execution_decision"] == "non_vectorizable_legacy"
+
+
+# ── orphan converge-close (paper never holds a trade the kernel has exited) ───
+
+def _open_orphan_paper_trade(strategy_id, *, direction="short", entry=100.0, signal_data=None):
+    return scanner_mod._open_trade_db(
+        strat_id=strategy_id, asset="BTC", direction=direction, entry=entry,
+        size=0.1, risk_pct=0.01, leverage=1.0,
+        signal_data=signal_data if signal_data is not None else {},
+        execution_type="paper",
+    )
+
+
+def test_kernel_recorded_trades_surfaces_orphan_open(forven_db):
+    # An open paper trade with NO kernel_entry_time is surfaced as an orphan so the
+    # reconciler can adopt or converge-close it (it used to be silently skipped).
+    _open_orphan_paper_trade("S-ORPH", direction="short")
+    rec = scanner_mod._kernel_recorded_trades("S-ORPH")
+    assert len(rec) == 1
+    assert rec[0]["_orphan"] is True and rec[0]["direction"] == "short" and rec[0]["status"] == "open"
+
+
+def test_kernel_recorded_trades_skips_manual_orphan(forven_db):
+    # Operator-controlled (manual / paused) positions are never auto-managed.
+    _open_orphan_paper_trade("S-MAN", signal_data={"source": "manual"})
+    assert scanner_mod._kernel_recorded_trades("S-MAN") == []
+
+
+def test_kernel_close_orphan_closes_the_trade(forven_db):
+    from forven.db import get_db
+    from forven.strategies.paper_reconcile import ReconcileAction
+
+    tid = _open_orphan_paper_trade("S-OC", direction="short", entry=100.0)
+    action = ReconcileAction("orphan_close", "short", "", recorded={"_row": {"id": tid, "asset": "BTC"}})
+    msg = scanner_mod._kernel_close_orphan(action, last_close=90.0, last_time="2026-06-26T00:00:00+00:00")
+    assert msg and "CONVERGE-CLOSE" in msg
+    with get_db() as conn:
+        row = dict(conn.execute("SELECT status FROM trades WHERE id = ?", (tid,)).fetchone())
+    assert row["status"] == "CLOSED"
+
+
+def test_kernel_cross_asset_orphan_is_flat_closed_not_refreshed(forven_db):
+    """Regression (S04545): when a strategy's symbol flips (e.g. an ETH backtest was
+    pinned onto a SOL strategy) while a position is open, the stale-asset open must NOT
+    be reconciled/refreshed against the new asset's kernel position (which spliced the
+    new asset's stop/target onto the old asset's entry → fake -95% loss). It is held out
+    of reconcile and flat-closed at its own entry."""
+    import json as _json
+
+    from forven.db import get_db
+    from forven.scanner import _kernel_close_cross_asset_orphan, _kernel_recorded_trades
+
+    # A SOL strategy with a lingering ETH-entry OPEN paper trade (kernel-managed).
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO trades "
+            "(id, strategy, strategy_id, asset, symbol, direction, entry_price, signal_entry_price, "
+            " fill_entry_price, size, risk_pct, leverage, status, execution_type, source, signal_data, opened_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', 'paper', 'paper', ?, datetime('now'))",
+            (
+                "E-XA-1", "S-XA", "S-XA", "ETH", "ETH", "long",
+                1582.86, 1582.86, 1582.86, 6.231725, 0.02, 1.0,
+                _json.dumps({"kernel_managed": True, "kernel_entry_time": "2026-06-28 12:00:00+00:00", "price": 1582.86}),
+            ),
+        )
+
+    # The recorded-trade shaping carries the row (with its ETH asset), so the kernel guard
+    # can tell it is cross-asset relative to the now-SOL strategy.
+    recorded = _kernel_recorded_trades("S-XA")
+    eth_rows = [r for r in recorded if (r.get("_row") or {}).get("asset") == "ETH"]
+    assert eth_rows, "recorded trade should expose its asset via _row"
+
+    msg = _kernel_close_cross_asset_orphan(eth_rows[0]["_row"])
+    assert msg is not None and "CROSS-ASSET" in msg
+
+    with get_db() as conn:
+        t = conn.execute(
+            "SELECT status, exit_price, pnl FROM trades WHERE id = 'E-XA-1'"
+        ).fetchone()
+    assert str(t["status"]).upper() == "CLOSED"
+    assert abs(float(t["exit_price"]) - 1582.86) < 1e-6  # flat at its OWN entry, not SOL price
+    if t["pnl"] is not None:
+        assert abs(float(t["pnl"])) < 1e-6  # no bogus PnL

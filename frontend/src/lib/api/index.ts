@@ -479,6 +479,7 @@ export {
 	getSystemHeartbeat,
 	getBackendSoakReport,
 	getForvenAllTrades,
+	getForvenTradesStats,
 	markForvenTradeFailed,
 } from './forven';
 export {
@@ -583,6 +584,8 @@ export type {
 	ResearchMemoryMode,
 	ResearchSettings,
 	ForvenTradesPage,
+	ForvenTradesStats,
+	ForvenTradesQuery,
 	LiveSignalsResponse,
 } from './forven';
 
@@ -679,6 +682,7 @@ export {
 	getContainerAudit,
 	getContainerTasks,
 	transitionStage,
+	updateStrategyDisplayName,
 	getGraveyard,
 	reviveFromGraveyard,
 	deleteStrategy,
@@ -750,6 +754,7 @@ export {
 	getPaperWebSocketUrl,
 	getSessionIndicators,
 	getTradeMarkers,
+	getPaperSessionChart,
 } from './paper';
 export type {
 	PaperPosition,
@@ -774,6 +779,9 @@ export type {
 	TradeMarker,
 	TradeMarkersResponse,
 	OpenManualPaperPositionOptions,
+	ChartIndicatorSeries,
+	ActiveLevel,
+	PaperSessionChart,
 } from './paper';
 
 export {

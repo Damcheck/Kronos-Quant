@@ -224,27 +224,6 @@ def set_execution_mode(mode: str):
     save_config(cfg)
 
 
-def get_execution_fast_path() -> bool:
-    """Whether scanner should attempt direct exchange execution first.
-
-    Default is enabled in the local config and can be overridden by
-    FORVEN_EXECUTION_FAST_PATH env var.
-    """
-    env_val = os.environ.get("FORVEN_EXECUTION_FAST_PATH")
-    if env_val is not None:
-        return _parse_bool(env_val)
-
-    cfg = load_config()
-    return _parse_bool(cfg.get("execution_fast_path", True))
-
-
-def set_execution_fast_path(enabled: bool):
-    """Persist the execution fast-path toggle."""
-    cfg = load_config()
-    cfg["execution_fast_path"] = bool(enabled)
-    save_config(cfg)
-
-
 def _parse_float(value, default: float) -> float:
     """Parse float-like values with fallback."""
     if isinstance(value, (int, float)):

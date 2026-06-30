@@ -241,5 +241,6 @@ class TestDataEngineNestedPartialSave:
         )
         des = _load_settings_payload()["data_engine_settings"]
         assert des["auto_catchup_enabled"] is False
-        # Nested defaults still filled for genuinely-missing keys.
-        assert des["source_reconciliation"]["enabled"] is False
+        # Nested defaults still filled for genuinely-missing keys (source
+        # reconciliation now defaults ON — the Binance↔HL divergence safety net).
+        assert des["source_reconciliation"]["enabled"] is True

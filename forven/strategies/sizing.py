@@ -43,6 +43,22 @@ HONORED_EXECUTION_CONTROL_FIELDS = (
 # positions" floor the operator asked for.
 DEFAULT_RISK_PER_TRADE = 0.01
 
+# Default per-trade risk for a CONFIGURED profile (sizing_mode set) that omits an
+# explicit risk_per_trade — 2%, matching the frontend "fraction"/"atr" presets. This
+# is deliberately distinct from DEFAULT_RISK_PER_TRADE (the no-profile fallback): a
+# profile that opts into risk-sizing accepts a slightly higher default. Named so the
+# 1%-vs-2% split is explicit, not a bare magic number.
+DEFAULT_PROFILE_RISK_PER_TRADE = 0.02
+
+# The default risk engine sizes that 1% against a 2x-ATR stop (an industry-standard
+# volatility stop) which is ALSO placed as a real stop on the position. When ATR is
+# unavailable (e.g. a flat warmup window) the sizing/stop fall back to a fixed
+# percent so the position can never collapse to flat 1% notional (the "$100 on a
+# $10k portfolio" bug). Both constants live here so the backtest and the live/paper
+# scanner share one definition — the parity invariant.
+DEFAULT_ATR_STOP_MULTIPLIER = 2.0
+DEFAULT_STOP_LOSS_PCT_FLOOR = 3.0
+
 
 def clamp01(value: float) -> float:
     """Clamp to [0, 1]; non-finite → 0. Mirrors backtest._clamp01."""
@@ -136,7 +152,7 @@ def normalize_execution_controls(controls: dict | None) -> dict | None:
     if time_stop_bars is not None and time_stop_bars <= 0:
         time_stop_bars = None
 
-    risk_per_trade = _opt_pos("risk_per_trade") or 0.02
+    risk_per_trade = _opt_pos("risk_per_trade") or DEFAULT_PROFILE_RISK_PER_TRADE
     fixed_size = _opt_pos("fixed_size")
     atr_stop_multiplier = _opt_pos("atr_stop_multiplier") or 2.0
     kelly_multiplier = _opt_pos("kelly_multiplier") or 0.5
@@ -177,14 +193,27 @@ def entry_stop_dist_pct(ec: dict, *, entry_price: float, atr_value: float | None
     stops it reads the profile percent. Mirrors backtest._entry_stop_dist_pct.
     Returns None when the profile defines no stop (caller may supply its own).
     """
-    if ec.get("sizing_mode") == "atr" and atr_value is not None:
-        if entry_price > 0 and atr_value > 0:
-            return (ec["atr_stop_multiplier"] * atr_value) / entry_price
-        return None
+    if (
+        ec.get("sizing_mode") == "atr"
+        and atr_value is not None
+        and entry_price > 0
+        and atr_value > 0
+    ):
+        return (ec["atr_stop_multiplier"] * atr_value) / entry_price
+    # Fall through to a fixed-percent stop when ATR is unavailable (flat warmup,
+    # zero-volatility bar) so atr-mode sizing never collapses to flat notional.
     if ec.get("stop_loss_pct") is not None:
         return ec["stop_loss_pct"] / 100.0
     if ec.get("trailing_stop_pct") is not None:
         return ec["trailing_stop_pct"] / 100.0
+    # SIZE-1: an atr-mode profile that carries NO explicit stop_loss_pct (the selectable
+    # `atr` candidates from execution_selection don't) must STILL keep a protective floor
+    # when ATR is unavailable — otherwise size_fraction collapses to flat risk_per_trade
+    # notional AND the kernel places no stop, contradicting the "atr-sizing never
+    # collapses to flat notional" invariant. Inherit the same DEFAULT_STOP_LOSS_PCT_FLOOR
+    # default_controls uses, so the floor lives in ONE place for every atr profile.
+    if ec.get("sizing_mode") == "atr":
+        return DEFAULT_STOP_LOSS_PCT_FLOOR / 100.0
     return None
 
 
@@ -220,21 +249,29 @@ def size_fraction(
 
 
 def default_controls(risk_per_trade: float = DEFAULT_RISK_PER_TRADE) -> dict:
-    """The fallback profile when a strategy has none: risk a fixed % of the
-    portfolio over the stop distance (fraction mode). The stop itself is supplied
-    by the caller (signal/ATR), so this carries no stop_loss_pct of its own."""
+    """The fallback risk engine when a strategy carries no execution profile.
+
+    Risk a fixed % of equity per trade (``risk_per_trade``) sized against an
+    auto-synthesized ATR stop (``DEFAULT_ATR_STOP_MULTIPLIER`` x ATR) that the
+    kernel ALSO places as a real ``stop_price`` on the position — so a stop-out
+    loses ~``risk_per_trade`` of equity and the position can't ride to an unbounded
+    loss. ``DEFAULT_STOP_LOSS_PCT_FLOOR`` is the fixed-percent fallback used only
+    when ATR is unavailable, so the size never collapses to flat 1% notional. This
+    is ``atr`` sizing, not ``fraction`` with no stop — fixing the "$100 on a $10k
+    portfolio" degeneracy. Lives in the shared sizing module so the backtest and
+    the live/paper scanner apply the IDENTICAL default (the parity invariant)."""
     return {
-        "sizing_mode": "fraction",
-        "stop_loss_pct": None,
+        "sizing_mode": "atr",
+        "stop_loss_pct": DEFAULT_STOP_LOSS_PCT_FLOOR,
         "take_profit_pct": None,
         "trailing_stop_pct": None,
         "time_stop_bars": None,
         "risk_per_trade": float(risk_per_trade),
         "fixed_size": None,
-        "atr_stop_multiplier": 2.0,
+        "atr_stop_multiplier": DEFAULT_ATR_STOP_MULTIPLIER,
         "kelly_multiplier": 0.5,
         "kelly_lookback": 100,
-        "needs_atr": False,
+        "needs_atr": True,
         "atr_period": 14,
         "is_default": True,
     }

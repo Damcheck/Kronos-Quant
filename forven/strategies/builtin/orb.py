@@ -19,19 +19,28 @@ class ORBStrategy(BaseStrategy):
         return {"VOLATILE", "TREND_UP"}
     def describe(self) -> str:
         return "Trades the breakout of the high/low established in the first N bars of the session."
+    def generate_signals(self, df: pd.DataFrame):
+        """Vectorized twin of generate_signal — the SINGLE source of entry/exit logic."""
+        p = self.params
+        close = df["close"]
+        n = p["range_bars"]
+        recent_high = df["high"].rolling(n).max().shift(1)
+        recent_low = df["low"].rolling(n).min().shift(1)
+        entry = close > recent_high
+        exit_ = close < recent_low
+        return entry.fillna(False), exit_.fillna(False)
+
     def generate_signal(self, df: pd.DataFrame) -> Signal:
         close = df["close"]
         curr_close = float(close.iloc[-1])
-        
+
         n = self.params["range_bars"]
         recent_high = float(df["high"].rolling(n).max().iloc[-2])
-        recent_low = float(df["low"].rolling(n).min().iloc[-2])
-        
-        entry = curr_close > recent_high
-        exit_ = curr_close < recent_low
-        
+
+        entries, exits = self.generate_signals(df)
+
         return Signal(
-            entry_signal=bool(entry), exit_signal=bool(exit_),
+            entry_signal=bool(entries.iloc[-1]), exit_signal=bool(exits.iloc[-1]),
             price=round(curr_close, 4), direction="long", confidence=1.0,
             indicators={"orb_high": round(recent_high, 4)}
         )

@@ -12,6 +12,17 @@ from forven.sandbox.ast_guard import scan_source
 
 
 BYPASS_PAYLOADS = {
+    # R3 (2026-06-30): the confused-deputy forven modules are no longer on the
+    # untrusted allowlist — forven.scanner (re-exports get_db/kv_get/_execute_direct),
+    # forven.strategies.sentiment (live funding fetch), forven.data / forven.data_manager
+    # (ccxt/requests/Path-shutil). Strategies use the forven.strategies.indicators facade
+    # instead. See docs/strategy-share-security-audit-2026-06-29.md.
+    "r3_scanner_db_handle": "from forven.scanner import get_db\n",
+    "r3_scanner_indicator": "from forven.scanner import atr\n",
+    "r3_scanner_module": "import forven.scanner as sc\nsc.kv_get('forven:settings')\n",
+    "r3_sentiment_fetch": "from forven.strategies.sentiment import fetch_funding_rates\n",
+    "r3_data_path": "from forven.data import Path\n",
+    "r3_data_manager_session": "from forven.data_manager import data_manager\n",
     "builtins_eval_attr": "import builtins\nbuiltins.eval('1+1')\n",
     "builtins_exec_attr": "import builtins\nbuiltins.exec('x=1')\n",
     "builtins_open_attr": "import builtins\nbuiltins.open('/etc/passwd')\n",
@@ -43,6 +54,74 @@ BYPASS_PAYLOADS = {
     "dunder_import_alias": "i = __import__\ni('os')\n",
     "import_operator": "import operator\n",
     "operator_attrgetter": "from operator import attrgetter\nattrgetter('__globals__')(print)\n",
+    # P1.2 (audit 2026-06-28): allowlist + traversal/smuggle bypasses that the old
+    # denylist let through and that were proven to execute in-process.
+    "pandas_subprocess_traversal": "import pandas as pd\npd._config.localization.subprocess.run(['echo', 'x'])\n",
+    "pandas_os_traversal": "import pandas as pd\npd.compat.os.startfile('x')\n",
+    "from_pandas_import_os": "from pandas.io.common import os\n_ = os.environ\n",
+    "from_numpy_import_sys": "from numpy import sys\n",
+    "import_winapi": "import _winapi\n",
+    "import_http_client": "import http.client\n",
+    "import_pdb_run": "import pdb\npdb.run('x=1')\n",
+    "import_timeit_exec": "import timeit\ntimeit.timeit('x=1')\n",
+    "import_winreg": "import winreg\n",
+    "import_poplib": "import poplib\n",
+    "relative_import_smuggle": "from . import os\n",
+    # The forven.* tightening: orders / DB / credentials are now off-limits to
+    # untrusted strategy code (the old denylist allowed ALL of forven.*).
+    "forven_exchange_blocked": "from forven.exchange.hyperliquid import market_order\n",
+    "forven_db_blocked": "from forven.db import get_db\n",
+    "forven_secret_blocked": "from forven.secret_storage import decrypt_secret\n",
+    "forven_config_blocked": "import forven.config\n",
+    # ------------------------------------------------------------------
+    # 2026-06-29 strategy-import-RCE audit: confirmed bypasses reproduced
+    # against the real guard. Each PASSED scan_source before the hardening
+    # and then reached RCE / secret-read / file-write on the import path.
+    # ------------------------------------------------------------------
+    # CRIT-1: PEP 263 source-encoding cookie (scan/compile byte-view split).
+    "coding_cookie_utf7": "# coding: utf-7\nimport pandas as pd\n",
+    "coding_cookie_unicode_escape": "# -*- coding: unicode_escape -*-\nimport pandas as pd\n",
+    "coding_cookie_raw_unicode_escape": "#!/usr/bin/env python\n# coding: raw_unicode_escape\nimport numpy as np\n",
+    "coding_cookie_fileencoding_alias": "# vim: set fileencoding=utf-7 :\nimport pandas as pd\n",
+    "coding_cookie_utf16": "# coding: utf-16\nimport pandas as pd\n",
+    # CRIT-3: frame / generator / coroutine / traceback introspection -> builtins.
+    "gi_frame_f_builtins_exec": "g = (x for x in [1])\ng.gi_frame.f_builtins['exec']('x=1')\n",
+    "gi_frame_f_globals": "g = (x for x in [1])\n_ = g.gi_frame.f_globals\n",
+    "tb_frame_f_back_locals": (
+        "try:\n    raise ValueError()\n"
+        "except ValueError as e:\n    _ = e.__traceback__.tb_frame.f_back.f_locals\n"
+    ),
+    # CRIT-4: getattr constant-string indirection past the dunder-only check.
+    "getattr_builtins_exec": "import dataclasses\ngetattr(getattr(dataclasses, 'builtins'), 'exec')('x=1')\n",
+    "getattr_sklearn_os_system": "import sklearn\ngetattr(getattr(sklearn, 'os'), 'system')('id')\n",
+    "getattr_os_environ": "import sklearn\n_ = getattr(getattr(sklearn, 'os'), 'environ')\n",
+    "getattr_sys_modules": "import statistics\n_ = getattr(statistics, 'sys').modules\n",
+    "getattr_const_subprocess": "import pandas as pd\ngetattr(pd._config.localization, 'subprocess')\n",
+    # CRIT-5: allowlisted-library native gadgets / full-dotted-path import.
+    "numpy_distutils_exec_command": "import numpy.distutils.exec_command as h\nh.exec_command('id')\n",
+    "numpy_ctypeslib_import": "from numpy.ctypeslib import load_library\n",
+    "numpy_ctypeslib_attr": "import numpy as np\nnp.ctypeslib.load_library('m', '.')\n",
+    "numpy_f2py_import": "import numpy.f2py\n",
+    "pandas_query_python_engine": (
+        "import pandas as pd\n"
+        "def g(df):\n    return df.query('a.__class__', engine='python')\n"
+    ),
+    # .query python-engine evasions: an ABSENT engine (pandas defaults to python when
+    # numexpr is unavailable) and a NON-CONSTANT engine both reach the python evaluator.
+    "pandas_query_absent_engine": (
+        "def g(df):\n    return df.query('close.__init__.__globals__')\n"
+    ),
+    "pandas_query_computed_engine": (
+        "def g(df):\n    e = 'pyth' + 'on'\n    return df.query('a.__class__', engine=e)\n"
+    ),
+    # CRIT-6: write-serializer file-write primitives (-> overwrite __init__.py).
+    "ndarray_tofile_self": "import numpy as np\nnp.frombuffer(b'x', np.uint8).tofile(__file__)\n",
+    "df_to_csv": "def g(df):\n    df.to_csv('x.csv')\n",
+    "df_to_json_path": "def g(df):\n    df.to_json('x.json')\n",
+    "np_save": "import numpy as np\nnp.save('x.npy', np.zeros(3))\n",
+    # Builtins-dict subscript callee.
+    "subscript_dunder_globals": "d = {}\n_ = d['__globals__']\n",
+    "subscript_exec_key": "d = {}\n_ = d['exec']\n",
 }
 
 LEGIT_PAYLOADS = {
@@ -78,6 +157,35 @@ LEGIT_PAYLOADS = {
     "getattr_constant_ok": "def pick(o):\n    return getattr(o, 'close')\n",
     "setattr_constant_ok": "class S:\n    def f(self):\n        setattr(self, 'cached', 1)\n",
     "builtin_numeric_calls_ok": "def f(x):\n    return int(float(x)) + abs(x) + round(x, 2)\n",
+    # P1.2: the allowlist must NOT regress real corpus patterns — legit submodules
+    # of allowed libraries (numpy.random, scipy.signal, pandas.io), the extra TA/
+    # science libs the corpus uses, and the strategy-facing forven API.
+    "numpy_random_ok": "import numpy as np\ny = np.random.normal(size=3)\n",
+    "scipy_signal_ok": "from scipy import signal\n_ = signal\n",
+    "pandas_io_attr_ok": "import pandas as pd\n_ = pd.io\n",
+    "pandas_ta_ok": "import pandas_ta as pta\n",
+    "warnings_ok": "import warnings\nwarnings.warn('x')\n",
+    "forven_base_ok": "from forven.strategies.base import BaseStrategy, Signal\n",
+    "forven_marketdata_ok": "from forven.market_data_view import get_ohlcv\n",
+    # R3: pure indicator helpers now come from the allowlisted facade, NOT forven.scanner
+    # (which re-exports get_db/kv_get/_execute_direct and is de-allowlisted).
+    "forven_indicator_facade_ok": "from forven.strategies.indicators import atr, rsi, adx\n",
+    # 2026-06-29 hardening must NOT regress these real corpus idioms.
+    "ohlcv_subscript_open": "def g(df):\n    return df['open'] + df['close'] - df['low']\n",
+    # .query with an explicit constant engine="numexpr" is numeric-only (no attribute
+    # access) and stays allowed — only the python engine is the RCE gadget.
+    "pandas_query_numexpr_ok": "def g(df):\n    return df.query('close > 100', engine='numexpr')\n",
+    "dataclass_params_dict": (
+        "from dataclasses import dataclass\n"
+        "@dataclass\n"
+        "class StrategyParams:\n    span: int = 14\n"
+        "def defaults():\n    return StrategyParams().__dict__\n"
+    ),
+    "getattr_const_column_ok": "def pick(row):\n    return getattr(row, 'close')\n",
+    "utf8_coding_cookie_ok": "# -*- coding: utf-8 -*-\nimport pandas as pd\n",
+    "numpy_random_submodule_ok": "import numpy as np\n_ = np.random.default_rng(0)\n",
+    "scipy_signal_submodule_ok": "from scipy import signal\n_ = signal.argrelextrema\n",
+    "to_dict_in_memory_ok": "def g(df):\n    return df.tail().to_dict()\n",
 }
 
 

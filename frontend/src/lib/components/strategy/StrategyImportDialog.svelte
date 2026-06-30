@@ -208,8 +208,11 @@
 							</div>
 						</div>
 						{#if parsed.summary.hasCode}
-							<div class="mt-2 text-[10px] text-emerald-300/80">
-								Bundled custom code will be security-scanned and registered before the container is created.
+							<div class="mt-2 rounded border border-sky-900/50 bg-sky-950/20 px-2 py-1.5 text-[10px] text-sky-300/90">
+								<span class="font-semibold">Runs sandboxed.</span>
+								This export bundles custom code. It is security-scanned and then executed
+								ONLY inside an isolated worker (secret-free, network-denied, filesystem-confined)
+								— never in the main app. It imports as a sandbox-only strategy.
 							</div>
 						{/if}
 						{#if parsed.summary.backtests > 0 || parsed.summary.trades > 0 || parsed.summary.events > 0}
@@ -237,7 +240,7 @@
 					disabled={!parsed || importing}
 					on:click={() => void runImport()}
 				>
-					{importing ? 'Importing…' : 'Import as new container'}
+					{importing ? 'Importing…' : parsed?.summary.hasCode ? 'Import (sandboxed)' : 'Import as new container'}
 				</button>
 			</div>
 		{/if}

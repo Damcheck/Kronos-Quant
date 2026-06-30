@@ -23,6 +23,12 @@ _TYPE_MAP: dict[str, type[BaseStrategy]] = {}
 _DYNAMIC_REGIME_CLASS: dict[type, type] = {}
 _ARCHIVED_CUSTOM_MODULES: dict[str, str] = {}
 
+# Reserved runtime-type prefix for untrusted-origin (imported, sandbox-only)
+# strategies. Their runtime type is ``imported__<module>`` — keyed by MODULE NAME,
+# never the module's self-declared TYPE_NAME — so an import can never shadow a real
+# builtin/custom type. Only the worker's _TYPE_MAP ever holds these keys.
+IMPORTED_TYPE_PREFIX = "imported__"
+
 # Custom modules that failed to import — memoized so repeated discover() calls
 # (after a reset, or across the many backtests in a long-lived process) do not
 # re-attempt the import and re-emit the same "Skipping custom strategy module"
@@ -159,6 +165,23 @@ def build_strategy_from_row(row: Mapping[str, object]) -> BaseStrategy:
     if data.get("symbol"):
         canonical_params["_asset"] = data["symbol"]
 
+    # Untrusted-origin (sandbox-only) strategies are NEVER instantiated from their
+    # real class in the trusted parent — the parent doesn't even have it. Build the
+    # non-executing proxy; all signal generation routes to the worker by type+params.
+    if bool(data.get("sandbox_only")) or runtime_meta.get("sandbox_only") or resolved_runtime_type.startswith(IMPORTED_TYPE_PREFIX):
+        from forven.strategies.sandbox_proxy import SandboxOnlyStrategy
+
+        strategy = SandboxOnlyStrategy(sid, canonical_params, runtime_type=resolved_runtime_type)
+        _attach_runtime_metadata(
+            strategy,
+            family_type=resolve_strategy_family(stype),
+            runtime_type=resolved_runtime_type,
+            runtime_source=str(runtime_meta.get("source") or "sandbox_only"),
+            param_meta=canonical_meta,
+        )
+        _inject_regime_metadata(strategy, compatible_regimes, is_all_rounder)
+        return strategy
+
     cls = _TYPE_MAP.get(resolved_runtime_type)
     if not cls:
         raise ValueError(f"runtime type '{resolved_runtime_type}' is not registered")
@@ -281,9 +304,80 @@ def discover(include_custom: bool = True):
         # above skipped — otherwise a legit paper/live strategy whose TYPE_NAME
         # differs from its filename is blocked as "runtime type not registered".
         _ensure_active_db_strategy_modules()
+        # Worker-ONLY: also load untrusted-origin (imported/) strategies so the
+        # sandbox can run them by type+params. The trusted PARENT never enters this
+        # branch (FORVEN_IN_STRATEGY_WORKER is unset there), so author-controlled
+        # imported code is imported exclusively inside the locked-down subprocess.
+        if _in_strategy_worker():
+            _discover_imported_modules()
         _custom_discovered = True
 
     _discovered = _builtin_discovered and _custom_discovered
+
+
+def imported_runtime_type(module_name: str) -> str:
+    """The namespaced runtime-type key for an untrusted-origin (imported) strategy.
+
+    Imported strategies are routed/executed by MODULE NAME under a reserved prefix
+    (never their self-declared TYPE_NAME), so a malicious import can never shadow or
+    hijack a builtin/custom type in the worker's registry (e.g. declaring
+    ``TYPE_NAME='macd'`` to take over real macd execution). The module name is unique
+    within forven/strategies/imported/ and the prefix can't collide with a real type."""
+    return f"{IMPORTED_TYPE_PREFIX}{str(module_name).strip()}"
+
+
+def _discover_imported_modules() -> None:
+    """Worker-ONLY: import every untrusted-origin strategy under
+    ``forven.strategies.imported`` and register it in the worker's _TYPE_MAP under a
+    NAMESPACED key (``imported__<module>``) so the sandbox can run it by type+params.
+
+    Hard-guarded to the worker process: if ever called in the trusted parent it is a
+    no-op, so author-controlled imported code can never execute in the host. The
+    namespaced key (NOT the module's self-declared TYPE_NAME) prevents an imported
+    module from overriding a real builtin/custom type via last-writer-wins."""
+    if not _in_strategy_worker():
+        return
+    try:
+        from forven.strategies import imported
+    except ImportError:
+        return
+    for _importer, modname, _ispkg in pkgutil.iter_modules(imported.__path__):
+        if not modname or modname == "__init__":
+            continue
+        try:
+            assert_custom_module_safe(modname, package="imported")
+            module = importlib.import_module(f"forven.strategies.imported.{modname}")
+            cls = _resolve_module_strategy_class(module)
+            if cls is None:
+                raise RegistryTypeError(f"no single BaseStrategy subclass in imported.{modname}")
+            errors = _registry_type_validation_errors(cls)
+            if errors:
+                raise RegistryTypeError("; ".join(errors))
+            _TYPE_MAP[imported_runtime_type(modname)] = cls
+        except Exception as e:
+            if modname not in _FAILED_CUSTOM_LOGGED:
+                _FAILED_CUSTOM_LOGGED.add(modname)
+                log.warning("Skipping imported strategy module %s: %s", modname, e)
+
+
+def _resolve_module_strategy_class(module) -> type | None:
+    """Resolve the single BaseStrategy subclass a strategy module exports (via
+    STRATEGY_CLASS, a string class-name, or a lone subclass). Returns None if
+    ambiguous/absent. Shared by imported discovery and the worker validator."""
+    strategy_cls = getattr(module, "STRATEGY_CLASS", None)
+    if isinstance(strategy_cls, str):
+        strategy_cls = getattr(module, strategy_cls, None)
+    if isinstance(strategy_cls, type) and issubclass(strategy_cls, BaseStrategy):
+        return strategy_cls
+    subclasses = [
+        obj
+        for obj in vars(module).values()
+        if isinstance(obj, type)
+        and issubclass(obj, BaseStrategy)
+        and obj is not BaseStrategy
+        and getattr(obj, "__module__", None) == module.__name__
+    ]
+    return subclasses[0] if len(subclasses) == 1 else None
 
 
 def _ensure_active_db_strategy_modules() -> None:
@@ -294,6 +388,13 @@ def _ensure_active_db_strategy_modules() -> None:
     registered" after a restart (the lazy archived loader only resolves when the
     runtime name equals the module name). Bounded to active strategies; best-effort
     and never raises."""
+    # The isolated strategy worker is DB-jailed (forven.db refuses connections when
+    # FORVEN_IN_STRATEGY_WORKER is set) and resolves the one type it needs per-request
+    # from the filesystem/imported scan — it never needs this parent-side convenience
+    # sweep. Skip it explicitly so worker startup stays clean (rather than relying on
+    # the broad except below to swallow the jail's RuntimeError every spawn).
+    if _in_strategy_worker():
+        return
     try:
         from forven.db import get_db
         with get_db() as conn:
@@ -309,7 +410,10 @@ def _ensure_active_db_strategy_modules() -> None:
     loaded = 0
     for row in rows:
         stype = str(row["stype"] or "").strip()
-        if not stype or stype in _TYPE_MAP:
+        # Untrusted-origin (imported, sandbox-only) types are NEVER imported into the
+        # trusted parent — their class lives only in the worker. Skip so this sweep
+        # can't even attempt an in-process import of an imported module.
+        if not stype or stype in _TYPE_MAP or stype.startswith(IMPORTED_TYPE_PREFIX):
             continue
         src = str(row["source_ref"] or "").strip()
         if not src:
@@ -407,7 +511,17 @@ def _register_module_type_tolerant(module, *, raise_on_skip: bool = False) -> No
 _SCAN_VERDICT_CACHE: dict[tuple[str, int, int, int], tuple[bool, str]] = {}
 
 
-def assert_custom_module_safe(modname: str) -> None:
+def _in_strategy_worker() -> bool:
+    """True only inside the locked-down sandbox subprocess (set via the worker env).
+
+    Used to gate worker-ONLY behaviour: the trusted parent never imports
+    untrusted-origin (``forven.strategies.imported``) modules; the worker does."""
+    import os
+
+    return bool(os.environ.get("FORVEN_IN_STRATEGY_WORKER"))
+
+
+def assert_custom_module_safe(modname: str, package: str = "custom") -> None:
     """C-1: statically AST-scan a custom strategy module BEFORE it is imported
     into the live process.
 
@@ -423,10 +537,10 @@ def assert_custom_module_safe(modname: str) -> None:
     any other broken module. Modules with no resolvable .py file (namespace
     packages) pass through untouched.
     """
-    from forven.strategies import custom
+    pkg = importlib.import_module(f"forven.strategies.{package}")
 
     source_path: Path | None = None
-    for root in list(getattr(custom, "__path__", []) or []):
+    for root in list(getattr(pkg, "__path__", []) or []):
         candidate = Path(root) / f"{modname}.py"
         if candidate.is_file():
             source_path = candidate
@@ -471,9 +585,9 @@ def assert_custom_module_safe(modname: str) -> None:
         _SCAN_VERDICT_CACHE[cache_key] = (True, "")
 
 
-def _load_custom_strategy_module(modname: str) -> None:
-    assert_custom_module_safe(modname)
-    module = importlib.import_module(f"forven.strategies.custom.{modname}")
+def _load_custom_strategy_module(modname: str, package: str = "custom") -> None:
+    assert_custom_module_safe(modname, package=package)
+    module = importlib.import_module(f"forven.strategies.{package}.{modname}")
     if hasattr(module, "STRATEGIES"):
         for sid, cls, params in module.STRATEGIES:
             register(cls(sid, params))
@@ -576,11 +690,18 @@ def _load_db_strategies(target: dict):
                         _inject_regime_metadata(strategy, compatible_regimes, is_all_rounder)
                         continue
 
-                    cls = _TYPE_MAP.get(resolved_runtime_type)
-                    if not cls:
-                        raise ValueError(f"runtime type '{resolved_runtime_type}' is not registered")
+                    # Untrusted-origin (sandbox-only) strategies promoted to paper/live
+                    # are hydrated as the non-executing proxy — the real class is never
+                    # imported in the parent; the scanner routes execution to the worker.
+                    if bool(row.get("sandbox_only")) or runtime_meta.get("sandbox_only") or resolved_runtime_type.startswith(IMPORTED_TYPE_PREFIX):
+                        from forven.strategies.sandbox_proxy import SandboxOnlyStrategy
 
-                    strategy = cls(sid, canonical_params)
+                        strategy = SandboxOnlyStrategy(sid, canonical_params, runtime_type=resolved_runtime_type)
+                    else:
+                        cls = _TYPE_MAP.get(resolved_runtime_type)
+                        if not cls:
+                            raise ValueError(f"runtime type '{resolved_runtime_type}' is not registered")
+                        strategy = cls(sid, canonical_params)
                     _attach_runtime_metadata(
                         strategy,
                         family_type=resolve_strategy_family(stype),
@@ -663,6 +784,15 @@ def _attach_runtime_metadata(
 def resolve_runtime_type(strategy_type: str | None, runtime_type: str | None = None) -> tuple[str | None, dict]:
     normalized_type = str(strategy_type or "").strip()
     normalized_runtime = str(runtime_type or "").strip()
+
+    # Untrusted-origin (imported, sandbox-only) types resolve to themselves WITHOUT
+    # any in-parent import — the real class lives only in the worker. Resolve early
+    # so the parent never treats them as "not registered" and never tries to load
+    # the module in-process.
+    if normalized_runtime.startswith(IMPORTED_TYPE_PREFIX):
+        return normalized_runtime, {"source": "sandbox_only", "sandbox_only": True, "blocked_reason": None}
+    if normalized_type.startswith(IMPORTED_TYPE_PREFIX):
+        return normalized_type, {"source": "sandbox_only", "sandbox_only": True, "blocked_reason": None}
 
     if normalized_runtime and normalized_runtime not in _TYPE_MAP:
         _load_archived_custom_runtime_type(normalized_runtime)

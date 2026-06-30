@@ -491,7 +491,10 @@ def get_bot_token() -> str:
     if token:
         return token
     cfg = load_config()
-    token = cfg.get("discord_token")
+    # Stored encrypted by the Settings save path (audit P1.5); decrypt_secret
+    # passes any legacy plaintext token through unchanged for backward compat.
+    from forven.secret_storage import decrypt_secret
+    token = decrypt_secret(cfg.get("discord_token") or "")
     if not token:
         raise ValueError(
             "Discord bot token not found. Set DISCORD_TOKEN env var "
@@ -585,24 +588,11 @@ def _build_default_agents() -> list[dict]:
                 "Always reference Strategy Container ID S0000X when issuing risk or allocation directives."
             ),
         },
-        {
-            "agent_id": "execution-trader",
-            "name": "Execution Trader",
-            "role": "Execute trades on HyperLiquid testnet. Handle order placement, position management, and fill reconciliation. Only agent with exchange access.",
-            "model": "openai",
-            "model_id": get_default_model_for_provider("openai"),
-            "visibility": "visible",
-            "instructions": (
-                "You are the Execution Trader for Forven. You are the ONLY agent with exchange access.\n"
-                "1. Place orders on HyperLiquid testnet (market or limit)\n"
-                "2. Monitor fill quality and slippage\n"
-                "3. Manage stop-losses and trailing stops\n"
-                "4. Reconcile fills with trade records using update_trade\n"
-                "5. Tag every trade fill and slippage audit with the parent Strategy Container ID S0000X\n"
-                "6. Report execution quality back to the Brain\n"
-                f"NEVER exceed {max_trade}% of account per trade. Always set stop-losses."
-            ),
-        },
+        # execution-trader RETIRED (2026-06-30): trade execution is owned by the
+        # scanner's parity kernel (manage_positions_via_kernel) and the operator's
+        # manual position controls. There is no LLM-driven order path anymore — an
+        # agent placing/closing orders out-of-band fabricated phantom/unknown
+        # closes. The row is deleted via `deprecated_agents` in seed_default_agents.
         {
             "agent_id": "strategy-developer",
             "name": "Strategy Developer",
@@ -678,7 +668,12 @@ def seed_default_agents() -> dict:
         existing = {r["id"] for r in conn.execute("SELECT id FROM agents").fetchall()}
 
     removed_deprecated: list[str] = []
-    deprecated_agents = {"portfolio-optimizer", "sentiment-analyst", "data-scientist"}
+    deprecated_agents = {
+        "portfolio-optimizer", "sentiment-analyst", "data-scientist",
+        # Retired 2026-06-30: execution is owned by the scanner kernel + the
+        # operator's manual controls; no LLM order path remains.
+        "execution-trader",
+    }
     for deprecated_id in sorted(deprecated_agents & existing):
         try:
             delete_agent(deprecated_id)
@@ -974,12 +969,11 @@ class ForvenBot(commands.Bot):
                             "1. Check what Strategy Containers exist and their lifecycle statuses\n"
                             "2. Review any pending post-mortems from closed trades\n"
                             "3. Check the market regime and sentiment\n"
-                    "4. Assign tasks to your 7 agents as needed:\n"
+                    "4. Assign tasks to your agents as needed:\n"
                     "   - strategy-developer swarm: Generate first-class hypotheses and spawn initial strategy candidates immediately\n"
                     "   - defer quant-researcher until after the first strategy-developer hypothesis wave is underway; then use it only for external benchmarks, market structure, missing data, and data-quality/feature-integrity checks\n"
                     "   - simulation-agent: Validate Strategy Containers in Test stage\n"
-                            "   - risk-manager: Oversee live container risk and capital allocation\n"
-                            "   - execution-trader: Execute approved trades\n"
+                            "   - risk-manager: Oversee paper + live container risk and capital allocation (trade execution is automated by the scanner kernel — there is no execution agent)\n"
                             "   - brain: Escalate orchestrator-level control tasks if needed\n"
                             "5. Update LESSONS.md with any new insights\n\n"
                             "Be proactive. Don't wait — assign work NOW."

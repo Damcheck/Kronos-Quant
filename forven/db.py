@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import re
 import shutil
 import sqlite3
@@ -26,6 +27,25 @@ ID_WIDTH_BY_PREFIX = {
 }
 log = logging.getLogger("forven.db")
 _WAL_CONFIGURED_PATHS: set[str] = set()
+
+# Untrusted strategy code runs ONLY inside the out-of-process strategy worker
+# (forven.sandbox.strategy_worker sets FORVEN_IN_STRATEGY_WORKER). That worker must
+# never reach the production database: the confused-deputy modules it can still
+# import (forven.scanner re-exports get_db/kv_get/kv_set; forven.data/data_manager)
+# funnel DB reads, secret decryption (kv_get), trade tampering and settings /
+# kill-switch writes through the connection factories below. Refusing a connection
+# here is the boundary that makes a guard bypass inert (see
+# docs/strategy-share-security-audit-2026-06-29.md, R3). The parent process never
+# sets this flag, so the guard is a no-op outside the sandbox.
+_STRATEGY_WORKER_FLAG = "FORVEN_IN_STRATEGY_WORKER"
+
+
+def _assert_db_access_allowed() -> None:
+    if os.environ.get(_STRATEGY_WORKER_FLAG):
+        raise RuntimeError(
+            "database access is disabled inside the strategy sandbox "
+            "(forven.db connection requested from the isolated strategy worker)"
+        )
 
 
 FACTORY_RESET_CATEGORIES = {
@@ -429,6 +449,7 @@ def _repair_strategy_generic_placeholders(conn: sqlite3.Connection, now_iso: str
 @contextmanager
 def get_db():
     """Get a database connection with WAL mode and foreign keys."""
+    _assert_db_access_allowed()
     ensure_dirs()
     db_key = str(FORVEN_DB)
     conn = sqlite3.connect(db_key, timeout=60)
@@ -461,6 +482,7 @@ def get_db_best_effort(timeout_seconds: float = 0.25):
     Use this only for telemetry/state writes where dropping an update is better
     than blocking an async loop behind SQLite contention.
     """
+    _assert_db_access_allowed()
     ensure_dirs()
     timeout = max(float(timeout_seconds), 0.0)
     busy_timeout_ms = max(1, int(timeout * 1000))
@@ -501,6 +523,7 @@ def get_db_immediate():
     Use sparingly — an IMMEDIATE txn serializes writers, so it should wrap
     only the critical section that must be atomic.
     """
+    _assert_db_access_allowed()
     ensure_dirs()
     db_key = str(FORVEN_DB)
     conn = sqlite3.connect(db_key, timeout=60, isolation_level=None)
@@ -766,6 +789,7 @@ CREATE TABLE IF NOT EXISTS trades (
 CREATE TABLE IF NOT EXISTS strategies (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
+    display_name TEXT,
     type TEXT,
     runtime_type TEXT,
     symbol TEXT,
@@ -1871,6 +1895,10 @@ def _run_migrations(conn: sqlite3.Connection):
     _ensure_column(conn, "strategies", "stage", "TEXT DEFAULT 'quick_screen'")
     _ensure_column(conn, "strategies", "base_id", "INTEGER")
     _ensure_column(conn, "strategies", "display_id", "TEXT")
+    # Operator-editable friendly name that overrides the canonical {ASSET}-{TYPE}-{ID}
+    # name in the UI. NULL = fall back to the canonical name. Kept separate from `name`
+    # so the placeholder-repair pass and naming convention never clobber operator intent.
+    _ensure_column(conn, "strategies", "display_name", "TEXT")
     _ensure_column(conn, "strategies", "audit_summary", "JSON")
     _ensure_column(conn, "strategies", "market_pot", "TEXT")
     _ensure_column(conn, "strategies", "last_prefix", "TEXT")
@@ -2685,7 +2713,7 @@ def _run_migrations(conn: sqlite3.Connection):
     # CEO manual review lane removed: promote legacy CEO-owned strategies directly to deployment.
     conn.execute(
         "UPDATE strategies "
-        "SET stage = 'live_graduated', status = 'live_graduated', owner = 'execution-trader', stage_changed_at = ?, updated_at = ? "
+        "SET stage = 'live_graduated', status = 'live_graduated', owner = 'risk-manager', stage_changed_at = ?, updated_at = ? "
         "WHERE LOWER(TRIM(COALESCE(owner, ''))) = 'ceo' "
         "OR LOWER(TRIM(COALESCE(stage, status, ''))) IN ('ceo_review', 'ceoreview', 'ceo-review', 'review')",
         (now_iso, now_iso),
@@ -3540,6 +3568,18 @@ def kv_set(key: str, value):
         )
 
 
+def live_equity_baseline_kv_key(strategy_id: str) -> str:
+    """KV key holding a live strategy's go-live account equity baseline.
+
+    Stamped (by brain.transition_stage) with the REAL Hyperliquid account equity
+    at the moment a strategy graduates to live_graduated, so the live "Capital"
+    card can report a true return % against the equity it deployed against instead
+    of a fabricated $10k sandbox base. Read by api_domains.paper when building the
+    live session view.
+    """
+    return f"live_baseline:{str(strategy_id or '').strip()}"
+
+
 def kv_set_best_effort(key: str, value, *, timeout_seconds: float = 0.25) -> bool:
     """Set a KV value without blocking critical loops on SQLite contention."""
     try:
@@ -3880,47 +3920,234 @@ def get_recent_trades(limit: int = 20) -> list[dict]:
 _ALL_TRADE_COLUMNS = (
     "id, display_id, strategy, strategy_id, strategy_name, asset, symbol, direction, "
     "size, risk_pct, leverage, entry_price, signal_entry_price, fill_entry_price, "
-    "exit_price, signal_exit_price, fill_exit_price, status, execution_type, pnl, "
-    "pnl_pct, pnl_usd, signal_data, opened_at, closed_at, timeframe, source, created_at"
+    "exit_price, signal_exit_price, fill_exit_price, entry_slippage_bps, exit_slippage_bps, "
+    "status, execution_type, pnl, pnl_pct, pnl_usd, net_pnl_pct, fees_pct, book, "
+    "signal_data, opened_at, closed_at, timeframe, source, created_at"
 )
 
+# Whitelisted ledger sort columns (request key -> SQL expression). A request sort
+# that is not on this list falls back to opened_at, so a crafted ``?sort=`` can
+# never inject SQL — only these expressions ever reach ORDER BY.
+_TRADE_SORT_COLUMNS = {
+    "opened_at": "COALESCE(opened_at, created_at)",
+    "closed_at": "closed_at",
+    "pnl_usd": "COALESCE(pnl_usd, pnl)",
+    "pnl_pct": "COALESCE(net_pnl_pct, pnl_pct)",
+    "asset": "UPPER(COALESCE(asset, symbol, ''))",
+    "strategy": "UPPER(COALESCE(strategy_id, strategy, ''))",
+    "status": "UPPER(COALESCE(status, ''))",
+    "size": "size",
+    "leverage": "leverage",
+    "duration": "(julianday(COALESCE(closed_at, created_at)) - julianday(COALESCE(opened_at, created_at)))",
+}
 
-def get_all_trades(status: str | None = None, limit: int = 200, offset: int = 0) -> list[dict]:
-    """List trades across ALL statuses (newest first), optionally filtered by status.
 
-    Powers the operator trade-ledger view. ``get_open_trades`` only returns OPEN and
-    ``get_recent_trades`` has no status filter or pagination — this is the full ledger.
-    """
+def _build_trade_filters(
+    *,
+    status: str | None = None,
+    asset: str | None = None,
+    strategy: str | None = None,
+    direction: str | None = None,
+    execution_type: str | None = None,
+    opened_from: str | None = None,
+    opened_to: str | None = None,
+    search: str | None = None,
+) -> tuple[str, list]:
+    """Build a parameterized WHERE clause shared by the ledger list, count, and
+    stats so all three apply IDENTICAL filtering. Every value is bound, never
+    interpolated."""
+    clauses: list[str] = []
+    params: list = []
+
     norm_status = str(status or "").strip().upper()
+    if norm_status:
+        clauses.append("UPPER(COALESCE(status, '')) = ?")
+        params.append(norm_status)
+
+    norm_asset = str(asset or "").strip().upper()
+    if norm_asset:
+        clauses.append("UPPER(COALESCE(asset, symbol, '')) = ?")
+        params.append(norm_asset)
+
+    norm_dir = str(direction or "").strip().lower()
+    if norm_dir in ("long", "short"):
+        clauses.append("LOWER(COALESCE(direction, '')) = ?")
+        params.append(norm_dir)
+
+    norm_exec = str(execution_type or "").strip().lower()
+    if norm_exec:
+        clauses.append("LOWER(COALESCE(execution_type, '')) = ?")
+        params.append(norm_exec)
+
+    strat = str(strategy or "").strip()
+    if strat:
+        like = f"%{strat}%"
+        clauses.append(
+            "(strategy_id = ? OR strategy = ? OR display_id = ? "
+            "OR strategy_name LIKE ? OR strategy_id LIKE ? OR strategy LIKE ?)"
+        )
+        params.extend([strat, strat, strat, like, like, like])
+
+    dfrom = str(opened_from or "").strip()
+    if dfrom:
+        clauses.append("COALESCE(opened_at, created_at) >= ?")
+        params.append(dfrom)
+    dto = str(opened_to or "").strip()
+    if dto:
+        clauses.append("COALESCE(opened_at, created_at) <= ?")
+        params.append(dto)
+
+    q = str(search or "").strip()
+    if q:
+        like = f"%{q}%"
+        clauses.append(
+            "(id LIKE ? OR display_id LIKE ? OR asset LIKE ? OR symbol LIKE ? "
+            "OR strategy LIKE ? OR strategy_id LIKE ? OR strategy_name LIKE ?)"
+        )
+        params.extend([like] * 7)
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where, params
+
+
+def get_all_trades(
+    status: str | None = None,
+    limit: int = 200,
+    offset: int = 0,
+    *,
+    asset: str | None = None,
+    strategy: str | None = None,
+    direction: str | None = None,
+    execution_type: str | None = None,
+    opened_from: str | None = None,
+    opened_to: str | None = None,
+    search: str | None = None,
+    sort: str | None = None,
+    sort_dir: str | None = None,
+) -> list[dict]:
+    """List trades across ALL statuses with ledger filtering + whitelisted sort.
+
+    Powers the operator trade-ledger blotter. ``get_open_trades`` only returns OPEN
+    and ``get_recent_trades`` has no filter/sort/pagination — this is the full ledger.
+    """
     safe_limit = max(1, min(int(limit or 200), 1000))
     safe_offset = max(0, int(offset or 0))
-    where = ""
-    params: list = []
-    if norm_status:
-        where = "WHERE UPPER(COALESCE(status, '')) = ?"
-        params.append(norm_status)
-    params.extend([safe_limit, safe_offset])
+    where, params = _build_trade_filters(
+        status=status, asset=asset, strategy=strategy, direction=direction,
+        execution_type=execution_type, opened_from=opened_from, opened_to=opened_to,
+        search=search,
+    )
+    sort_expr = _TRADE_SORT_COLUMNS.get(
+        str(sort or "").strip().lower(), _TRADE_SORT_COLUMNS["opened_at"]
+    )
+    sort_sql = "ASC" if str(sort_dir or "").strip().lower() == "asc" else "DESC"
+    query_params = list(params) + [safe_limit, safe_offset]
     with get_db() as conn:
         rows = conn.execute(
             f"SELECT {_ALL_TRADE_COLUMNS} FROM trades {where} "
-            "ORDER BY COALESCE(opened_at, created_at) DESC, id DESC LIMIT ? OFFSET ?",
-            tuple(params),
+            f"ORDER BY {sort_expr} {sort_sql}, id DESC LIMIT ? OFFSET ?",
+            tuple(query_params),
         ).fetchall()
         return [dict(r) for r in rows]
 
 
-def count_trades(status: str | None = None) -> int:
-    """Count trades, optionally filtered by status (for ledger pagination totals)."""
-    norm_status = str(status or "").strip().upper()
+def count_trades(
+    status: str | None = None,
+    *,
+    asset: str | None = None,
+    strategy: str | None = None,
+    direction: str | None = None,
+    execution_type: str | None = None,
+    opened_from: str | None = None,
+    opened_to: str | None = None,
+    search: str | None = None,
+) -> int:
+    """Count trades matching the ledger filters (for pagination totals)."""
+    where, params = _build_trade_filters(
+        status=status, asset=asset, strategy=strategy, direction=direction,
+        execution_type=execution_type, opened_from=opened_from, opened_to=opened_to,
+        search=search,
+    )
     with get_db() as conn:
-        if norm_status:
-            row = conn.execute(
-                "SELECT COUNT(*) AS n FROM trades WHERE UPPER(COALESCE(status, '')) = ?",
-                (norm_status,),
-            ).fetchone()
-        else:
-            row = conn.execute("SELECT COUNT(*) AS n FROM trades").fetchone()
+        row = conn.execute(f"SELECT COUNT(*) AS n FROM trades {where}", tuple(params)).fetchone()
         return int(row["n"] if row else 0)
+
+
+def get_trades_stats(
+    status: str | None = None,
+    *,
+    asset: str | None = None,
+    strategy: str | None = None,
+    direction: str | None = None,
+    execution_type: str | None = None,
+    opened_from: str | None = None,
+    opened_to: str | None = None,
+    search: str | None = None,
+) -> dict:
+    """Aggregate blotter stats over the FULL filtered set (not just one page).
+
+    Realized metrics use the unambiguous DOLLAR P&L ``COALESCE(pnl_usd, pnl)`` over
+    CLOSED trades — deliberately sidestepping the pnl_pct unit-blend (kernel writes an
+    equity-fraction, legacy writes a margin-return). Open exposure is the sum of open
+    notional (size * entry price). Computed entirely in SQL so a large ledger never
+    streams every row into the API process.
+    """
+    where, params = _build_trade_filters(
+        status=status, asset=asset, strategy=strategy, direction=direction,
+        execution_type=execution_type, opened_from=opened_from, opened_to=opened_to,
+        search=search,
+    )
+    pnl = "COALESCE(pnl_usd, pnl)"
+    closed = "UPPER(COALESCE(status, '')) = 'CLOSED'"
+    notional = "ABS(COALESCE(size, 0) * COALESCE(fill_entry_price, entry_price, signal_entry_price, 0))"
+    sql = f"""
+        SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN UPPER(COALESCE(status,'')) = 'OPEN' THEN 1 ELSE 0 END) AS open_count,
+          SUM(CASE WHEN {closed} THEN 1 ELSE 0 END) AS closed_count,
+          SUM(CASE WHEN UPPER(COALESCE(status,'')) = 'FAILED' THEN 1 ELSE 0 END) AS failed_count,
+          SUM(CASE WHEN UPPER(COALESCE(status,'')) = 'OPEN' THEN {notional} ELSE 0 END) AS open_exposure,
+          SUM(CASE WHEN {closed} AND {pnl} IS NOT NULL THEN {pnl} ELSE 0 END) AS net_pnl,
+          SUM(CASE WHEN {closed} AND {pnl} > 0 THEN {pnl} ELSE 0 END) AS gross_profit,
+          SUM(CASE WHEN {closed} AND {pnl} < 0 THEN {pnl} ELSE 0 END) AS gross_loss,
+          SUM(CASE WHEN {closed} AND {pnl} > 0 THEN 1 ELSE 0 END) AS wins,
+          SUM(CASE WHEN {closed} AND {pnl} < 0 THEN 1 ELSE 0 END) AS losses,
+          MAX(CASE WHEN {closed} THEN {pnl} END) AS best,
+          MIN(CASE WHEN {closed} THEN {pnl} END) AS worst
+        FROM trades {where}
+    """
+    with get_db() as conn:
+        row = conn.execute(sql, tuple(params)).fetchone()
+    r = dict(row) if row else {}
+
+    wins = int(r.get("wins") or 0)
+    losses = int(r.get("losses") or 0)
+    decided = wins + losses
+    gross_profit = float(r.get("gross_profit") or 0.0)
+    gross_loss = float(r.get("gross_loss") or 0.0)  # <= 0
+    net_pnl = float(r.get("net_pnl") or 0.0)
+    return {
+        "total": int(r.get("total") or 0),
+        "open_count": int(r.get("open_count") or 0),
+        "closed_count": int(r.get("closed_count") or 0),
+        "failed_count": int(r.get("failed_count") or 0),
+        "open_exposure": float(r.get("open_exposure") or 0.0),
+        "net_pnl": net_pnl,
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
+        "wins": wins,
+        "losses": losses,
+        "decided": decided,
+        # win_rate / profit_factor / expectancy are None when undefined (no decided
+        # trades / no losses) so the UI renders "—"/"∞" instead of a misleading 0.
+        "win_rate": (wins / decided) if decided else None,
+        "profit_factor": (gross_profit / abs(gross_loss)) if gross_loss < 0 else None,
+        "avg_win": (gross_profit / wins) if wins else None,
+        "avg_loss": (gross_loss / losses) if losses else None,  # <= 0
+        "expectancy": (net_pnl / decided) if decided else None,
+        "best": (float(r["best"]) if r.get("best") is not None else None),
+        "worst": (float(r["worst"]) if r.get("worst") is not None else None),
+    }
 
 
 def get_open_trades(exclude_bots: bool = False) -> list[dict]:
@@ -4394,6 +4621,7 @@ def create_strategy_container(
     strategy_id: str | None = None,
     parent_strategy_id: str | None = None,
     origin_task_id: str | None = None,
+    sandbox_only: bool = False,
 ) -> tuple[str, str, int]:
     """Create a strategy container row with canonical immutable Sxxxxx IDs.
 
@@ -4472,7 +4700,8 @@ def create_strategy_container(
         "research_only": "strategy-developer",
         "gauntlet": "simulation-agent",
         "paper": "risk-manager",
-        "live_graduated": "execution-trader",
+        # execution-trader retired — live oversight owned by risk-manager.
+        "live_graduated": "risk-manager",
         "archived": None,
         "rejected": None,
     }
@@ -4482,8 +4711,8 @@ def create_strategy_container(
     normalized_origin_task_id = str(origin_task_id or "").strip() or None
     conn.execute(
         "INSERT INTO strategies "
-        "(id, name, type, runtime_type, symbol, timeframe, params, status, stage, owner, hypothesis_id, base_id, display_id, last_prefix, model, model_id, source, source_ref, stage_changed_at, audit_summary, parent_strategy_id, origin_task_id, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?)",
+        "(id, name, type, runtime_type, symbol, timeframe, params, status, stage, owner, hypothesis_id, base_id, display_id, last_prefix, model, model_id, source, source_ref, stage_changed_at, audit_summary, parent_strategy_id, origin_task_id, sandbox_only, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?)",
         (
             final_strategy_id,
             generated_name,
@@ -4506,6 +4735,7 @@ def create_strategy_container(
             now,
             normalized_parent,
             normalized_origin_task_id,
+            1 if sandbox_only else 0,
             now,
             now,
         ),
@@ -4788,7 +5018,8 @@ _STAGE_TO_OWNER_FOR_LOCK = {
     "quick_screen": "simulation-agent",
     "gauntlet": "simulation-agent",
     "paper": "risk-manager",
-    "live_graduated": "execution-trader",
+    # execution-trader retired — live oversight owned by risk-manager.
+    "live_graduated": "risk-manager",
 }
 
 
@@ -4841,9 +5072,6 @@ def _claim_ownership_for_task(conn: sqlite3.Connection, agent_id: str, task: sql
             except json.JSONDecodeError:
                 input_data = {}
         strategy_id = _extract_strategy_id(input_data if isinstance(input_data, dict) else None)
-
-    if normalized_agent == "execution-trader" and task_type == "execution":
-        return strategy_id or "ok", None
 
     # strategy-developer codes containers at any stage; ownership is irrelevant.
     if normalized_agent == "strategy-developer" and task_type in (
@@ -5288,8 +5516,19 @@ def append_strategy_event(
     owner_to: str | None = None,
     idempotency_key: str | None = None,
     details: object | None = None,
+    _lifecycle_authorized: bool = False,
 ) -> int | None:
-    """Append a lifecycle event for a strategy and return event id when created."""
+    """Append a lifecycle event for a strategy and return event id when created.
+
+    ``_lifecycle_authorized`` is an INTERNAL flag set only by the canonical,
+    approval-gated ``brain.transition_stage`` path. A stage CHANGE (``from`` !=
+    ``to``) recorded WITHOUT it is an out-of-band write (e.g. an autonomous agent
+    flipping a strategy out of ``live_graduated`` without operator approval — see
+    the S01601 post-mortem, 2026-06-28). Such writes are refused and surfaced as a
+    security alert rather than silently forging a transition. (All legitimate
+    callers either go through ``transition_stage`` or record SAME-stage annotation
+    events where ``from == to``, so this never blocks a real flow.)
+    """
     normalized_id = str(strategy_id).strip()
     if not normalized_id or not to_state:
         return None
@@ -5297,6 +5536,34 @@ def append_strategy_event(
     normalized_from = str(from_state or "").strip() or None
     normalized_to = str(to_state).strip()
     normalized_actor = str(actor or "").strip() or None
+    normalized_reason_preview = str(reason).strip() if reason is not None else None
+
+    # SECURITY tripwire: reject out-of-band stage changes (see docstring).
+    if normalized_from and normalized_to and normalized_from != normalized_to and not _lifecycle_authorized:
+        log.error(
+            "BLOCKED out-of-band stage-change event for %s: %s -> %s by actor=%r "
+            "(not routed through the approval-gated transition_stage)",
+            normalized_id, normalized_from, normalized_to, normalized_actor,
+        )
+        try:
+            log_activity(
+                "error",
+                "security",
+                f"BLOCKED out-of-band stage change for {normalized_id}: "
+                f"{normalized_from} -> {normalized_to} by {normalized_actor or 'unknown'} "
+                f"— not routed through the operator-approval lifecycle.",
+                {
+                    "strategy_id": normalized_id,
+                    "from_state": normalized_from,
+                    "to_state": normalized_to,
+                    "actor": normalized_actor,
+                    "attempted_reason": normalized_reason_preview,
+                    "blocked": "out_of_band_stage_change",
+                },
+            )
+        except Exception:
+            pass
+        return None
     normalized_owner_from = str(owner_from or "").strip() or None
     normalized_owner_to = str(owner_to or "").strip() or None
     normalized_reason = str(reason).strip() if reason is not None else None
@@ -6310,6 +6577,132 @@ def resolve_best_symbol(strategy_id: str) -> tuple[str | None, float, dict]:
     return symbol, fitness, metrics
 
 
+# ---------------------------------------------------------------------------
+# Capital-adjacent traded-asset freeze
+# ---------------------------------------------------------------------------
+# The paper scanner and live engine read strategies.symbol LIVE on every cycle to
+# decide which asset to trade. Re-homing a strategy that is ALREADY paper/live to a
+# different asset — e.g. an auto-assign or pinned-backtest sync picking a higher-
+# scoring cross-asset sweep result — makes a RUNNING strategy trade the wrong coin
+# and open cross-asset phantom positions (the 2026-06-29 incident: BTC strategies
+# S04667/S04736 were flipped to SOL mid-flight and opened phantom SOL paper trades).
+# Once a strategy reaches a capital-adjacent stage its traded asset is FROZEN: cross-
+# asset symbol re-homes are refused and audited so they are never again silent.
+CAPITAL_ADJACENT_STAGES: frozenset = frozenset(
+    {"paper", "paper_trading", "live", "live_graduated", "deployed", "active"}
+)
+
+
+def _symbol_asset_key(symbol: object) -> str:
+    """Reduce a symbol/pair to its bare asset key for cross-asset comparison
+    (``SOL/USDT`` -> ``SOL``, ``BTC`` -> ``BTC``). Kept local to db.py to avoid a
+    circular import of the scanner's equivalent normalizer."""
+    raw = str(symbol or "").strip().upper()
+    if not raw:
+        return ""
+    token = raw
+    for sep in ("/", ":", "-", "_", " "):
+        if sep in token:
+            token = token.split(sep, 1)[0]
+            break
+    for quote in ("USDT", "USD", "PERP"):
+        if token.endswith(quote) and len(token) > len(quote):
+            token = token[: -len(quote)]
+            break
+    return token.strip()
+
+
+def block_cross_asset_symbol_rehome(
+    conn: sqlite3.Connection,
+    strategy_id: str,
+    new_symbol: object,
+    *,
+    source: str,
+) -> bool:
+    """Enforce the capital-adjacent traded-asset freeze for a pending symbol write.
+
+    Returns True when a re-home of ``strategy_id`` to ``new_symbol`` MUST be skipped
+    because the strategy is already paper/live/deployed and ``new_symbol`` is a
+    DIFFERENT asset than its current symbol — flipping it would make a running
+    strategy trade the wrong coin. A same-asset change (``BTC`` -> ``BTC/USDT``) or a
+    pre-capital stage is never blocked. On a block it warn-logs and records an
+    audited same-stage strategy_event ON THE PASSED CONNECTION (no nested get_db, so
+    it is safe to call mid-transaction) — closing the silent-flip visibility gap.
+    """
+    row = conn.execute(
+        "SELECT stage, status, symbol FROM strategies WHERE id = ?",
+        (str(strategy_id),),
+    ).fetchone()
+    if row is None:
+        return False
+    stage = (str(row["stage"] or "").strip() or str(row["status"] or "").strip()).lower()
+    if stage not in CAPITAL_ADJACENT_STAGES:
+        return False
+    current_symbol = str(row["symbol"] or "")
+    current_key = _symbol_asset_key(current_symbol)
+    new_key = _symbol_asset_key(new_symbol)
+    # Allow when there is no real cross-asset CHANGE: no new asset, no current asset
+    # (initial assignment), or the same asset (e.g. BTC -> BTC/USDT canonicalization).
+    if not new_key or not current_key or new_key == current_key:
+        return False
+
+    log.warning(
+        "Refused cross-asset symbol re-home of capital-adjacent strategy %s (%s): "
+        "%s -> %s via %s; a running paper/live strategy's traded asset is frozen.",
+        strategy_id, stage, current_symbol, new_symbol, source,
+    )
+    try:
+        conn.execute(
+            """INSERT INTO strategy_events
+            (strategy_id, from_state, to_state, actor, reason, owner_from, owner_to,
+             idempotency_key, details_json, created_at)
+            VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)""",
+            (
+                str(strategy_id),
+                stage,
+                stage,
+                source,
+                "cross-asset symbol re-home blocked (capital-adjacent traded asset is frozen)",
+                _serialize_json_value(
+                    {
+                        "current_symbol": current_symbol,
+                        "blocked_symbol": str(new_symbol),
+                        "source": source,
+                    }
+                ),
+                _now(),
+            ),
+        )
+    except Exception:  # noqa: BLE001 — audit is best-effort, never blocks the guard
+        pass
+    return True
+
+
+def capital_adjacent_pin_asset_conflict(
+    conn: sqlite3.Connection, strategy_id: str, pin_symbol: object
+) -> tuple[bool, str | None, str | None]:
+    """Return ``(conflict, stage, current_symbol)``. ``conflict`` is True when
+    ``strategy_id`` is capital-adjacent (paper/live/deployed) AND ``pin_symbol`` is a
+    DIFFERENT asset than its current symbol — pinning that backtest would imply
+    re-homing a running, frozen-asset strategy, so it is refused at the API boundary.
+    Pure read; the caller decides how to surface the conflict."""
+    row = conn.execute(
+        "SELECT stage, status, symbol FROM strategies WHERE id = ?",
+        (str(strategy_id),),
+    ).fetchone()
+    if row is None:
+        return False, None, None
+    stage = (str(row["stage"] or "").strip() or str(row["status"] or "").strip()).lower()
+    current_symbol = str(row["symbol"] or "")
+    if stage not in CAPITAL_ADJACENT_STAGES:
+        return False, stage, current_symbol
+    pin_key = _symbol_asset_key(pin_symbol)
+    cur_key = _symbol_asset_key(current_symbol)
+    if not pin_key or not cur_key or pin_key == cur_key:
+        return False, stage, current_symbol
+    return True, stage, current_symbol
+
+
 def auto_assign_best_symbol_timeframe(strategy_id: str) -> tuple[str, str] | None:
     """Assign the best symbol/timeframe context from stored backtest results."""
     best_symbol, best_timeframe, fitness, _ = resolve_best_symbol_timeframe(strategy_id)
@@ -6328,6 +6721,13 @@ def auto_assign_best_symbol_timeframe(strategy_id: str) -> tuple[str, str] | Non
         old_timeframe = str(row["timeframe"] or "").strip().lower() or "1h"
         if old_symbol == best_symbol and old_timeframe == best_timeframe:
             return best_symbol, best_timeframe
+
+        # Traded-asset freeze: never re-home a running paper/live strategy onto a
+        # higher-scoring cross-asset sweep result — keep its promoted asset.
+        if block_cross_asset_symbol_rehome(
+            conn, strategy_id, best_symbol, source="auto_assign_best_symbol_timeframe"
+        ):
+            return old_symbol, old_timeframe
 
         new_name = build_strategy_container_name(
             symbol=best_symbol,

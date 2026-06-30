@@ -11,6 +11,7 @@
 		getReplayBars,
 		getSessionIndicators,
 		getTradeMarkers,
+		getPaperSessionChart,
 		getPaperTrades,
 		closePaperPosition,
 		partialClosePaperPosition,
@@ -184,6 +185,9 @@
 	// Selected session
 	let selectedSession: PaperTradingSession | null = null;
 	let sessionTrades: PaperTrade[] = [];
+	// One-shot: a strategy id from a ?select= deep-link (e.g. the All Trades blotter)
+	// to select THAT strategy's existing session on the next session load.
+	let preselectStrategyId: string | null = null;
 
 	// Visual replay state
 	let showVisualReplay = false;
@@ -200,6 +204,10 @@
 	let subIndicators: IndicatorConfig[] = [];
 	let entryMarkers: SignalMarker[] = [];
 	let exitMarkers: SignalMarker[] = [];
+	// Full-history strategy triggers (entry/exit signals incl. pre-live) + active
+	// position levels (SL/TP/trailing) — fed to the chart by the parity bundle.
+	let triggerMarkers: SignalMarker[] = [];
+	let positionPriceLines: Array<{ id: string; price: number; color?: string; title?: string; dashed?: boolean }> = [];
 	let blockedMarkers: TradeMarker[] = [];
 	let indicatorConfig: Record<string, SessionIndicatorConfig> = {};
 	let sessionIndicatorHistory: SessionIndicatorsResponse['indicators'] = {};
@@ -234,6 +242,7 @@
 	let selectedSessionRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 	let livePriceUnsubscribe: (() => void) | null = null;
 	let forvenEventUnsubscribe: (() => void) | null = null;
+	let selectSessionUnsubscribe: (() => void) | null = null;
 	let latestLivePrices: Record<string, number> = {};
 	const compatSessionPrefix = 'compat:strategy:';
 
@@ -255,6 +264,32 @@
 		if (!isCompatSession(session)) return false;
 		const kind = String((session as Record<string, unknown> | null | undefined)?.compat_kind ?? '').toLowerCase();
 		return kind === 'deployed';
+	}
+
+	// Capital to render on a card: deployed/live -> the REAL Hyperliquid wallet equity
+	// (account_value); paper -> the simulated sandbox capital. Returns null for a
+	// deployed session whose real balance has not synced yet, so the UI shows
+	// "balance unavailable" instead of the fabricated $10k sandbox base.
+	function displayCapital(session: PaperTradingSession | null | undefined): number | null {
+		if (!session) return null;
+		if (isDeployedCompatSession(session)) {
+			// Nullish FIRST — Number(null) === 0 would render a fabricated "$0.00 · real"
+			// wallet for a deployed session whose balance hasn't synced (account_value null).
+			if (session.account_value == null) return null;
+			const v = Number(session.account_value);
+			return Number.isFinite(v) ? v : null;
+		}
+		const c = Number(session.capital);
+		return Number.isFinite(c) ? c : null;
+	}
+
+	// 'real' when a deployed session is showing a genuine exchange balance,
+	// 'unavailable' when it is deployed but the balance has not synced, else null
+	// (paper). Drives the small tag next to the live Capital figure.
+	function balanceState(session: PaperTradingSession | null | undefined): 'real' | 'unavailable' | null {
+		if (!isDeployedCompatSession(session)) return null;
+		const src = String(session?.balance_source ?? '').toLowerCase();
+		return src === 'exchange' || src === 'books_aggregate' ? 'real' : 'unavailable';
 	}
 
 	// Manual controls are enabled for every compat session — paper AND deployed/live.
@@ -310,8 +345,16 @@
 			price: marker.price,
 			type,
 			direction: markerDirection(marker),
-			label: markerLabel(marker, type),
+			// Prefer the backend's short on-chart text (BUY/SELL/SHORT/COVER); fall
+			// back to the derived verbose label for legacy payloads.
+			label: marker.label ?? markerLabel(marker, type),
 			source: markerSource(marker),
+			// Forward the self-describing visuals so the chart renders straight from
+			// the payload (ChartWorkspace falls back to direction when absent).
+			...(marker.side ? { side: marker.side } : {}),
+			...(marker.action ? { action: marker.action } : {}),
+			...(marker.shape ? { shape: marker.shape } : {}),
+			...(marker.color ? { color: marker.color } : {}),
 		};
 	}
 
@@ -381,6 +424,8 @@
 		nextUrl.searchParams.delete('strategy');
 		nextUrl.searchParams.delete('symbol');
 		nextUrl.searchParams.delete('timeframe');
+		nextUrl.searchParams.delete('select');
+		nextUrl.searchParams.delete('view');
 		const nextPath = `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`;
 		const currentPath = `${window.location.pathname}${window.location.search}${window.location.hash}`;
 		if (nextPath !== currentPath) {
@@ -494,6 +539,22 @@
 				timestamp: indicatorTimestamp,
 			},
 		};
+
+		// Deployed/live sessions: capital, total_pnl and the position's unrealized P&L
+		// are REAL exchange values supplied by the server. A price tick must NOT
+		// recompute them off the synthetic initial_capital — that would re-fake the
+		// live equity between server refreshes. Update only the live price line/marker.
+		if (isDeployedCompatSession(session)) {
+			if (Math.abs((session.current_price ?? 0) - nextPrice) < 1e-9) {
+				return session;
+			}
+			return {
+				...session,
+				current_price: nextPrice,
+				position: session.position ? { ...session.position, current_price: nextPrice } : session.position,
+				indicators: nextIndicators,
+			};
+		}
 
 		if (!session.position) {
 			if (Math.abs((session.current_price ?? 0) - nextPrice) < 1e-9) {
@@ -735,17 +796,11 @@
 	async function loadLiveChart() {
 		if (!selectedSession) return;
 		const sessionId = selectedSession.id;
-		const chartTimeframe = activeVisualChartTimeframe;
 		if (chartBars.length === 0) {
 			loadingBars = true;
 		}
 		try {
-			const liveBars = await getReplayBars(sessionId, 500, chartTimeframe);
-			if (selectedSession?.id !== sessionId) return;
-			chartBars = [...liveBars];
-			applyLatestRealtimeSnapshot();
-			loadingBars = false;
-			void loadIndicatorsAndMarkers(sessionId);
+			await loadChartBundle(sessionId);
 		} catch (e) {
 			console.error('Failed to load live chart:', e);
 		} finally {
@@ -894,6 +949,10 @@
 			const eventHandler = () => handleForvenRealtimeEvent();
 			window.addEventListener('forven:event', eventHandler);
 			forvenEventUnsubscribe = () => window.removeEventListener('forven:event', eventHandler);
+
+			const selectHandler = (event: Event) => handleSelectSessionRequest(event);
+			window.addEventListener('forven:select-session', selectHandler);
+			selectSessionUnsubscribe = () => window.removeEventListener('forven:select-session', selectHandler);
 		}
 
 		const strategyParam = $page.url.searchParams.get('strategy');
@@ -901,7 +960,11 @@
 		const timeframeParam = $page.url.searchParams.get('timeframe');
 		const hasExplicitCreateIntent = Boolean(strategyParam || symbolParam || timeframeParam);
 		let hasWorkspacePrefillIntent = false;
-		if (hasExplicitCreateIntent && allowsSessionEditing) {
+		// ?select=<strategyId> means "select that strategy's existing session" (a
+		// deep-link from the All Trades blotter) — distinct from ?strategy= which
+		// pre-fills the NEW-session form.
+		preselectStrategyId = $page.url.searchParams.get('select');
+		if (hasExplicitCreateIntent || preselectStrategyId) {
 			clearPrefillQueryParams();
 		}
 
@@ -953,6 +1016,8 @@
 		livePriceUnsubscribe = null;
 		forvenEventUnsubscribe?.();
 		forvenEventUnsubscribe = null;
+		selectSessionUnsubscribe?.();
+		selectSessionUnsubscribe = null;
 		stopLiveChartPolling();
 		stopSelectedSessionSync();
 		if (typeof window !== 'undefined') {
@@ -989,10 +1054,22 @@
 			});
 			sessions = loadedSessions;
 
-			const keepArchivedSelection = Boolean(selectedArchivedStrategy && !selectedSession);
-			const preferredId = selectedSession?.id ?? readStoredSelectedSessionId();
+			// Resolve a ?select= deep-link (strategy id -> its session) ONCE on the
+			// initial load; it overrides the stored/first-session default so the
+			// blotter lands the operator on that strategy's trade.
+			let preselectId: string | null = null;
+			if (preselectStrategyId) {
+				const match = loadedSessions.find(
+					(s) => s.strategy_id === preselectStrategyId || s.id === preselectStrategyId
+				);
+				if (match) preselectId = match.id;
+				preselectStrategyId = null;
+			}
+			const keepArchivedSelection = Boolean(selectedArchivedStrategy && !selectedSession) && !preselectId;
+			const preferredId = preselectId ?? selectedSession?.id ?? readStoredSelectedSessionId();
 			const preferredSession = getPreferredSession(loadedSessions, preferredId);
 			if (preferredSession && !keepArchivedSelection) {
+				if (preselectId) writeStoredSelectedSessionId(preferredSession.id);
 				if (selectedSession?.id !== preferredSession.id) {
 					selectSession(preferredSession);
 				} else {
@@ -1073,7 +1150,7 @@
 		editSessionStrategy = session.strategy_name;
 		editSessionSymbol = session.symbol;
 		editSessionTimeframe = session.timeframe;
-		editSessionCapital = session.initial_capital;
+		editSessionCapital = session.initial_capital ?? 10000;
 		editSessionPositionSize = session.position_size_pct;
 		editSessionStopLoss = session.stop_loss_pct;
 		editSessionTakeProfit = session.take_profit_pct;
@@ -1345,6 +1422,24 @@
 		void loadSessionTrades(session.id);
 	}
 
+	async function handleSelectSessionRequest(event: Event) {
+		const detail = (event as CustomEvent<{ sessionId?: string }>).detail ?? {};
+		const sessionId = String(detail.sessionId ?? '').trim();
+		if (!sessionId) return;
+		// Already selected — nothing to switch, just make sure it's the visible panel.
+		if (selectedSession?.id === sessionId) {
+			showNewSession = false;
+			return;
+		}
+		let target = sessions.find((s) => s.id === sessionId);
+		if (!target) {
+			// Stale list (e.g. position opened since the last poll) — refresh once.
+			await loadSessions();
+			target = sessions.find((s) => s.id === sessionId);
+		}
+		if (target) selectSession(target);
+	}
+
 	function updateSession(updated: PaperTradingSession) {
 		sessions = sessions.map(s => s.id === updated.id ? updated : s);
 		if (selectedSession?.id === updated.id) {
@@ -1456,6 +1551,65 @@
 		}
 		lastIndicatorCursor = cursor;
 		await loadIndicatorsAndMarkers(sessionId);
+	}
+
+	// Parity overhaul: one bundle call returns bars + REAL registry indicators +
+	// full-history triggers + actual trade markers — all matching what paper trades.
+	async function loadChartBundle(sessionId: string) {
+		const chartTimeframe = activeVisualChartTimeframe;
+		let bundle;
+		try {
+			bundle = await getPaperSessionChart(sessionId, { limit: 2000, timeframe: chartTimeframe });
+		} catch (e) {
+			console.error('Failed to load chart bundle:', e);
+			return;
+		}
+		if (selectedSession?.id !== sessionId) return;
+
+		chartBars = [...(bundle.bars ?? [])];
+		applyLatestRealtimeSnapshot();
+		loadingBars = false;
+
+		const toConfig = (s: { name: string; panel: string; color?: string; data: Array<{ timestamp: string; value: number | null }> }): IndicatorConfig => ({
+			id: s.name,
+			name: s.name,
+			params: {},
+			color: s.color || getIndicatorColor(s.name),
+			panel: s.panel === 'main' ? 'main' : 'sub1',
+			visible: indicatorVisibility[s.name] ?? true,
+			data: s.data
+				.filter((p) => p.value !== null && p.value !== undefined)
+				.map((p) => ({ timestamp: p.timestamp, value: p.value as number })),
+		});
+		mainIndicators = (bundle.main_indicators ?? []).map(toConfig);
+		subIndicators = (bundle.sub_indicators ?? []).map(toConfig);
+		for (const s of [...(bundle.main_indicators ?? []), ...(bundle.sub_indicators ?? [])]) {
+			if (!(s.name in indicatorVisibility)) indicatorVisibility[s.name] = true;
+		}
+		indicatorVisibility = indicatorVisibility;
+
+		applyTradeMarkers({ entries: bundle.entry_markers ?? [], exits: bundle.exit_markers ?? [], blocked: [] });
+		triggerMarkers = [
+			...(bundle.trigger_entries ?? []).map((m) => toSignalMarker(m, 'entry')),
+			...(bundle.trigger_exits ?? []).map((m) => toSignalMarker(m, 'exit')),
+		];
+
+		// Active order lines for the open position: a solid blue ENTRY line drawn for
+		// the whole hold, plus DASHED red SL / green TP / amber Trail lines (the
+		// TradingView-standard look for active orders). Prefer the backend's
+		// self-describing levels; fall back to the open position's entry price.
+		const levels = bundle.active_levels ?? { stop: [], take_profit: [], trail: [], entry: [] };
+		const lines: typeof positionPriceLines = [];
+		const entryLevel = (levels.entry ?? [])[0];
+		const fallbackEntry = Number(selectedSession?.position?.entry_price);
+		const entryPrice = entryLevel?.price ?? (Number.isFinite(fallbackEntry) ? fallbackEntry : undefined);
+		if (entryPrice !== undefined && (entryLevel || selectedSession?.position)) {
+			lines.push({ id: 'entry', price: entryPrice, color: '#3b82f6', title: 'ENTRY', dashed: false });
+		}
+		for (const s of levels.stop ?? []) lines.push({ id: 'sl', price: s.price, color: '#ef4444', title: 'SL', dashed: true });
+		for (const t of levels.take_profit ?? []) lines.push({ id: 'tp', price: t.price, color: '#22c55e', title: 'TP', dashed: true });
+		for (const tr of levels.trail ?? []) lines.push({ id: 'trail', price: tr.price, color: '#f59e0b', title: 'Trail', dashed: true });
+		positionPriceLines = lines;
 	}
 
 	function toggleIndicatorVisibility(name: string) {
@@ -2494,7 +2648,15 @@
 									{session.symbol} | {session.timeframe} | {session.mode}
 								</div>
 								<div class="text-[10px] w-full flex justify-between">
-									<span class="text-gray-600">{formatPrice(session.capital)}</span>
+									{#if isDeployedCompatSession(session)}
+										{#if balanceState(session) === 'real'}
+											<span class="text-gray-600" title="Real Hyperliquid balance">{formatPrice(displayCapital(session))}</span>
+										{:else}
+											<span class="text-amber-500" title="Live balance not synced yet">— bal n/a</span>
+										{/if}
+									{:else}
+										<span class="text-gray-600">{formatPrice(session.capital)}</span>
+									{/if}
 									{#if session.position}
 										<span class="{session.position.unrealized_pnl > 0 ? 'text-green-400' : session.position.unrealized_pnl < 0 ? 'text-red-400' : 'text-gray-400'}">
 											[{formatDollarPnl(session.position.unrealized_pnl)} {formatPercent(session.position.unrealized_pnl_pct)}]
@@ -2639,7 +2801,23 @@
 					</span>
 					<span>
 						<span class="text-gray-500">Capital</span>
-						<span class="text-white font-bold ml-1">{formatPrice(selectedSession.capital)}</span>
+						{#if isLiveSelected}
+							{#if balanceState(selectedSession) === 'real'}
+								<span class="text-white font-bold ml-1">{formatPrice(displayCapital(selectedSession))}</span>
+								<span
+									class="text-[9px] uppercase tracking-wider text-green-500 ml-1"
+									title="Real Hyperliquid balance{selectedSession.account_synced_at ? ` (synced ${selectedSession.account_synced_at})` : ''}"
+								>real{selectedSession.account_network ? ` · ${selectedSession.account_network}` : ''}</span>
+							{:else}
+								<span class="text-amber-400 font-bold ml-1">—</span>
+								<span
+									class="text-[9px] uppercase tracking-wider text-amber-400 ml-1"
+									title="The live Hyperliquid balance has not synced yet (daemon/exchange). No fabricated value is shown."
+								>balance unavailable</span>
+							{/if}
+						{:else}
+							<span class="text-white font-bold ml-1">{formatPrice(selectedSession.capital)}</span>
+						{/if}
 					</span>
 					<span>
 						<span class="text-gray-500">P&L</span>
@@ -2903,7 +3081,15 @@
 							{/if}
 						{/if}
 						<span class="text-gray-500">Capital</span>
-						<span class="text-gray-300">{formatPrice(selectedSession.initial_capital)}</span>
+						{#if isLiveSelected}
+							{#if balanceState(selectedSession) === 'real'}
+								<span class="text-gray-300">{formatPrice(displayCapital(selectedSession))}</span>
+							{:else}
+								<span class="text-amber-400">balance unavailable</span>
+							{/if}
+						{:else}
+							<span class="text-gray-300">{formatPrice(selectedSession.initial_capital)}</span>
+						{/if}
 						<span class="text-gray-500">Position Size</span>
 						<span class="text-gray-300">{selectedSession.position_size_pct}%</span>
 						{#if selectedSession.mode === 'replay'}
@@ -3173,6 +3359,8 @@
 											data={chartBars}
 											entryMarkers={entryMarkers}
 											exitMarkers={exitMarkers}
+											triggerMarkers={triggerMarkers}
+											priceLines={positionPriceLines}
 											mainIndicators={mainIndicators.filter(i => i.visible !== false)}
 											subIndicators={subIndicators.filter(i => i.visible !== false)}
 											strategyName={selectedSession.strategy_name}
