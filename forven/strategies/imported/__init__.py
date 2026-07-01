@@ -9,6 +9,6 @@ them by construction. They are imported and executed exclusively inside the
 locked-down subprocess worker (``forven.sandbox.strategy_worker``), which runs with
 a secret-free environment, network denied, filesystem confined, and resource caps.
 
-See docs/strategy-share-security-audit-2026-06-29.md (R2). The package marker is
+See the 2026-06 strategy-import security audit (R2). The package marker is
 committed; the strategy modules inside remain gitignored local files.
 """

@@ -1692,8 +1692,8 @@ def import_strategy_container(payload: object) -> dict:
     # creds, and the DB reachable. The AST guard (hardened in the same audit) is
     # defense-in-depth, NOT a trust boundary, and the confused-deputy channel
     # (allowlisted forven.scanner/data/data_manager) needs no guard bypass at all.
-    # Until that lifecycle runs OUT-OF-PROCESS (docs/strategy-share-security-audit-
-    # 2026-06-29.md, R2), refuse to execute shared code. Param/registry-type
+    # Until that lifecycle runs OUT-OF-PROCESS (the 2026-06 strategy-import security
+    # audit, R2), refuse to execute shared code. Param/registry-type
     # strategies are reconstructed from their definition below and are unaffected.
     source_code = payload.get("source_code") if isinstance(payload.get("source_code"), dict) else None
     if source_code and str(source_code.get("content") or "").strip():
@@ -1775,7 +1775,7 @@ def _import_code_strategy(source_code: dict, source_id: str, warnings: list[str]
     locked-down worker subprocess, and registered as a ``sandbox_only`` container.
     Its code is never imported into the host process; every later execution
     (gauntlet/backtest/scanner) is routed through the worker. Never overwrites a
-    differing local file. See docs/strategy-share-security-audit-2026-06-29.md (R2).
+    differing local file. See the 2026-06 strategy-import security audit (R2).
     """
     import re as _re
     from pathlib import Path

@@ -10,7 +10,7 @@ worker (by type + params, over parquet). Its in-process ``generate_signal`` /
 ``generate_signals`` FAIL CLOSED: if anything ever tries to run the strategy in the
 parent, it raises rather than executing author-controlled code.
 
-See docs/strategy-share-security-audit-2026-06-29.md (R2).
+See the 2026-06 strategy-import security audit (R2).
 """
 from __future__ import annotations
 

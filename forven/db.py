@@ -35,7 +35,7 @@ _WAL_CONFIGURED_PATHS: set[str] = set()
 # funnel DB reads, secret decryption (kv_get), trade tampering and settings /
 # kill-switch writes through the connection factories below. Refusing a connection
 # here is the boundary that makes a guard bypass inert (see
-# docs/strategy-share-security-audit-2026-06-29.md, R3). The parent process never
+# the 2026-06 strategy-import security audit, R3). The parent process never
 # sets this flag, so the guard is a no-op outside the sandbox.
 _STRATEGY_WORKER_FLAG = "FORVEN_IN_STRATEGY_WORKER"
 
