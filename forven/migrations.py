@@ -209,7 +209,7 @@ def _m_2026_06_strategy_sandbox_only(conn: sqlite3.Connection) -> None:
     forven/strategies/imported/ (invisible to in-process discovery) and this flag
     is the durable, authoritative record that its execution must be routed through
     the locked-down subprocess worker (the file path / source label are not a trust
-    boundary). See docs/strategy-share-security-audit-2026-06-29.md (R2).
+    boundary). See the 2026-06 strategy-import security audit (R2).
     """
     strat_cols = {
         row[1] for row in conn.execute("PRAGMA table_info(strategies)").fetchall()

@@ -31,7 +31,7 @@ timeout, so the discover() cost is amortized rather than paid per call.
 NOTE (Phase 2 status): this is the isolation primitive + a persistent worker. Wiring it
 into the backtest/scanner hot paths — so the parent stops importing custom strategy code
 and delegates per-bar execution too — is the remaining increment (see
-docs/security-hardening-plan.md). A strategy run here sees ONLY the input frame (no DB,
+the 2026-06 security-hardening plan). A strategy run here sees ONLY the input frame (no DB,
 no network), so the trusted parent must enrich the df with any funding/OI/cross-asset
 columns before delegating.
 """
@@ -113,7 +113,7 @@ def _install_network_deny() -> None:
     bypass reaches a socket via a transitive import. Loopback is denied too: the
     worker needs no network of any kind, and a bypass must not reach the local
     control plane (``127.0.0.1:8003``) for SSRF against the trusted host
-    (docs/strategy-share-security-audit-2026-06-29.md, R3)."""
+    (the 2026-06 strategy-import security audit, R3)."""
     try:
         import socket
     except Exception:
@@ -194,7 +194,7 @@ def _validate_custom_module(workdir: Path) -> dict:
     """Import + probe + certify + lookahead-scan one CUSTOM strategy module entirely
     inside the locked-down child, returning ONLY JSON metadata.
 
-    This is the lifecycle the audit (docs/strategy-share-security-audit-2026-06-29.md)
+    This is the lifecycle the 2026-06 strategy-import security audit
     found unguarded: ``register_custom_strategy_file`` runs the untrusted module's
     top-level code (importlib.import_module), its ``__init__`` (probe construction)
     and ``generate_signals`` (lookahead probe) IN THE TRUSTED PARENT. Here the same

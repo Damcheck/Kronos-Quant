@@ -18,7 +18,7 @@ caps (file bytes + line count).
 
 NOT a complete trust boundary by itself — a static scan can never be. It is
 defense-in-depth that shrinks the surface; the real boundary is out-of-process
-execution (Phase 2, see docs/security-hardening-plan.md).
+execution (Phase 2, see the 2026-06 security-hardening plan).
 """
 from __future__ import annotations
 
@@ -96,7 +96,7 @@ ALLOWED_IMPORTS: frozenset[str] = frozenset(
 # forven.exchange / forven.db / forven.secret_storage / forven.config / forven.auth /
 # forven.brain — which expose orders, the database, and credentials.
 #
-# REMOVED for R3 (docs/strategy-share-security-audit-2026-06-29.md):
+# REMOVED for R3 (the 2026-06 strategy-import security audit):
 #  • forven.scanner — re-exports get_db / kv_get / _execute_direct (DB + secret-decrypt
 #    + live-order sink). Strategies only ever needed its PURE indicator helpers
 #    (rsi/atr/adx/...), which are now re-exported by forven.strategies.indicators (a

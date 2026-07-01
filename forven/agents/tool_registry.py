@@ -120,7 +120,7 @@ _CONTEXT_DEFAULT_DENY: dict[str, frozenset[str]] = {
     # prompt-injected develop task must never reach a catastrophic primitive
     # (factory_reset wipes the pipeline DB), so deny that. The real containment for
     # the inject→register→execute chain is the AST guard (P1.2) + out-of-process
-    # execution (Phase 2, see docs/security-hardening-plan.md). (audit P1.1)
+    # execution (Phase 2, see the 2026-06 security-hardening plan). (audit P1.1)
     "develop": frozenset({"catastrophic"}),
 }
 

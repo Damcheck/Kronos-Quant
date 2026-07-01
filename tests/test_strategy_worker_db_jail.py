@@ -10,7 +10,7 @@ secrets. The boundary is the DB connection factory itself: it refuses every
 connection while the worker flag is set. These tests assert that invariant and
 that the parent is unaffected.
 
-See docs/strategy-share-security-audit-2026-06-29.md (R3).
+See the 2026-06 strategy-import security audit (R3).
 """
 
 import pytest

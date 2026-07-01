@@ -16,7 +16,7 @@ BYPASS_PAYLOADS = {
     # untrusted allowlist — forven.scanner (re-exports get_db/kv_get/_execute_direct),
     # forven.strategies.sentiment (live funding fetch), forven.data / forven.data_manager
     # (ccxt/requests/Path-shutil). Strategies use the forven.strategies.indicators facade
-    # instead. See docs/strategy-share-security-audit-2026-06-29.md.
+    # instead. See the 2026-06 strategy-import security audit.
     "r3_scanner_db_handle": "from forven.scanner import get_db\n",
     "r3_scanner_indicator": "from forven.scanner import atr\n",
     "r3_scanner_module": "import forven.scanner as sc\nsc.kv_get('forven:settings')\n",

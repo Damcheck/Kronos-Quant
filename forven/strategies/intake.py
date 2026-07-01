@@ -659,7 +659,7 @@ def register_imported_strategy_file(
     worker subprocess; only JSON metadata returns. The DB row is flagged
     ``sandbox_only=1`` with ``runtime_type=imported__<module>``, so every later
     execution (gauntlet/backtest/scanner) is routed through the worker and the parent
-    never imports the module. See docs/strategy-share-security-audit-2026-06-29.md (R2).
+    never imports the module. See the 2026-06 strategy-import security audit (R2).
     """
     from pathlib import Path
 

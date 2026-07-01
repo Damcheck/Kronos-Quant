@@ -6,7 +6,7 @@ into the filename raw and ``symbol_to_fs`` does not strip ``..``/``\\``/``:``, s
 crafted symbol/timeframe was a path-traversal write-/read-anywhere primitive. These
 tests assert legitimate datasets still resolve and any traversal attempt is rejected.
 
-See docs/security-hardening-plan.md (P3.1).
+See the 2026-06 security-hardening plan (P3.1).
 """
 
 import pytest

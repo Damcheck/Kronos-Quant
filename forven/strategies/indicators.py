@@ -842,7 +842,7 @@ __all__ = [
 # Untrusted (custom/imported) strategies may import ``forven.strategies.indicators``
 # (allowlisted) but NOT ``forven.scanner`` — which also re-exports get_db / kv_get /
 # _execute_direct, the confused-deputy surface (see
-# docs/strategy-share-security-audit-2026-06-29.md, R3). These names are the PURE,
+# the 2026-06 strategy-import security audit, R3). These names are the PURE,
 # stateless indicator helpers strategies legitimately need (df -> Series, no DB /
 # network / global state), re-exported from their canonical home in ``forven.scanner``
 # so there is a single implementation. The re-export is LAZY (PEP 562 module hook):

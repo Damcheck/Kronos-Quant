@@ -13,7 +13,7 @@ How updating a self-hosted Forven install behaves, and the few things worth know
 
 A full audit of the paper + live trading engine fixed both critical findings and all 19
 high-severity findings (kernel-path safety parity, promotion-gate integrity, restart/freeze
-recovery, live-exchange edge cases). Full report: [`paper-live-engine-audit-2026-06-28.md`](paper-live-engine-audit-2026-06-28.md).
+recovery, live-exchange edge cases).
 
 ### What happens automatically (no action needed)
 
@@ -80,8 +80,7 @@ recovery, live-exchange edge cases). Full report: [`paper-live-engine-audit-2026
 ## Security hardening release (2026-06)
 
 A security audit closed an in-process strategy-import RCE chain and tightened the sandbox. Most
-of it is transparent; a few things are worth knowing. Full report:
-[`strategy-share-security-audit-2026-06-29.md`](strategy-share-security-audit-2026-06-29.md).
+of it is transparent; a few things are worth knowing.
 
 ### What happens automatically (no action needed)
 
