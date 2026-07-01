@@ -1150,6 +1150,18 @@ class TogetherProvider(_OpenAICompatProvider):
     DEFAULT_BASE_URL = "https://api.together.xyz/v1"
 
 
+class NvidiaProvider(_OpenAICompatProvider):
+    """NVIDIA NIM (build.nvidia.com) — OpenAI-compatible Chat Completions.
+
+    Serves many open models (Llama, Nemotron, DeepSeek, Qwen, Mistral, Kimi) at
+    ``integrate.api.nvidia.com/v1`` with ``nvapi-`` Bearer keys. Tool/function
+    calling is supported on the instruct/chat families the agent loop uses.
+    """
+
+    PROVIDER = "nvidia"
+    DEFAULT_BASE_URL = "https://integrate.api.nvidia.com/v1"
+
+
 # ---------------------------------------------------------------------------
 # OpenCode Zen / OpenCode GO — OpenAI-compatible coding-model gateways
 # ---------------------------------------------------------------------------
@@ -1244,6 +1256,8 @@ def _construct_provider(name: str) -> ToolCallProvider:
         return XAIProvider()
     if name == "together":
         return TogetherProvider()
+    if name == "nvidia":
+        return NvidiaProvider()
     if name == "opencode-zen":
         return OpenCodeZenProvider()
     if name == "opencode-go":

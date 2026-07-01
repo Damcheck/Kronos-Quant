@@ -25,6 +25,7 @@ _SUPPORTED_PROVIDERS: tuple[str, ...] = (
     "mistral",
     "xai",
     "together",
+    "nvidia",
     "opencode-zen",
     "opencode-go",
 )
@@ -48,6 +49,7 @@ _ZAI_PRIMARY_PROVIDER_PRIORITY = [
     "mistral",
     "xai",
     "together",
+    "nvidia",
     # Paid coding-model gateways — below the free tiers by default.
     "opencode-zen",
     "opencode-go",
@@ -121,6 +123,7 @@ _DEFAULT_MODEL_ROUTING = {
         "mistral": "mistral-small-latest",
         "xai": "grok-3-mini",
         "together": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        "nvidia": "meta/llama-3.3-70b-instruct",
         "opencode-zen": "grok-code",
         "opencode-go": "glm-5.2",
     },
@@ -167,6 +170,9 @@ _DEFAULT_MODEL_ROUTING = {
         ],
         "together": [
             {"provider": "together", "model_id": "meta-llama/Llama-3.3-70B-Instruct-Turbo"},
+        ],
+        "nvidia": [
+            {"provider": "nvidia", "model_id": "meta/llama-3.3-70b-instruct"},
         ],
         "opencode-zen": [
             {"provider": "opencode-zen", "model_id": "grok-code"},

@@ -167,6 +167,7 @@ ENDPOINTS = {
     "mistral": "https://api.mistral.ai/v1/chat/completions",
     "xai": "https://api.x.ai/v1/chat/completions",
     "together": "https://api.together.xyz/v1/chat/completions",
+    "nvidia": "https://integrate.api.nvidia.com/v1/chat/completions",
     "opencode-zen": "https://opencode.ai/zen/v1/chat/completions",
     "opencode-go": "https://opencode.ai/zen/go/v1/chat/completions",
 }
@@ -184,7 +185,7 @@ _PROVIDER_ALIAS = {
 
 _KNOWN_PROVIDER_PREFIXES: frozenset[str] = frozenset({
     "openai", "minimax", "lmstudio", "zai", "openrouter", "groq", "gemini",
-    "cerebras", "mistral", "xai", "together", "opencode-zen", "opencode-go",
+    "cerebras", "mistral", "xai", "together", "nvidia", "opencode-zen", "opencode-go",
     "codex", "openai-codex", "local", "lm-studio", "z.ai", "z-ai",
     "open-router", "open_router",
 })
@@ -200,7 +201,7 @@ _KNOWN_PROVIDER_PREFIXES: frozenset[str] = frozenset({
 # (openai/minimax/zai/lmstudio) keep their model-name cross-checks.
 _PROVIDER_PASSTHROUGH: frozenset[str] = frozenset({
     "openrouter", "anthropic", "deepseek", "groq", "gemini",
-    "cerebras", "mistral", "xai", "together", "opencode-zen", "opencode-go",
+    "cerebras", "mistral", "xai", "together", "nvidia", "opencode-zen", "opencode-go",
 })
 
 
@@ -978,7 +979,7 @@ async def _call_single(
             endpoint=ENDPOINTS["openrouter"],
             provider_label="openrouter",
         )
-    elif provider in ("groq", "gemini", "cerebras", "mistral", "xai", "together", "opencode-zen", "opencode-go"):
+    elif provider in ("groq", "gemini", "cerebras", "mistral", "xai", "together", "nvidia", "opencode-zen", "opencode-go"):
         # All expose OpenAI-compatible Chat Completions endpoints, so route
         # through the shared OpenAI caller with the provider's endpoint/label.
         return await _call_openai(

@@ -277,7 +277,7 @@ def _parse_int_query(value: str | None, default: int = 0) -> int:
         return default
 
 
-_SUPPORTED_AUTH_PROVIDERS: list[str] = ["openai", "minimax", "lmstudio", "zai", "openrouter", "anthropic", "deepseek", "groq", "gemini", "cerebras", "mistral", "xai", "together", "opencode-zen", "opencode-go"]
+_SUPPORTED_AUTH_PROVIDERS: list[str] = ["openai", "minimax", "lmstudio", "zai", "openrouter", "anthropic", "deepseek", "groq", "gemini", "cerebras", "mistral", "xai", "together", "nvidia", "opencode-zen", "opencode-go"]
 _AUTH_PROVIDER_ENV_VARS = {
     "openai": "OPENAI_API_KEY",
     "minimax": "MINIMAX_API_KEY",
@@ -292,6 +292,7 @@ _AUTH_PROVIDER_ENV_VARS = {
     "mistral": "MISTRAL_API_KEY",
     "xai": "XAI_API_KEY",
     "together": "TOGETHER_API_KEY",
+    "nvidia": "NVIDIA_API_KEY",
     "opencode-zen": "OPENCODE_ZEN_API_KEY",
     "opencode-go": "OPENCODE_GO_API_KEY",
 }
@@ -331,6 +332,9 @@ _MODEL_DISCOVERY_ALT_ENDPOINTS = {
     "cerebras": ["https://api.cerebras.ai/v1/models"],
     "mistral": ["https://api.mistral.ai/v1/models"],
     "xai": ["https://api.x.ai/v1/models"],
+    # NVIDIA NIM is OpenAI-compatible; /v1/models lists the whole catalog
+    # (chat + embeddings + rerankers), filtered to chat by the belong-rule.
+    "nvidia": ["https://integrate.api.nvidia.com/v1/models"],
     # OpenCode Zen exposes an OpenAI-compatible /models route (curated catalog).
     # OpenCode GO has NO /models endpoint (chat-completions only), so it is not
     # listed here — its models are curated in _AGENT_MODEL_CATALOG instead.
@@ -371,6 +375,9 @@ _MODEL_DISCOVERY_HEADERS = {
     "xai": {
         "Authorization": "Bearer {token}",
     },
+    "nvidia": {
+        "Authorization": "Bearer {token}",
+    },
     "opencode-zen": {
         "Authorization": "Bearer {token}",
     },
@@ -403,6 +410,7 @@ _MODEL_PROVIDER_DISPLAY_NAMES = {
     "mistral": "Mistral",
     "xai": "xAI (Grok)",
     "together": "Together AI",
+    "nvidia": "NVIDIA NIM",
     "opencode-zen": "OpenCode Zen",
     "opencode-go": "OpenCode GO",
 }
@@ -494,6 +502,15 @@ _AGENT_MODEL_CATALOG = [
     {"provider": "together", "model_id": "Qwen/Qwen2.5-72B-Instruct-Turbo", "label": "Together Qwen 2.5 72B Turbo"},
     {"provider": "together", "model_id": "deepseek-ai/DeepSeek-V3", "label": "Together DeepSeek V3"},
     {"provider": "together", "model_id": "mistralai/Mixtral-8x7B-Instruct-v0.1", "label": "Together Mixtral 8x7B"},
+    # NVIDIA NIM (build.nvidia.com) — curated tool-capable chat models. The live
+    # /v1/models list is also discovered; these are reliable, function-calling
+    # instruct/reasoning families (vendor/model ids passed through unchanged).
+    {"provider": "nvidia", "model_id": "meta/llama-3.3-70b-instruct", "label": "NVIDIA Llama 3.3 70B Instruct"},
+    {"provider": "nvidia", "model_id": "nvidia/llama-3.1-nemotron-70b-instruct", "label": "NVIDIA Nemotron 70B Instruct"},
+    {"provider": "nvidia", "model_id": "nvidia/llama-3.3-nemotron-super-49b-v1", "label": "NVIDIA Nemotron Super 49B"},
+    {"provider": "nvidia", "model_id": "deepseek-ai/deepseek-r1", "label": "NVIDIA DeepSeek R1"},
+    {"provider": "nvidia", "model_id": "qwen/qwen2.5-coder-32b-instruct", "label": "NVIDIA Qwen2.5 Coder 32B"},
+    {"provider": "nvidia", "model_id": "meta/llama-3.1-8b-instruct", "label": "NVIDIA Llama 3.1 8B Instruct"},
     # OpenCode Zen: live-discovered via /v1/models; these seed sensible defaults
     # and a fallback when discovery is unavailable.
     {"provider": "opencode-zen", "model_id": "grok-code", "label": "OpenCode Zen Grok Code Fast"},
@@ -625,6 +642,22 @@ def _looks_like_opencode_discovery_model(model: str) -> bool:
     return bool(str(model or "").strip())
 
 
+def _looks_like_nvidia_discovery_model(model: str) -> bool:
+    lowered = model.lower().strip()
+    if not lowered:
+        return False
+    # NVIDIA NIM's catalog spans many modalities; drop the non-chat families
+    # (embeddings, rerankers, OCR/parse, vision-only, speech, safety) so the
+    # agent picker only offers tool-capable instruct/chat/reasoning models.
+    if any(tag in lowered for tag in (
+        "embed", "embedqa", "rerank", "ocr", "parse", "vila", "vlm", "clip",
+        "diffusion", "riva", "asr", "-tts", "text-to-speech", "speech",
+        "retrieval", "nemoguard", "guard", "vision", "-ranking",
+    )):
+        return False
+    return True
+
+
 def _looks_like_xai_discovery_model(model: str) -> bool:
     lowered = model.lower().strip()
     # Keep generative grok chat models; drop image-generation variants.
@@ -687,6 +720,8 @@ def _discovery_model_should_belong(provider: str, model_id: str) -> bool:
         return _looks_like_mistral_discovery_model(model_id)
     if provider == "xai":
         return _looks_like_xai_discovery_model(model_id)
+    if provider == "nvidia":
+        return _looks_like_nvidia_discovery_model(model_id)
     if provider == "opencode-zen":
         return _looks_like_opencode_discovery_model(model_id)
     return False
