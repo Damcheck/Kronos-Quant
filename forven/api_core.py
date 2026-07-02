@@ -9941,6 +9941,11 @@ def _persist_completed_backtest_run(
         created_at=now_iso,
     )
 
+    if compact_config.get("dropzone_session_id"):
+        from forven.ai_dropzone_sessions import touch_session
+
+        touch_session(compact_config["dropzone_session_id"])
+
     try:
         from forven.quant_skills_extractor import record_backtest_for_learning
 
@@ -10887,6 +10892,11 @@ def post_backtest_submit(body: BacktestSubmitBody, *, skip_auto_trash: bool = Fa
         config=compact_config,
         created_at=now_iso,
     )
+
+    if compact_config.get("dropzone_session_id"):
+        from forven.ai_dropzone_sessions import touch_session
+
+        touch_session(compact_config["dropzone_session_id"])
 
     try:
         from forven.quant_skills_extractor import record_backtest_for_learning

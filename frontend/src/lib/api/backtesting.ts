@@ -1692,6 +1692,7 @@ export interface AiDropzoneSession {
 	metadata: Record<string, unknown>;
 	started_at: string;
 	ended_at?: string | null;
+	last_activity_at?: string | null;
 	strategy_count?: number;
 	run_count?: number;
 }

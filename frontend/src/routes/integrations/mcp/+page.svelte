@@ -177,9 +177,13 @@
 <div class="p-4 text-gray-200">
 	<div class="flex items-center justify-between mb-4">
 		<div>
-			<h1 class="text-xl font-semibold">MCP Servers</h1>
-			<p class="text-xs text-gray-500 mt-0.5">
-				Model Context Protocol servers expose tools that granted agents can call.
+			<h1 class="text-xl font-semibold">Agent Tool Servers</h1>
+			<p class="text-xs text-gray-500 mt-0.5 max-w-2xl">
+				The <span class="text-gray-300">outbound</span> direction: register an external MCP server
+				(a filesystem server, web search, a ticker API, …) and its tools become callable by
+				<span class="text-gray-300">Forven's own internal agents</span> — scoped per agent via
+				grants on each agent's page. Connecting an outside assistant <em>into</em> Forven is the
+				other tab (AI Clients); most setups never need anything here.
 			</p>
 		</div>
 		<button
@@ -389,9 +393,10 @@
 		<div class="text-xs text-red-400">{loadError}</div>
 	{:else if servers.length === 0}
 		<div class="bg-[#0d0d0d] border border-[#222] rounded p-6 text-center">
-			<p class="text-sm text-gray-400">No MCP servers configured yet.</p>
+			<p class="text-sm text-gray-400">No agent tool servers configured — that's the normal state.</p>
 			<p class="text-xs text-gray-500 mt-1">
-				Add a server to expose external tools to your agents.
+				Add one only when a Forven agent needs an external tool (e.g. web search during research).
+				To connect Claude/Cursor/Codex into Forven, use the AI Clients tab instead.
 			</p>
 		</div>
 	{:else}
