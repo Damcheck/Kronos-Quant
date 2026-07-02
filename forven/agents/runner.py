@@ -1475,6 +1475,20 @@ async def _run_agent_task_inner(
                     input_data=input_data,
                 )
 
+        # Durable spend accounting: task rows are pruned after the retention
+        # window, the daily rollup is what survives.
+        try:
+            from forven.db import record_agent_spend
+
+            record_agent_spend(
+                agent_id,
+                cost_usd=cost_usd,
+                input_tokens=usage.get("input_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0),
+            )
+        except Exception:
+            pass
+
         if queue_follow_through:
             with get_db() as conn:
                 _queue_autonomous_research_follow_through_if_needed(

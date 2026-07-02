@@ -3031,6 +3031,22 @@ def _run_migrations(conn: sqlite3.Connection):
         "CREATE INDEX IF NOT EXISTS idx_agent_task_messages_task ON agent_task_messages (task_display_id, seq)"
     )
 
+    # Per-agent daily spend rollup. agent_tasks rows are pruned after the
+    # retention window; this tiny table is what keeps cost history durable
+    # (and powers per-agent spend views) after the runs themselves are gone.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS agent_spend_daily (
+            day TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            tasks INTEGER NOT NULL DEFAULT 0,
+            cost_usd REAL NOT NULL DEFAULT 0,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')),
+            PRIMARY KEY (day, agent_id)
+        )
+    """)
+
     # Hermes-inspired Phase 1: Brain memory + decisions + FTS5 recall.
     # Brain-only: these tables back the Brain agent's persistent operational
     # memory and decision log. Quant agents (task workers) stay stateless.
@@ -4705,6 +4721,57 @@ def get_task_messages(task_display_id: str) -> list[dict]:
         rows = conn.execute(
             "SELECT * FROM agent_task_messages WHERE task_display_id = ? ORDER BY seq ASC, id ASC",
             (str(task_display_id).strip(),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def record_agent_spend(
+    agent_id: str | None,
+    *,
+    cost_usd: float | None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+) -> bool:
+    """Fold one completed run into the per-agent daily spend rollup.
+
+    Best-effort: spend accounting must never fail the run itself.
+    """
+    normalized_agent = str(agent_id or "").strip().lower()
+    if not normalized_agent:
+        return False
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO agent_spend_daily (day, agent_id, tasks, cost_usd, input_tokens, output_tokens) "
+                "VALUES (?, ?, 1, ?, ?, ?) "
+                "ON CONFLICT(day, agent_id) DO UPDATE SET "
+                "tasks = tasks + 1, "
+                "cost_usd = cost_usd + excluded.cost_usd, "
+                "input_tokens = input_tokens + excluded.input_tokens, "
+                "output_tokens = output_tokens + excluded.output_tokens, "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')",
+                (
+                    day,
+                    normalized_agent,
+                    float(cost_usd or 0.0),
+                    int(input_tokens or 0),
+                    int(output_tokens or 0),
+                ),
+            )
+        return True
+    except Exception as exc:  # noqa: BLE001 - spend rollup is best-effort
+        log.warning("record_agent_spend failed for %s: %s", normalized_agent, exc)
+        return False
+
+
+def get_agent_spend(days: int = 30) -> list[dict]:
+    """Per-agent spend rollup for the last ``days`` days (newest first)."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))).strftime("%Y-%m-%d")
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM agent_spend_daily WHERE day >= ? ORDER BY day DESC, agent_id ASC",
+            (cutoff,),
         ).fetchall()
     return [dict(r) for r in rows]
 
