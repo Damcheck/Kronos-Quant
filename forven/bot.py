@@ -71,45 +71,17 @@ def _bot_owns_runtime_loops() -> bool:
         "on",
     }
 
-# Defaults — overridden by config.json "discord_channels", "discord_owner_id"
-_DEFAULT_CHANNELS = {
-    "general": "1472929176213393505",
-    "ops": "1473714175300603924",
-    "approvals": "1473006244171354123",
-    "risk": "1473006244171354123",
-    "morning-brief": "1473323213143539868",
-    "evening-brief": "1473323214083199093",
-    "evening-summary": "1473323214083199093",
-    "chat": "1473412370528338003",
-    "heartbeat": "1473654720735481947",
-    "development": "1473714175300603924",
-    "strategies": "1473006243147808829",
-    "alerts": "1473006244171354123",
-    "research": "1473006245211275304",
-    "backtesting": "1473036255716577420",
-    "paper-trades": "1473036257625112808",
-    "market-data": "1473036258962968842",
-    "autopilot": "1473036260103815351",
-    "news": "1473036261345202340",
-    "full-stack-engineer": "1474937376928301169",
-    # Backward-compatible aliases that collapse old room-specific names onto the
-    # reduced notification/channel model.
-    "quant-researcher": "1473006245211275304",
-    "back-test-engineer": "1473036255716577420",
-    "risk-manager": "1473006244171354123",
-    "sentiment": "1473036261345202340",
-    "full-stack-engineers": "1473714175300603924",
-}
+# Channel alias map lives in forven.discord_channels (shared with the API);
+# config.json "discord_channels" / "discord_owner_id" override the defaults.
+from forven.discord_channels import load_channel_map
 
 
 def _load_discord_config() -> tuple[dict, dict, int]:
     """Load channels, reverse lookup, and owner ID from config (or defaults)."""
-    cfg = load_config()
-    channel_overrides = cfg.get("discord_channels", {}) or {}
-    channels = {**_DEFAULT_CHANNELS, **channel_overrides}
+    channels = load_channel_map()
     channel_names = {v: k for k, v in channels.items()}
-    
-    owner_val = cfg.get("discord_owner_id")
+
+    owner_val = load_config().get("discord_owner_id")
     owner_id = int(owner_val) if owner_val else 0
     return channels, channel_names, owner_id
 

@@ -6,8 +6,7 @@ export interface Routine {
 	prompt: string;
 	cron_expr: string;
 	tools_context: string;
-	skills_json?: string | null;
-	skills: string[];
+	channel: string | null;
 	enabled: number | boolean;
 	created_by: string | null;
 	approval_id: number | null;
@@ -23,7 +22,7 @@ export interface RoutineCreatePayload {
 	prompt: string;
 	cron_expr: string;
 	tools_context?: string;
-	skills?: string[];
+	channel?: string | null;
 	enabled?: boolean;
 }
 
@@ -32,7 +31,8 @@ export interface RoutineUpdatePayload {
 	prompt?: string;
 	cron_expr?: string;
 	tools_context?: string;
-	skills?: string[];
+	/** Discord channel alias or raw id; send '' to clear. */
+	channel?: string | null;
 	enabled?: boolean;
 }
 
@@ -96,6 +96,12 @@ export async function previewRoutineSchedule(id: number, count = 5): Promise<str
 		{ method: 'POST', body: JSON.stringify({}) },
 	);
 	return res.upcoming || [];
+}
+
+/** Discord channel aliases the bot can deliver routine results to. */
+export async function listRoutineChannels(): Promise<string[]> {
+	const res = await fetchApi<{ channels: string[] }>('/routines/channels');
+	return res.channels || [];
 }
 
 export async function previewCronExpression(cron_expr: string, count = 5): Promise<string[]> {

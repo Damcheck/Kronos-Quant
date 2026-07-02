@@ -4,6 +4,7 @@
 		createRoutine,
 		deleteRoutine,
 		listRoutines,
+		listRoutineChannels,
 		pauseRoutine,
 		previewCronExpression,
 		previewRoutineSchedule,
@@ -13,11 +14,18 @@
 		type Routine,
 		type RoutineCreatePayload,
 	} from '$lib/api/routines';
-	import { minutesToCron, cronToMinutes } from '$lib/utils/schedule';
-
-	type ScheduleMode = 'cron' | 'minutes';
+	import {
+		cronToFriendly,
+		defaultFriendlySchedule,
+		describeCronLocal,
+		describeFriendly,
+		friendlyToCron,
+		WEEKDAY_NAMES,
+		type FriendlySchedule,
+	} from '$lib/utils/schedule';
 
 	let routines: Routine[] = [];
+	let channels: string[] = [];
 	let loading = true;
 	let error: string | null = null;
 	let actionMessage: string | null = null;
@@ -26,34 +34,32 @@
 	let createForm: RoutineCreatePayload = {
 		name: '',
 		prompt: '',
-		cron_expr: '0 14 * * *',
+		cron_expr: '',
 		tools_context: 'scheduled',
-		skills: [],
+		channel: '',
 		enabled: true,
 	};
 	let creating = false;
 	let cronPreview: string[] = [];
 	let cronPreviewError: string | null = null;
-	let skillsInput = '';
-	let createMode: ScheduleMode = 'cron';
-	let createMinutes = 30;
+	let createSched: FriendlySchedule = defaultFriendlySchedule();
+	let createAdvanced = false;
 
 	let editingId: number | null = null;
-	let editDraft: RoutineCreatePayload = { name: '', prompt: '', cron_expr: '' };
-	let editSkillsInput = '';
+	let editDraft: RoutineCreatePayload = { name: '', prompt: '', cron_expr: '', channel: '' };
 	let editError: string | null = null;
 	let editPreview: string[] = [];
-	let editMode: ScheduleMode = 'cron';
-	let editMinutes = 30;
+	let editSched: FriendlySchedule = defaultFriendlySchedule();
+	let editAdvanced = false;
 
 	const VALID_CONTEXTS = ['scheduled', 'interactive', 'recovery', 'research'];
 
-	const CRON_PRESETS: { label: string; expr: string }[] = [
-		{ label: 'Hourly', expr: '0 * * * *' },
-		{ label: 'Daily 14:00 UTC', expr: '0 14 * * *' },
-		{ label: 'Weekdays 14:00 UTC', expr: '0 14 * * MON-FRI' },
-		{ label: 'Weekly (Mon 14:00 UTC)', expr: '0 14 * * MON' },
-		{ label: 'Monthly (1st 14:00 UTC)', expr: '0 14 1 * *' },
+	const FREQ_OPTIONS: { value: FriendlySchedule['freq']; label: string }[] = [
+		{ value: 'minutes', label: 'Every N minutes' },
+		{ value: 'hours', label: 'Every N hours' },
+		{ value: 'daily', label: 'Every day' },
+		{ value: 'weekly', label: 'Every week' },
+		{ value: 'monthly', label: 'Every month' },
 	];
 
 	function fmtDate(value: string | null | undefined): string {
@@ -61,50 +67,6 @@
 		const d = new Date(String(value));
 		if (Number.isNaN(d.getTime())) return '--';
 		return `${d.toLocaleDateString()} ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
-	}
-
-	const DOW_FULL = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-
-	// Plain-English summary of common 5-field cron expressions. Falls back to ''
-	// for anything it can't confidently describe (the live preview still covers it).
-	function describeCron(expr: string): string {
-		const parts = (expr || '').trim().split(/\s+/);
-		if (parts.length !== 5) return '';
-		const [min, hour, dom, mon, dow] = parts;
-		if (mon !== '*') return '';
-		const num = (v: string) => (/^\d+$/.test(v) ? Number(v) : null);
-		const m = num(min);
-		const h = num(hour);
-		const timeAt = m !== null && h !== null
-			? `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')} UTC`
-			: null;
-
-		if (min === '*' && hour === '*' && dom === '*' && dow === '*') return 'Every minute';
-		if (m !== null && hour === '*' && dom === '*' && dow === '*') return `Every hour at :${String(m).padStart(2, '0')}`;
-		if (!timeAt) return '';
-		if (dom === '*' && dow === '*') return `Every day at ${timeAt}`;
-		if (dom === '*' && dow !== '*') {
-			const label = dowLabel(dow);
-			return label ? `Every ${label} at ${timeAt}` : '';
-		}
-		if (dom !== '*' && dow === '*') {
-			const d = num(dom);
-			return d !== null ? `On day ${d} of the month at ${timeAt}` : '';
-		}
-		return '';
-	}
-
-	function dowLabel(dow: string): string {
-		const named: Record<string, string> = {
-			MON: 'Monday', TUE: 'Tuesday', WED: 'Wednesday', THU: 'Thursday',
-			FRI: 'Friday', SAT: 'Saturday', SUN: 'Sunday',
-		};
-		const upper = dow.toUpperCase();
-		if (upper === 'MON-FRI' || dow === '1-5') return 'weekday';
-		if (named[upper]) return named[upper];
-		const n = Number(dow);
-		if (Number.isInteger(n) && n >= 0 && n <= 6) return DOW_FULL[n];
-		return '';
 	}
 
 	function statusClass(status: string | null): string {
@@ -121,6 +83,10 @@
 		}
 	}
 
+	function scheduleLabel(routine: Routine): string {
+		return describeCronLocal(routine.cron_expr) || routine.cron_expr;
+	}
+
 	async function load() {
 		loading = true;
 		error = null;
@@ -130,6 +96,15 @@
 			error = err instanceof Error ? err.message : String(err);
 		} finally {
 			loading = false;
+		}
+	}
+
+	async function loadChannels() {
+		// Older backends don't have the endpoint yet — fall back to free text.
+		try {
+			channels = await listRoutineChannels();
+		} catch {
+			channels = [];
 		}
 	}
 
@@ -149,14 +124,12 @@
 		error = null;
 		actionMessage = null;
 		try {
-			const skills = skillsInput.split(',').map((s) => s.trim()).filter(Boolean);
-			await createRoutine({ ...createForm, skills });
+			await createRoutine({ ...createForm, channel: (createForm.channel || '').trim() });
 			actionMessage = `Routine '${createForm.name}' created.`;
-			createForm = { name: '', prompt: '', cron_expr: '0 14 * * *', tools_context: 'scheduled', skills: [], enabled: true };
-			skillsInput = '';
+			createForm = { name: '', prompt: '', cron_expr: '', tools_context: 'scheduled', channel: '', enabled: true };
+			createSched = defaultFriendlySchedule();
+			createAdvanced = false;
 			cronPreview = [];
-			createMode = 'cron';
-			createMinutes = 30;
 			await load();
 		} catch (err) {
 			error = err instanceof Error ? err.message : String(err);
@@ -172,19 +145,18 @@
 			prompt: routine.prompt,
 			cron_expr: routine.cron_expr,
 			tools_context: routine.tools_context,
-			skills: routine.skills,
+			channel: routine.channel || '',
 			enabled: !!routine.enabled,
 		};
-		editSkillsInput = (routine.skills || []).join(', ');
 		editError = null;
-		// Re-open in "every N minutes" mode when the stored cron is a simple
-		// interval; otherwise keep the raw cron editor.
-		const asMinutes = cronToMinutes(routine.cron_expr);
-		if (asMinutes !== null) {
-			editMode = 'minutes';
-			editMinutes = asMinutes;
+		// Re-open in friendly mode when the stored cron fits one of the plain
+		// shapes; otherwise (e.g. a Brain-proposed expression) keep raw cron.
+		const friendly = cronToFriendly(routine.cron_expr);
+		if (friendly) {
+			editSched = friendly;
+			editAdvanced = false;
 		} else {
-			editMode = 'cron';
+			editAdvanced = true;
 		}
 		try {
 			editPreview = await previewRoutineSchedule(routine.id, 5);
@@ -198,8 +170,7 @@
 		busyId = editingId;
 		editError = null;
 		try {
-			const skills = editSkillsInput.split(',').map((s) => s.trim()).filter(Boolean);
-			await updateRoutine(editingId, { ...editDraft, skills });
+			await updateRoutine(editingId, { ...editDraft, channel: (editDraft.channel || '').trim() });
 			actionMessage = `Routine #${editingId} updated.`;
 			editingId = null;
 			await load();
@@ -258,14 +229,17 @@
 		cronPreviewTimer = setTimeout(() => void refreshCronPreview(expr), 300);
 	}
 
-	// In "every N minutes" mode the cron field is derived from the minutes value;
-	// the backend still stores (and the preview still reads) a cron expression.
-	$: if (createMode === 'minutes') createForm.cron_expr = minutesToCron(createMinutes);
-	$: if (editMode === 'minutes') editDraft.cron_expr = minutesToCron(editMinutes);
+	// The friendly builder is the source of truth unless advanced mode is on;
+	// the backend still stores (and the preview still reads) a UTC cron.
+	$: if (!createAdvanced) createForm.cron_expr = friendlyToCron(createSched);
+	$: if (editingId !== null && !editAdvanced) editDraft.cron_expr = friendlyToCron(editSched);
 
 	$: scheduleCronPreview(createForm.cron_expr || '');
 
-	onMount(load);
+	onMount(() => {
+		void load();
+		void loadChannels();
+	});
 </script>
 
 <svelte:head><title>Routines | Forven</title></svelte:head>
@@ -276,9 +250,9 @@
 			<div class="text-[11px] uppercase tracking-[0.18em] text-gray-500">Brain</div>
 			<h1 class="text-2xl font-semibold text-gray-100">Routines</h1>
 			<p class="mt-1 text-xs text-gray-500 max-w-2xl">
-				Scheduled NL prompts the Brain runs autonomously. Operator-authored routines are
-				live immediately; Brain-proposed routines must be approved on the
-				<a href="/approval" class="underline">/approval</a> page first.
+				Scheduled instructions the Brain runs autonomously — optionally posting the result to a
+				Discord channel. Operator-authored routines are live immediately; Brain-proposed routines
+				must be approved on the <a href="/approval" class="underline">/approval</a> page first.
 			</p>
 		</div>
 		<button type="button" class="text-xs border border-[#333] px-3 py-1.5 rounded text-gray-300" on:click={() => void load()}>Reload</button>
@@ -291,33 +265,40 @@
 		<h2 class="text-sm uppercase tracking-wider text-gray-400">Create routine</h2>
 		<div class="grid sm:grid-cols-2 gap-3">
 			<label class="text-xs"><span class="text-gray-500 uppercase tracking-wider">Name</span>
-				<input type="text" bind:value={createForm.name} placeholder="weekly-postmortem" class="mt-1 w-full bg-black border border-[#222] px-2 py-1.5 text-gray-200" />
+				<input type="text" bind:value={createForm.name} placeholder="hourly-status-report" class="mt-1 w-full bg-black border border-[#222] px-2 py-1.5 text-gray-200" />
 			</label>
 			<div class="text-xs">
 				<div class="flex items-center justify-between gap-2">
-					<span class="text-gray-500 uppercase tracking-wider">Schedule (UTC)</span>
-					<div class="inline-flex rounded overflow-hidden border border-[#222] text-[10px]">
-						<button type="button" class="px-2 py-0.5 {createMode === 'minutes' ? 'bg-[#1a1a1a] text-gray-100' : 'text-gray-500 hover:text-gray-300'}" on:click={() => (createMode = 'minutes')}>Every N min</button>
-						<button type="button" class="px-2 py-0.5 {createMode === 'cron' ? 'bg-[#1a1a1a] text-gray-100' : 'text-gray-500 hover:text-gray-300'}" on:click={() => (createMode = 'cron')}>Cron</button>
-					</div>
+					<span class="text-gray-500 uppercase tracking-wider">Schedule</span>
+					<button type="button" class="text-[10px] px-2 py-0.5 rounded border {createAdvanced ? 'bg-[#1a1a1a] text-gray-100 border-[#444]' : 'text-gray-500 border-[#222] hover:text-gray-300'}" on:click={() => (createAdvanced = !createAdvanced)}>Advanced</button>
 				</div>
-				{#if createMode === 'minutes'}
-					<div class="mt-1 flex items-center gap-2">
-						<span class="text-gray-400">Run every</span>
-						<input type="number" min="1" step="1" bind:value={createMinutes} class="w-20 bg-black border border-[#222] px-2 py-1.5 text-gray-200" />
-						<span class="text-gray-400">minutes</span>
-					</div>
-					<div class="mt-1 text-[11px] text-gray-500 font-mono">cron: {createForm.cron_expr || '--'}</div>
+				{#if createAdvanced}
+					<input type="text" bind:value={createForm.cron_expr} placeholder="0 14 * * 1" class="mt-1 w-full bg-black border border-[#222] px-2 py-1.5 text-gray-200 font-mono" />
+					<div class="mt-1 text-[11px] text-gray-500">Raw 5-field cron, UTC.</div>
 				{:else}
-					<input type="text" bind:value={createForm.cron_expr} placeholder="0 14 * * MON" class="mt-1 w-full bg-black border border-[#222] px-2 py-1.5 text-gray-200 font-mono" />
-					<div class="mt-1 flex flex-wrap gap-1">
-						{#each CRON_PRESETS as preset}
-							<button type="button" class="border border-[#333] text-gray-400 hover:text-gray-100 hover:border-[#555] px-1.5 py-0.5 rounded text-[10px]" on:click={() => (createForm.cron_expr = preset.expr)}>{preset.label}</button>
-						{/each}
+					<div class="mt-1 flex flex-wrap items-center gap-2">
+						<select bind:value={createSched.freq} class="bg-black border border-[#222] px-2 py-1.5 text-gray-200">
+							{#each FREQ_OPTIONS as opt}<option value={opt.value}>{opt.label}</option>{/each}
+						</select>
+						{#if createSched.freq === 'minutes' || createSched.freq === 'hours'}
+							<span class="text-gray-400">every</span>
+							<input type="number" min="1" max={createSched.freq === 'minutes' ? 59 : 23} step="1" bind:value={createSched.every} class="w-16 bg-black border border-[#222] px-2 py-1.5 text-gray-200" />
+							<span class="text-gray-400">{createSched.freq}</span>
+						{:else}
+							{#if createSched.freq === 'weekly'}
+								<span class="text-gray-400">on</span>
+								<select bind:value={createSched.weekday} class="bg-black border border-[#222] px-2 py-1.5 text-gray-200">
+									{#each WEEKDAY_NAMES as day, i}<option value={i}>{day}</option>{/each}
+								</select>
+							{:else if createSched.freq === 'monthly'}
+								<span class="text-gray-400">on day</span>
+								<input type="number" min="1" max="31" step="1" bind:value={createSched.dom} class="w-16 bg-black border border-[#222] px-2 py-1.5 text-gray-200" />
+							{/if}
+							<span class="text-gray-400">at</span>
+							<input type="time" bind:value={createSched.time} class="bg-black border border-[#222] px-2 py-1.5 text-gray-200" />
+						{/if}
 					</div>
-					{#if describeCron(createForm.cron_expr || '')}
-						<div class="mt-1 text-[11px] text-gray-400">{describeCron(createForm.cron_expr || '')}</div>
-					{/if}
+					<div class="mt-1 text-[11px] text-gray-400">{describeFriendly(createSched)} (your local time)</div>
 				{/if}
 			</div>
 		</div>
@@ -325,13 +306,20 @@
 			<textarea rows="3" bind:value={createForm.prompt} class="mt-1 w-full bg-black border border-[#222] px-2 py-1.5 text-gray-200" placeholder="What should the Brain do when this fires?"></textarea>
 		</label>
 		<div class="grid sm:grid-cols-3 gap-3">
+			<label class="text-xs"><span class="text-gray-500 uppercase tracking-wider">Post result to Discord</span>
+				{#if channels.length > 0}
+					<select bind:value={createForm.channel} class="mt-1 w-full bg-black border border-[#222] px-2 py-1.5 text-gray-200">
+						<option value="">— don't post —</option>
+						{#each channels as ch}<option value={ch}>#{ch}</option>{/each}
+					</select>
+				{:else}
+					<input type="text" bind:value={createForm.channel} placeholder="channel alias or id (optional)" class="mt-1 w-full bg-black border border-[#222] px-2 py-1.5 text-gray-200" />
+				{/if}
+			</label>
 			<label class="text-xs"><span class="text-gray-500 uppercase tracking-wider">Tools context</span>
 				<select bind:value={createForm.tools_context} class="mt-1 w-full bg-black border border-[#222] px-2 py-1.5 text-gray-200">
 					{#each VALID_CONTEXTS as ctx}<option value={ctx}>{ctx}</option>{/each}
 				</select>
-			</label>
-			<label class="text-xs"><span class="text-gray-500 uppercase tracking-wider">Skills (comma-separated)</span>
-				<input type="text" bind:value={skillsInput} placeholder="postmortem-review, decay-watch" class="mt-1 w-full bg-black border border-[#222] px-2 py-1.5 text-gray-200" />
 			</label>
 			<label class="text-xs flex items-center gap-2 mt-5">
 				<input type="checkbox" bind:checked={createForm.enabled} />
@@ -372,8 +360,11 @@
 									{:else}
 										<span class="border border-[#333] bg-[#111] text-gray-400 rounded px-1.5 py-0.5 text-[10px] uppercase tracking-wider">{routine.created_by ? `operator · ${routine.created_by}` : 'operator'}</span>
 									{/if}
+									{#if routine.channel}
+										<span class="border border-sky-900 bg-sky-900/20 text-sky-300 rounded px-1.5 py-0.5 text-[10px]" title="Result is posted to this Discord channel">→ #{routine.channel}</span>
+									{/if}
 								</div>
-								<div class="text-[11px] text-gray-500 font-mono mt-0.5">{routine.cron_expr} · {routine.tools_context}</div>
+								<div class="text-[11px] text-gray-500 mt-0.5" title={routine.cron_expr}>{scheduleLabel(routine)} · {routine.tools_context}</div>
 							</div>
 							<div class="flex items-center gap-2 text-[11px]">
 								<span class="border rounded px-2 py-0.5 uppercase tracking-wider {routine.enabled ? 'border-emerald-700 bg-emerald-900/20 text-emerald-300' : 'border-[#333] bg-[#111] text-gray-400'}">
@@ -389,11 +380,6 @@
 							<div class="text-[11px] text-red-400 border border-red-900/40 bg-red-900/10 rounded px-2 py-1 whitespace-pre-wrap break-words" title={routine.last_error}>{routine.last_error}</div>
 						{/if}
 						<div class="text-xs text-gray-300 whitespace-pre-wrap line-clamp-3">{routine.prompt}</div>
-						{#if routine.skills && routine.skills.length > 0}
-							<div class="flex flex-wrap gap-1 text-[10px]">
-								{#each routine.skills as s}<span class="border border-[#222] bg-black px-2 py-0.5 rounded font-mono">{s}</span>{/each}
-							</div>
-						{/if}
 						<div class="flex flex-wrap gap-2 text-xs pt-1">
 							<button type="button" disabled={busyId === routine.id || !routine.enabled} title={routine.enabled ? 'Dispatch this routine now' : 'Resume the routine before running it'} class="border border-sky-700 bg-sky-900/20 text-sky-300 hover:bg-sky-900/40 px-3 py-1 rounded disabled:opacity-40" on:click={() => void handleRun(routine)}>Run now</button>
 							<button type="button" disabled={busyId === routine.id} class="border border-[#333] text-gray-300 hover:text-gray-100 px-3 py-1 rounded disabled:opacity-40" on:click={() => void startEdit(routine)}>Edit</button>
@@ -409,28 +395,53 @@
 									</label>
 									<div class="text-xs">
 										<div class="flex items-center justify-between gap-2">
-											<span class="text-gray-500 uppercase tracking-wider">Schedule (UTC)</span>
-											<div class="inline-flex rounded overflow-hidden border border-[#222] text-[10px]">
-												<button type="button" class="px-2 py-0.5 {editMode === 'minutes' ? 'bg-[#1a1a1a] text-gray-100' : 'text-gray-500 hover:text-gray-300'}" on:click={() => (editMode = 'minutes')}>Every N min</button>
-												<button type="button" class="px-2 py-0.5 {editMode === 'cron' ? 'bg-[#1a1a1a] text-gray-100' : 'text-gray-500 hover:text-gray-300'}" on:click={() => (editMode = 'cron')}>Cron</button>
-											</div>
+											<span class="text-gray-500 uppercase tracking-wider">Schedule</span>
+											<button type="button" class="text-[10px] px-2 py-0.5 rounded border {editAdvanced ? 'bg-[#1a1a1a] text-gray-100 border-[#444]' : 'text-gray-500 border-[#222] hover:text-gray-300'}" on:click={() => (editAdvanced = !editAdvanced)}>Advanced</button>
 										</div>
-										{#if editMode === 'minutes'}
-											<div class="mt-1 flex items-center gap-2">
-												<span class="text-gray-400">Run every</span>
-												<input type="number" min="1" step="1" bind:value={editMinutes} class="w-20 bg-black border border-[#222] px-2 py-1.5 text-gray-200" />
-												<span class="text-gray-400">minutes</span>
-											</div>
-											<div class="mt-1 text-[11px] text-gray-500 font-mono">cron: {editDraft.cron_expr || '--'}</div>
+										{#if editAdvanced}
+											<input type="text" bind:value={editDraft.cron_expr} placeholder="0 14 * * 1" class="mt-1 w-full bg-black border border-[#222] px-2 py-1.5 text-gray-200 font-mono" />
+											<div class="mt-1 text-[11px] text-gray-500">Raw 5-field cron, UTC.</div>
 										{:else}
-											<input type="text" bind:value={editDraft.cron_expr} placeholder="0 14 * * MON" class="mt-1 w-full bg-black border border-[#222] px-2 py-1.5 text-gray-200 font-mono" />
+											<div class="mt-1 flex flex-wrap items-center gap-2">
+												<select bind:value={editSched.freq} class="bg-black border border-[#222] px-2 py-1.5 text-gray-200">
+													{#each FREQ_OPTIONS as opt}<option value={opt.value}>{opt.label}</option>{/each}
+												</select>
+												{#if editSched.freq === 'minutes' || editSched.freq === 'hours'}
+													<span class="text-gray-400">every</span>
+													<input type="number" min="1" max={editSched.freq === 'minutes' ? 59 : 23} step="1" bind:value={editSched.every} class="w-16 bg-black border border-[#222] px-2 py-1.5 text-gray-200" />
+													<span class="text-gray-400">{editSched.freq}</span>
+												{:else}
+													{#if editSched.freq === 'weekly'}
+														<span class="text-gray-400">on</span>
+														<select bind:value={editSched.weekday} class="bg-black border border-[#222] px-2 py-1.5 text-gray-200">
+															{#each WEEKDAY_NAMES as day, i}<option value={i}>{day}</option>{/each}
+														</select>
+													{:else if editSched.freq === 'monthly'}
+														<span class="text-gray-400">on day</span>
+														<input type="number" min="1" max="31" step="1" bind:value={editSched.dom} class="w-16 bg-black border border-[#222] px-2 py-1.5 text-gray-200" />
+													{/if}
+													<span class="text-gray-400">at</span>
+													<input type="time" bind:value={editSched.time} class="bg-black border border-[#222] px-2 py-1.5 text-gray-200" />
+												{/if}
+											</div>
+											<div class="mt-1 text-[11px] text-gray-400">{describeFriendly(editSched)} (your local time)</div>
 										{/if}
 									</div>
 								</div>
 								<label class="text-xs block"><span class="text-gray-500 uppercase tracking-wider">Prompt</span>
 									<textarea rows="3" bind:value={editDraft.prompt} class="mt-1 w-full bg-black border border-[#222] px-2 py-1.5 text-gray-200"></textarea>
 								</label>
-								<div class="grid sm:grid-cols-2 gap-3">
+								<div class="grid sm:grid-cols-3 gap-3">
+									<label class="text-xs"><span class="text-gray-500 uppercase tracking-wider">Post result to Discord</span>
+										{#if channels.length > 0}
+											<select bind:value={editDraft.channel} class="mt-1 w-full bg-black border border-[#222] px-2 py-1.5 text-gray-200">
+												<option value="">— don't post —</option>
+												{#each channels as ch}<option value={ch}>#{ch}</option>{/each}
+											</select>
+										{:else}
+											<input type="text" bind:value={editDraft.channel} placeholder="channel alias or id (optional)" class="mt-1 w-full bg-black border border-[#222] px-2 py-1.5 text-gray-200" />
+										{/if}
+									</label>
 									<label class="text-xs"><span class="text-gray-500 uppercase tracking-wider">Context</span>
 										<select bind:value={editDraft.tools_context} class="mt-1 w-full bg-black border border-[#222] px-2 py-1.5 text-gray-200">
 											{#each VALID_CONTEXTS as ctx}<option value={ctx}>{ctx}</option>{/each}
@@ -438,9 +449,6 @@
 									</label>
 									<label class="text-xs flex items-center gap-2 mt-5"><input type="checkbox" bind:checked={editDraft.enabled} /><span class="text-gray-300 uppercase tracking-wider">Enabled</span></label>
 								</div>
-								<label class="text-xs block"><span class="text-gray-500 uppercase tracking-wider">Skills (comma-separated)</span>
-									<input type="text" bind:value={editSkillsInput} placeholder="postmortem-review, decay-watch" class="mt-1 w-full bg-black border border-[#222] px-2 py-1.5 text-gray-200" />
-								</label>
 								{#if editPreview.length > 0}
 									<div class="text-[11px] text-gray-500">Upcoming fires (local): {editPreview.slice(0, 3).map((t) => fmtDate(t)).join(' · ')}</div>
 								{/if}

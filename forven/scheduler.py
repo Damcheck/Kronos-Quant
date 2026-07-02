@@ -1338,7 +1338,7 @@ async def run_job(job: dict) -> tuple[str, str | None]:
                         "routine_id": int(routine_id),
                         "routine_name": routine.get("name"),
                         "tools_context": routine.get("tools_context") or "scheduled",
-                        "skills": routine.get("skills") or [],
+                        "channel": routine.get("channel") or None,
                         "message": message,
                     },
                     priority=0,

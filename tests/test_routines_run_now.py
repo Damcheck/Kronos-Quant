@@ -3,7 +3,7 @@
 Covers ``forven.control_plane.routines.dispatch_routine_now`` and the
 ``POST /api/routines/{id}/run`` route. The manual dispatch must enqueue a
 ``brain_invoke`` task using the SAME payload shape the scheduler builds for
-cron fires (prompt + tools_context + skills), differing only by ``source``.
+cron fires (prompt + tools_context + channel), differing only by ``source``.
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def _make(**overrides) -> int:
         prompt="summarize the day",
         cron_expr="0 17 * * *",
         tools_context="research",
-        skills=["recall", "post_mortem"],
+        channel="ops",
     )
     base.update(overrides)
     return r.create_routine(**base)
@@ -71,7 +71,9 @@ def test_dispatch_enqueues_brain_invoke_task(forven_db) -> None:
     assert payload["routine_id"] == routine_id
     assert payload["message"] == "summarize the day"
     assert payload["tools_context"] == "research"
-    assert payload["skills"] == ["recall", "post_mortem"]
+    # The bot posts the response to this Discord channel (payload.channel
+    # delivery, same as generic brain_invoke scheduler jobs).
+    assert payload["channel"] == "ops"
 
 
 def test_dispatch_records_run(forven_db) -> None:

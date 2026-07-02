@@ -532,12 +532,7 @@ def _apply_routine_create(
     prompt = str(payload.get("prompt") or "").strip()
     cron_expr = str(payload.get("cron_expr") or "").strip()
     tools_context = str(payload.get("tools_context") or "scheduled").strip() or "scheduled"
-    skills_raw = payload.get("skills") or []
-    skills = (
-        [str(s).strip() for s in skills_raw if str(s).strip()]
-        if isinstance(skills_raw, list)
-        else []
-    )
+    channel = str(payload.get("channel") or "").strip() or None
 
     if not name or not prompt or not cron_expr:
         raise HTTPException(
@@ -555,7 +550,7 @@ def _apply_routine_create(
             prompt=prompt,
             cron_expr=cron_expr,
             tools_context=tools_context,
-            skills=skills,
+            channel=channel,
             enabled=True,
             created_by="brain",
             approval_id=int(approval.get("id")) if approval.get("id") is not None else None,

@@ -1195,6 +1195,7 @@ CREATE TABLE IF NOT EXISTS brain_routines (
     cron_expr TEXT NOT NULL,
     tools_context TEXT NOT NULL DEFAULT 'scheduled',
     skills_json JSON,
+    channel TEXT,
     enabled INTEGER NOT NULL DEFAULT 1,
     created_by TEXT,
     approval_id INTEGER,
@@ -1907,6 +1908,7 @@ def _run_migrations(conn: sqlite3.Connection):
             cron_expr TEXT NOT NULL,
             tools_context TEXT NOT NULL DEFAULT 'scheduled',
             skills_json JSON,
+            channel TEXT,
             enabled INTEGER NOT NULL DEFAULT 1,
             created_by TEXT,
             approval_id INTEGER,
@@ -1921,6 +1923,7 @@ def _run_migrations(conn: sqlite3.Connection):
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_brain_routines_enabled ON brain_routines (enabled)"
     )
+    _ensure_column(conn, "brain_routines", "channel", "TEXT")
     _ensure_column(conn, "strategies", "model", "TEXT")
     _ensure_column(conn, "strategies", "model_id", "TEXT")
     _ensure_column(conn, "strategies", "source", "TEXT")
