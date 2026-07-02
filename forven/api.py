@@ -407,6 +407,15 @@ async def lifespan(_app: FastAPI):
 
     await _on_startup()
 
+    # Event-loop lag watchdog: measures request-loop scheduling drift so GIL/loop
+    # stalls (the WS-drop mechanism) are logged and surfaced in /api/health instead
+    # of showing up only as mysterious client disconnects. Must run on THIS loop.
+    try:
+        from forven.loop_watchdog import run_loop_watchdog
+        _loop_watchdog_task = spawn(run_loop_watchdog(), name="loop-lag-watchdog")
+    except Exception:
+        log.exception("Failed to start event-loop lag watchdog.")
+
     # Start bot heartbeat monitor as background task
     try:
         from forven.bot_factory.manager import BotManager
