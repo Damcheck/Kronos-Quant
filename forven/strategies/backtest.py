@@ -8520,7 +8520,13 @@ def backtest_strategy(
         n_bars = len(df)
         backtest_timeout = _resolve_backtest_timeout(n_bars)
         log.info("Submitting backtest %s to isolated worker (timeout=%ds, bars=%d)", strategy_id, backtest_timeout, n_bars)
-        with concurrent.futures.ProcessPoolExecutor(
+        # Process-wide subprocess budget: concurrent callers (gauntlet drain, grid
+        # combos, jitter reruns) queue here so peak child-process memory stays
+        # bounded regardless of how the parallel levers stack. The worker timeout
+        # starts AFTER the slot is acquired, so queueing never eats into it.
+        from forven.strategies.concurrency import backtest_subprocess_slot
+
+        with backtest_subprocess_slot("backtest"), concurrent.futures.ProcessPoolExecutor(
             max_workers=1,
             mp_context=multiprocessing.get_context("spawn"),
         ) as executor:
@@ -10614,7 +10620,11 @@ def walk_forward(
         n_bars = len(df)
         walk_forward_timeout = _resolve_walk_forward_timeout(n_bars)
         log.info("Submitting walk-forward %s to isolated worker (timeout=%ds, bars=%d)", strategy_id, walk_forward_timeout, n_bars)
-        with concurrent.futures.ProcessPoolExecutor(
+        # All folds run inside ONE subprocess, so the whole WFA holds one slot of
+        # the process-wide subprocess budget (see strategies/concurrency.py).
+        from forven.strategies.concurrency import backtest_subprocess_slot
+
+        with backtest_subprocess_slot("walk_forward"), concurrent.futures.ProcessPoolExecutor(
             max_workers=1,
             mp_context=multiprocessing.get_context("spawn"),
         ) as executor:

@@ -1191,25 +1191,40 @@ def drain_exhausted_blocked_steps(*, limit: int = 50) -> int:
     return drained
 
 
+_DEFAULT_GAUNTLET_DRAIN_WORKERS = 3
+
+
 def _resolve_gauntlet_drain_workers() -> int:
     """Number of gauntlet workflows to advance CONCURRENTLY per tick.
 
-    Default 1 = the historical serial drain (lowest, most predictable memory). Opt in
-    to a bounded parallel drain with ``FORVEN_GAUNTLET_DRAIN_WORKERS=N`` on hardware
-    with RAM headroom. Each concurrent workflow may spawn a backtest subprocess, so
-    PEAK MEMORY scales with N — the same pressure that led parameter_jitter
-    parallelism to default off (see strategies/robustness.py). Hard-capped at 8. The
-    DB (WAL + 60s busy_timeout) serializes the concurrent per-step writes safely.
+    Precedence: ``FORVEN_GAUNTLET_DRAIN_WORKERS`` env override, else the
+    ``gauntlet_drain_workers`` runtime setting, else 3. Hard-capped at 8; 1
+    restores the historical serial drain. Under pytest the default is 1 so
+    engine tests stay deterministic unless a test opts in explicitly.
+
+    Peak memory is no longer the gating concern here: every backtest subprocess
+    a drained workflow spawns now queues on the PROCESS-WIDE subprocess budget
+    (strategies/concurrency.py), so N drain workers can only stack up to that
+    global ceiling. The DB (WAL + 60s busy_timeout) serializes the concurrent
+    per-step writes safely.
     """
     import os
 
     raw = str(os.getenv("FORVEN_GAUNTLET_DRAIN_WORKERS", "") or "").strip()
-    if not raw:
+    if raw:
+        try:
+            return max(1, min(int(raw), 8))
+        except ValueError:
+            return 1
+    if "PYTEST_CURRENT_TEST" in os.environ:
         return 1
     try:
-        return max(1, min(int(raw), 8))
-    except ValueError:
-        return 1
+        from forven.db import kv_get
+
+        value = int((kv_get("forven:settings", {}) or {}).get("gauntlet_drain_workers"))
+    except Exception:
+        return _DEFAULT_GAUNTLET_DRAIN_WORKERS
+    return max(1, min(value, 8))
 
 
 def tick_active_gauntlet_workflows(
@@ -1294,11 +1309,10 @@ def tick_active_gauntlet_workflows(
 
     drain_workers = _resolve_gauntlet_drain_workers()
     if drain_workers > 1 and len(workflow_ids) > 1:
-        # OPT-IN bounded parallel drain (FORVEN_GAUNTLET_DRAIN_WORKERS). The DB is
-        # WAL + 60s busy_timeout, so concurrent per-step writes serialize safely.
-        # Default is the serial path below: each concurrent workflow may run a backtest
-        # subprocess, so peak memory scales with the worker count (the same pressure
-        # that disabled parameter_jitter parallelism). In-flight is bounded to
+        # Bounded parallel drain (default 3 workers; see _resolve_gauntlet_drain_workers).
+        # The DB is WAL + 60s busy_timeout, so concurrent per-step writes serialize
+        # safely. Subprocess memory is bounded by the process-wide budget in
+        # strategies/concurrency.py, not by this worker count. In-flight is bounded to
         # drain_workers and submission is deadline-gated, so a backlog can neither
         # over-subscribe memory nor overrun the tick budget; in-flight workflows finish
         # (each self-limited by deadline_monotonic) and the rest defer to the next tick.

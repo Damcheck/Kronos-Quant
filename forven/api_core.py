@@ -1711,6 +1711,11 @@ _DEFAULT_SETTINGS_PAYLOAD = {
     "pipeline_assignments_per_cycle": 3,
     "pipeline_drain_mode": True,
     "backtest_matrix_workers": 4,
+    # Process-wide cap on concurrent backtest SUBPROCESSES (memory ceiling all the
+    # parallel pipeline levers queue on). See forven/strategies/concurrency.py.
+    "backtest_subprocess_budget": 4,
+    # Gauntlet workflows advanced concurrently per tick (1 = serial drain).
+    "gauntlet_drain_workers": 3,
     "pipeline_saturation_threshold": 100,
     "pipeline_resume_threshold": 60,
     "pipeline_drain_max_seconds": 300,
@@ -2883,6 +2888,20 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
             updates["backtest_matrix_workers"] = _coerce_bounded_int(
                 payload.get("backtest_matrix_workers"),
                 _coerce_bounded_int(updates.get("backtest_matrix_workers"), 4, 1, 8),
+                1,
+                8,
+            )
+        if "backtest_subprocess_budget" in payload:
+            updates["backtest_subprocess_budget"] = _coerce_bounded_int(
+                payload.get("backtest_subprocess_budget"),
+                _coerce_bounded_int(updates.get("backtest_subprocess_budget"), 4, 1, 8),
+                1,
+                8,
+            )
+        if "gauntlet_drain_workers" in payload:
+            updates["gauntlet_drain_workers"] = _coerce_bounded_int(
+                payload.get("gauntlet_drain_workers"),
+                _coerce_bounded_int(updates.get("gauntlet_drain_workers"), 3, 1, 8),
                 1,
                 8,
             )
