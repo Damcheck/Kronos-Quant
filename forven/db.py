@@ -758,6 +758,8 @@ CREATE TABLE IF NOT EXISTS trades (
     fill_exit_price REAL,
     entry_slippage_bps REAL,
     exit_slippage_bps REAL,
+    entry_lag_bps REAL,
+    exit_lag_bps REAL,
     exit_price REAL,
     size REAL,
     risk_pct REAL,
@@ -1847,6 +1849,11 @@ def _run_migrations(conn: sqlite3.Connection):
     _ensure_column(conn, "trades", "execution_type", "TEXT DEFAULT 'live'")
     _ensure_column(conn, "trades", "entry_slippage_bps", "REAL")
     _ensure_column(conn, "trades", "exit_slippage_bps", "REAL")
+    # Execution-quality watchdog: decision-lag component of the expected-vs-actual
+    # fill skew (expected -> mark-at-execution, adverse-positive bps); the remainder
+    # of entry/exit_slippage_bps is venue slippage (mark -> fill).
+    _ensure_column(conn, "trades", "entry_lag_bps", "REAL")
+    _ensure_column(conn, "trades", "exit_lag_bps", "REAL")
     # Fee-net PnL so the paper gate rehearses live economics. Paper fills already
     # carry realized slippage (entry/exit_slippage_bps), so only exchange fees are
     # deducted here; gross pnl_pct/pnl_usd are left untouched for other consumers.

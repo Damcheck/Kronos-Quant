@@ -259,11 +259,18 @@ def close_trade_record(
             pnl_pct = None
             pnl_usd = None
         else:
-            persisted_signal_exit_price = provided_signal_exit
+            # Expected-vs-actual instrumentation: signal_exit_price holds the
+            # decision-time EXPECTED exit, staged when the close order went out
+            # (_update_trade_fill / mark_trade_pending_close_reconcile). First
+            # write wins — finalizers like _close_trade_db echo the REALIZED fill
+            # as signal_exit_price, and letting that overwrite the expected made
+            # the slippage monitor re-derive every exit skew as ~0 (fill vs fill).
+            # The realized exit still lands in exit_price/fill_exit_price.
+            persisted_signal_exit_price = existing_signal_exit
+            if persisted_signal_exit_price is None:
+                persisted_signal_exit_price = provided_signal_exit
             if persisted_signal_exit_price is None:
                 persisted_signal_exit_price = provided_exit
-            if persisted_signal_exit_price is None:
-                persisted_signal_exit_price = existing_signal_exit
             if persisted_signal_exit_price is None:
                 persisted_signal_exit_price = resolved_exit_price
 

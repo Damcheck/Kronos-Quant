@@ -3157,12 +3157,21 @@ def _update_trade_signal_data(trade_id: str, updates: dict) -> None:
         return
 
 
-def _update_trade_fill(trade_id: str, fill_price: float, fill_kind: str, signal_price: float | None = None, exchange_order_id: str | None = None, filled_size: float | None = None) -> None:
+def _update_trade_fill(trade_id: str, fill_price: float, fill_kind: str, signal_price: float | None = None, exchange_order_id: str | None = None, filled_size: float | None = None, mark_price: float | None = None) -> None:
     """Update a trade row with fill details from direct execution.
 
     `filled_size` is the size the exchange actually filled (an IOC entry can
     partial-fill). On an entry fill we persist it to trades.size so stops,
     closes, and PnL act on the real position rather than the requested size.
+
+    Execution-quality instrumentation: `signal_price` is the backtest-EXPECTED
+    price for this leg (the kernel's next-bar-open fill) and is persisted to
+    signal_entry/exit_price, so entry/exit_slippage_bps is the realized
+    expected-vs-actual skew (adverse-positive). `mark_price` — the venue mark at
+    the moment the order was placed — splits that skew: expected -> mark is the
+    decision-lag component (persisted as entry/exit_lag_bps); mark -> fill is
+    venue slippage (the remainder). A paper fill IS the mark, so paper skew is
+    pure lag.
     """
     try:
         with get_db() as conn:
@@ -3211,19 +3220,31 @@ def _update_trade_fill(trade_id: str, fill_price: float, fill_kind: str, signal_
                 signal_data.pop("pending_open_reconcile_at", None)
                 signal_data.pop("open_execution_failure_reason", None)
                 ref_price = signal_price if signal_price not in (None, 0) else row["signal_entry_price"]
+                if signal_price not in (None, 0):
+                    updates.append("signal_entry_price = ?")
+                    values.append(float(signal_price))
                 if ref_price not in (None, 0):
                     side = "buy" if direction == "long" else "sell"
                     updates.append("entry_slippage_bps = COALESCE(?, entry_slippage_bps)")
                     values.append(_signed_slippage_bps(float(ref_price), float(fill_price), side))
+                    if mark_price not in (None, 0):
+                        updates.append("entry_lag_bps = COALESCE(?, entry_lag_bps)")
+                        values.append(_signed_slippage_bps(float(ref_price), float(mark_price), side))
             elif fill_kind == "exit":
                 updates.extend(["fill_exit_price = ?", "exit_price = ?"])
                 values.append(float(fill_price))
                 values.append(float(fill_price))
                 ref_price = signal_price if signal_price not in (None, 0) else row["signal_exit_price"]
+                if signal_price not in (None, 0):
+                    updates.append("signal_exit_price = ?")
+                    values.append(float(signal_price))
                 if ref_price not in (None, 0):
                     side = "sell" if direction == "long" else "buy"
                     updates.append("exit_slippage_bps = COALESCE(?, exit_slippage_bps)")
                     values.append(_signed_slippage_bps(float(ref_price), float(fill_price), side))
+                    if mark_price not in (None, 0):
+                        updates.append("exit_lag_bps = COALESCE(?, exit_lag_bps)")
+                        values.append(_signed_slippage_bps(float(ref_price), float(mark_price), side))
             else:
                 return
 
@@ -3520,6 +3541,7 @@ def _execute_direct(
                     signal_price=price,
                     exchange_order_id=exchange_order_id,
                     filled_size=filled_size_f,
+                    mark_price=result.get("mid"),
                 )
             if exchange_order_id is not None and "entry_exchange_order_id" not in order_meta:
                 order_meta["entry_exchange_order_id"] = exchange_order_id
@@ -3666,6 +3688,7 @@ def _execute_direct(
                     "exit",
                     signal_price=price,
                     exchange_order_id=exchange_order_id,
+                    mark_price=result.get("mid"),
                 )
             if exchange_order_id is not None and "exit_exchange_order_id" not in order_meta:
                 order_meta["exit_exchange_order_id"] = exchange_order_id
@@ -5614,7 +5637,16 @@ def _kernel_open_paper_trade(strat_id: str, strat: dict, action, *, sizing_equit
         register(trade_id, asset, direction, strat_id, float(alloc_risk), entry_price, execution_type="paper")
     except Exception:
         pass
-    _update_trade_fill(trade_id=trade_id, fill_price=entry_price, fill_kind="entry", signal_price=entry_price)
+    # Expected-vs-actual: the backtest-EXPECTED entry is the kernel's historical
+    # next-bar-open (kernel_entry_price), NOT the recorded fill — passing the fill
+    # as its own reference (the old behavior) made paper skew 0 by construction.
+    # A fill-now hop-in's entry_slippage_bps now records the real lag skew; a
+    # faithful open fills AT the expected price, so its 0 is a true measurement.
+    _update_trade_fill(
+        trade_id=trade_id, fill_price=entry_price, fill_kind="entry",
+        signal_price=kernel_entry_price if kernel_entry_price > 0 else entry_price,
+        mark_price=entry_price,
+    )
     return f"KERNEL-OPEN{' (fill-now)' if late else ''} {asset} {direction} @ {entry_price:.6g} size={units}"
 
 
@@ -5672,6 +5704,9 @@ def _kernel_close_recorded(
     sd = parse_trade_signal_data(row.get("signal_data"))
     late = bool(sd.get("late_entry"))
     exit_price = float(trade.get("exit_price") or 0.0)
+    # Backtest-EXPECTED exit (the kernel's own fill), captured BEFORE the fill-now
+    # override below so exit_slippage_bps measures expected-vs-actual, not fill-vs-fill.
+    kernel_exit_price = exit_price
     pnl_pct_net = float(trade.get("pnl_pct") or 0.0)  # kernel net, equity-fraction
     equity_at_entry = _coerce_positive_float(sd.get("kernel_equity_at_entry")) or _PAPER_SANDBOX_INITIAL_CAPITAL
     pnl_usd = round(float(equity_at_entry) * pnl_pct_net, 4)
@@ -5690,7 +5725,11 @@ def _kernel_close_recorded(
     )
     if fresh_exit:
         exit_price = float(current_price)
-    _update_trade_fill(trade_id=trade_id, fill_price=exit_price, fill_kind="exit", signal_price=exit_price)
+    _update_trade_fill(
+        trade_id=trade_id, fill_price=exit_price, fill_kind="exit",
+        signal_price=kernel_exit_price if kernel_exit_price > 0 else exit_price,
+        mark_price=exit_price,
+    )
     # closed_at = the kernel's actual EXIT-bar time (the trade really closed on the bar the
     # kernel exited on, not the scan moment). close_trade_record stamps it directly.
     # closed_at_override clamps it (used when a fill-now exit lands at/before the fill time)
@@ -5735,7 +5774,11 @@ def _kernel_close_recorded(
             _pnl_eq = 0.0
         _pnl_usd_eq = round(float(equity_at_entry) * _pnl_eq, 4)
         close_trade_record(
-            trade_id, signal_exit_price=exit_price, exit_price=exit_price,
+            # signal_exit_price = the backtest-EXPECTED exit; the actual fill-now
+            # exit is carried by exit_price/fill_exit_price (which win the close's
+            # price resolution), so PnL is unchanged and the skew columns survive.
+            trade_id, signal_exit_price=kernel_exit_price if kernel_exit_price > 0 else exit_price,
+            exit_price=exit_price,
             close_reason=exit_reason, close_price_source="kernel", closed_at=_closed_at,
             extra_signal_data={
                 "kernel_exit_time": trade.get("exit_time"), "kernel_managed": True,

@@ -1706,6 +1706,18 @@ async def run_job(job: dict) -> tuple[str, str | None]:
             )
             return "ok", None
 
+        # Execution-quality watchdog — nightly expected-vs-actual fill skew
+        # aggregated per strategy against its modeled cost budget
+        if kind == "exec_quality_watchdog":
+            from forven.monitoring import run_execution_quality_watchdog
+            result = await _run_sync_job(
+                run_execution_quality_watchdog,
+                lookback_days=int(payload.get("lookback_days", 30)),
+                min_trades=int(payload.get("min_trades", 5)),
+            )
+            flagged = int(result.get("flagged_count") or 0) if isinstance(result, dict) else 0
+            return "ok", (f"{flagged} strategy bucket(s) over cost budget" if flagged else None)
+
         if kind == "recalibrate":
             try:
                 from forven.recalibrator import check_and_recalibrate
@@ -3066,6 +3078,22 @@ def seed_forven_jobs():
         },
     )
 
+    # 5.5b. Execution-Quality Watchdog — nightly: flags strategies whose realized
+    # expected-vs-actual fill skew exceeds their modeled cost budget
+    add_job(
+        job_id="forven-exec-quality-watchdog",
+        name="Execution Quality Watchdog",
+        schedule_type="cron",
+        schedule_expr="30 6 * * *",
+        command="exec-quality-watchdog",
+        timezone_str="UTC",
+        payload={
+            "kind": "exec_quality_watchdog",
+            "lookback_days": 30,
+            "min_trades": 5,
+        },
+    )
+
     # 5.6. Adaptive regime recalibration — Every 30 minutes
     add_job(
         job_id="forven-recalibration",
@@ -3501,6 +3529,21 @@ def ensure_monitoring_jobs() -> int:
                 "kind": "slippage_monitor",
                 "lookback_hours": 168,
                 "max_trades": 2000,
+            },
+        )
+        added += 1
+    if "forven-exec-quality-watchdog" not in existing_ids:
+        add_job(
+            job_id="forven-exec-quality-watchdog",
+            name="Execution Quality Watchdog",
+            schedule_type="cron",
+            schedule_expr="30 6 * * *",
+            command="exec-quality-watchdog",
+            timezone_str="UTC",
+            payload={
+                "kind": "exec_quality_watchdog",
+                "lookback_days": 30,
+                "min_trades": 5,
             },
         )
         added += 1
