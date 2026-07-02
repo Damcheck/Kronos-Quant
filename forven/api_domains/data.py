@@ -1769,97 +1769,95 @@ _STREAM_CADENCES = {
 }
 
 
-def _stream_health_from_df(df, cadence_secs: int) -> dict:
-    """Build a stream health dict from a loaded DataFrame (or None)."""
+
+
+def _stream_health_from_footer(row_count: int, last_ms: int | None, cadence_secs: int) -> dict:
+    """Stream health from footer stats only — NEVER a full column/series load.
+    The previous implementation loaded the ENTIRE series into pandas just to
+    read the last timestamp; on the post-backfill 1m series (millions of rows)
+    that made the Datasets tab take seconds per click on the single worker."""
+    if not row_count or last_ms is None:
+        return {"status": "no_data", "row_count": 0, "last_updated": None, "data_age_hours": None}
     now = datetime.now(timezone.utc)
-    if df is None or df.empty:
-        return {
-            "status": "no_data",
-            "row_count": 0,
-            "last_updated": None,
-            "data_age_hours": None,
-        }
-    row_count = len(df)
+    last_ts = pd.Timestamp(last_ms, unit="ms", tz="UTC")
+    age_secs = (now - last_ts).total_seconds()
+    return {
+        "status": "live" if age_secs <= cadence_secs * 2 else "accumulating",
+        "row_count": int(row_count),
+        "last_updated": last_ts.isoformat(),
+        "data_age_hours": round(age_secs / 3600, 2),
+    }
+
+
+def _footer_stream_stats(path) -> tuple[int, int | None]:
+    """(row_count, last_ms) for a stream parquet from its footer; (0, None)
+    when absent/unreadable."""
+    from forven.data import _footer_bounds
+
     try:
-        last_ts = pd.to_datetime(df["timestamp"].iloc[-1], utc=True)
-        age_secs = (now - last_ts).total_seconds()
-        age_hours = round(age_secs / 3600, 2)
-        if age_secs <= cadence_secs * 2:
-            status = "live"
-        else:
-            status = "accumulating"
-        return {
-            "status": status,
-            "row_count": row_count,
-            "last_updated": last_ts.isoformat(),
-            "data_age_hours": age_hours,
-        }
+        if not path.exists():
+            return 0, None
+        rows, _, last_ms = _footer_bounds(path)
+        return rows, last_ms
     except Exception:
-        return {
-            "status": "accumulating",
-            "row_count": row_count,
-            "last_updated": None,
-            "data_age_hours": None,
-        }
+        return 0, None
 
 
 def get_stream_health(symbol: str) -> dict:
     """Return health for OHLCV, Funding, and OI streams for a symbol."""
     try:
-        from forven.data import load_parquet, symbol_to_fs
-        from forven.data_manager import (
-            FUNDING_DIR, OI_DIR, _load_stream_parquet,
-            data_manager,
-        )
+        from forven.data import _series_row_count, dataset_last_timestamp_ms, symbol_to_fs
+        from forven.data_manager import FUNDING_DIR, OI_DIR, data_manager
         fs_symbol = symbol_to_fs(symbol)
 
-        # OHLCV — use most recently active timeframe
+        # OHLCV — use most recently active timeframe (footer reads only)
         timeframes = data_manager.get_active_timeframes(symbol)
         tf = next(iter(timeframes)) if timeframes else "1h"
-        ohlcv_df = load_parquet(symbol, tf)
-        ohlcv_health = _stream_health_from_df(ohlcv_df, _STREAM_CADENCES["ohlcv"])
+        ohlcv_health = _stream_health_from_footer(
+            _series_row_count(symbol, tf),
+            dataset_last_timestamp_ms(symbol, tf),
+            _STREAM_CADENCES["ohlcv"],
+        )
         ohlcv_health["timeframe"] = tf
 
         # Funding
-        funding_path = FUNDING_DIR / fs_symbol / "history.parquet"
-        funding_df = _load_stream_parquet(funding_path)
-        funding_health = _stream_health_from_df(funding_df, _STREAM_CADENCES["funding"])
+        funding_rows, funding_last = _footer_stream_stats(FUNDING_DIR / fs_symbol / "history.parquet")
+        funding_health = _stream_health_from_footer(funding_rows, funding_last, _STREAM_CADENCES["funding"])
 
-        # OI
-        oi_df = None
+        # OI — first timeframe with data
+        oi_rows, oi_last = 0, None
         for t in list(timeframes) + ["1h", "4h"]:
-            oi_path = OI_DIR / fs_symbol / f"{t}.parquet"
-            candidate = _load_stream_parquet(oi_path)
-            if candidate is not None:
-                oi_df = candidate
+            oi_rows, oi_last = _footer_stream_stats(OI_DIR / fs_symbol / f"{t}.parquet")
+            if oi_rows:
                 break
-        oi_health = _stream_health_from_df(oi_df, _STREAM_CADENCES["oi"])
+        oi_health = _stream_health_from_footer(oi_rows, oi_last, _STREAM_CADENCES["oi"])
 
-        # Source reason
-        active_symbols = data_manager.get_active_symbols()
+        # Source reason — two scalar per-symbol counts. The previous code first
+        # computed the WHOLE active set (an ~1s unindexed backtest_results scan)
+        # just to decide whether to run these counts; the counts themselves
+        # already answer the question.
         reason = None
-        if fs_symbol in active_symbols:
-            try:
-                from forven.db import get_db
-                from datetime import timedelta
-                cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-                with get_db() as conn:
-                    strat_count = conn.execute(
-                        "SELECT COUNT(*) FROM strategies WHERE symbol = ? AND stage IN ('paper', 'paper_trading', 'live_graduated', 'deployed', 'gauntlet', 'active')",
-                        (fs_symbol,),
-                    ).fetchone()[0]
-                    bt_count = conn.execute(
-                        "SELECT COUNT(DISTINCT id) FROM backtest_results WHERE symbol = ? AND created_at >= ? AND deleted_at IS NULL",
-                        (fs_symbol, cutoff),
-                    ).fetchone()[0]
-                parts = []
-                if strat_count:
-                    parts.append(f"{strat_count} active {'strategy' if strat_count == 1 else 'strategies'}")
-                if bt_count:
-                    parts.append(f"{bt_count} recent {'backtest' if bt_count == 1 else 'backtests'}")
-                reason = ", ".join(parts) if parts else "in active set"
-            except Exception:
-                reason = "in active set"
+        try:
+            from forven.db import get_db
+            from datetime import timedelta
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+            with get_db() as conn:
+                strat_count = conn.execute(
+                    "SELECT COUNT(*) FROM strategies WHERE symbol = ? AND stage IN ('paper', 'paper_trading', 'live_graduated', 'deployed', 'gauntlet', 'active')",
+                    (fs_symbol,),
+                ).fetchone()[0]
+                bt_count = conn.execute(
+                    "SELECT COUNT(DISTINCT id) FROM backtest_results WHERE symbol = ? AND created_at >= ? AND deleted_at IS NULL",
+                    (fs_symbol, cutoff),
+                ).fetchone()[0]
+            parts = []
+            if strat_count:
+                parts.append(f"{strat_count} active {'strategy' if strat_count == 1 else 'strategies'}")
+            if bt_count:
+                parts.append(f"{bt_count} recent {'backtest' if bt_count == 1 else 'backtests'}")
+            reason = ", ".join(parts) if parts else None
+        except Exception:
+            reason = None
 
         return {
             "symbol": symbol,

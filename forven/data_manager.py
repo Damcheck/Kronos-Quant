@@ -1386,6 +1386,9 @@ class DataManager:
         # work): a delisted perp has no new bars, so sweeping it every cycle
         # is pure wasted API budget. TTL-cached; empty when no registry.
         self._delisted_cache: tuple[float, set[str]] = (0.0, set())
+        # TTL cache for the (expensive) active-symbol discovery, keyed by the
+        # include_recent_backtests variant.
+        self._active_symbols_cache: dict[bool, tuple[float, set[str]]] = {}
 
     _DELISTED_CACHE_TTL_SECONDS = 1800.0
 
@@ -1505,21 +1508,37 @@ class DataManager:
             log.warning("get_active_symbols failed: %s", exc)
         return symbols
 
+    # The active-set discovery costs ~1s (DISTINCT over backtest_results with
+    # no created_at index) and is hit by UI endpoints and every collector
+    # cycle. The set changes on strategy/promotion cadence, not per-second —
+    # a short TTL cache removes the repeated scan without staleness risk.
+    _ACTIVE_SYMBOLS_TTL_SECONDS = 60.0
+
     def get_active_symbols(self, *, include_recent_backtests: bool = True) -> set[str]:
         """Return symbols that should participate in background collection.
 
         Within a ``_cycle_cache()`` context, results are memoized per
         ``include_recent_backtests`` variant so repeat calls within one
-        collection cycle hit the DB at most once.
+        collection cycle hit the DB at most once; across cycles a 60s TTL
+        cache bounds the discovery cost for UI callers.
         """
         if self._cycle_cache_active:
             key = ("active_symbols", include_recent_backtests)
             if key in self._cycle_cache_store:
                 return self._cycle_cache_store[key]
-            val = self._fetch_active_symbols(include_recent_backtests=include_recent_backtests)
+            val = self._active_symbols_cached(include_recent_backtests)
             self._cycle_cache_store[key] = val
             return val
-        return self._fetch_active_symbols(include_recent_backtests=include_recent_backtests)
+        return self._active_symbols_cached(include_recent_backtests)
+
+    def _active_symbols_cached(self, include_recent_backtests: bool) -> set[str]:
+        now = datetime.now(timezone.utc).timestamp()
+        cached = self._active_symbols_cache.get(include_recent_backtests)
+        if cached is not None and now - cached[0] < self._ACTIVE_SYMBOLS_TTL_SECONDS:
+            return cached[1]
+        val = self._fetch_active_symbols(include_recent_backtests=include_recent_backtests)
+        self._active_symbols_cache[include_recent_backtests] = (now, val)
+        return val
 
     def _fetch_active_timeframes(self, symbol: str) -> set[str]:
         """Underlying DB fetch for ``get_active_timeframes``. Bypasses the cycle cache.

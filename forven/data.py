@@ -2171,16 +2171,60 @@ def cleanup_parquet_orphans() -> dict[str, Any]:
 
 
 def dataset_ohlcv(symbol: str, timeframe: str, limit: int = 100) -> dict[str, Any]:
+    """Most-recent ``limit`` bars for the data viewer.
+
+    Windowed DuckDB read (ORDER BY DESC LIMIT over cold+tail) + footer bounds —
+    the previous full pandas load served 100 rows by materializing MILLIONS on
+    the post-backfill 1m series. Falls back to the full load when DuckDB errors.
+    """
     fs_symbol = symbol_to_fs(symbol)
+    capped = max(1, int(limit))
+    try:
+        import duckdb
+
+        paths = [str(p) for p in (parquet_path(fs_symbol, timeframe), tail_path(fs_symbol, timeframe)) if p.exists()]
+        if not paths:
+            raise FileNotFoundError(f"dataset not found: {fs_symbol} {timeframe}")
+        with duckdb.connect(":memory:") as con:
+            rows = con.execute(
+                """
+                SELECT timestamp, open, high, low, close, volume
+                FROM read_parquet(?)
+                QUALIFY row_number() OVER (PARTITION BY timestamp) = 1
+                ORDER BY timestamp DESC
+                LIMIT ?
+                """,
+                [paths, capped],
+            ).fetchdf()
+        if rows.empty:
+            raise FileNotFoundError(f"dataset not found: {fs_symbol} {timeframe}")
+        rows = rows.iloc[::-1].reset_index(drop=True)
+        rows["timestamp"] = pd.to_datetime(rows["timestamp"], utc=True).map(_to_iso)
+        record = _footer_dataset_record(fs_symbol, timeframe, get_dataset_source(symbol, timeframe) or "local")
+        # Report the REAL source (e.g. binanceusdm) from the parquet metadata, not a
+        # generic "local", so this endpoint is self-describing and can't be silently
+        # confused with the HyperLiquid-served /api/ohlcv endpoint.
+        return {
+            "symbol": fs_symbol,
+            "timeframe": timeframe,
+            "source": record["source"],
+            "is_fallback": False,
+            "start": record["start_ts"],
+            "end": record["end_ts"],
+            "row_count": int(record["row_count"]),
+            "data": rows.to_dict("records"),
+        }
+    except FileNotFoundError:
+        raise
+    except Exception as exc:
+        log.warning("windowed dataset_ohlcv failed for %s %s; full-load fallback: %s", fs_symbol, timeframe, exc)
+
     frame = load_parquet(fs_symbol, timeframe)
     if frame is None or frame.empty:
         raise FileNotFoundError(f"dataset not found: {fs_symbol} {timeframe}")
-    rows = frame.tail(max(1, int(limit))).copy()
+    rows = frame.tail(capped).copy()
     rows["timestamp"] = rows["timestamp"].map(_to_iso)
     records = rows.to_dict("records")
-    # Report the REAL source (e.g. binanceusdm) from the parquet metadata, not a
-    # generic "local", so this endpoint is self-describing and can't be silently
-    # confused with the HyperLiquid-served /api/ohlcv endpoint.
     return {
         "symbol": fs_symbol,
         "timeframe": timeframe,
@@ -2241,15 +2285,20 @@ def _freshness_for(timeframe: str, last_ts: pd.Timestamp) -> dict[str, Any]:
 
 def compute_data_quality(symbol: str, timeframe: str) -> dict[str, Any]:
     fs_symbol = symbol_to_fs(symbol)
-    if _data_engine_read_enabled():
-        try:
-            from forven.dataeng.hub import get_data_hub
+    # DuckDB quality REGARDLESS of the engine flag: a native-code scan with
+    # column projection instead of a full pandas load. The pandas body below
+    # took seconds per call on post-backfill 1m series (millions of rows) and
+    # runs on every dataset selection in the UI — it is now only the fallback
+    # when DuckDB errors. Value parity between the two implementations is
+    # test-asserted (test_dataeng_foundation quality parity).
+    try:
+        from forven.dataeng.hub import get_data_hub
 
-            return get_data_hub().quality(fs_symbol, timeframe)
-        except FileNotFoundError:
-            raise
-        except Exception as exc:
-            log.warning("DataHub quality query failed for %s %s; falling back to legacy quality: %s", fs_symbol, timeframe, exc)
+        return get_data_hub().quality(fs_symbol, timeframe)
+    except FileNotFoundError:
+        raise
+    except Exception as exc:
+        log.warning("DuckDB quality scan failed for %s %s; pandas fallback: %s", fs_symbol, timeframe, exc)
 
     frame = load_parquet(fs_symbol, timeframe)
     if frame is None or frame.empty:

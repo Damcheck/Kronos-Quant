@@ -604,8 +604,12 @@ def test_cycle_cache_reuses_active_symbols(monkeypatch):
     assert calls["n"] == 1  # cache hit 2 of 3
 
 
-def test_cycle_cache_off_reloads_active_symbols(monkeypatch):
-    """Outside the cycle cache, every call hits the fetch helper."""
+def test_active_symbols_ttl_cache(monkeypatch):
+    """Outside the cycle cache, calls within the 60s TTL reuse one fetch —
+    the discovery costs ~1s (unindexed backtest_results scan) and is hit by
+    UI endpoints; expiring the TTL refetches."""
+    import time as _time
+
     dm = DataManager()
     calls = {"n": 0}
 
@@ -617,7 +621,16 @@ def test_cycle_cache_off_reloads_active_symbols(monkeypatch):
     dm.get_active_symbols()
     dm.get_active_symbols()
     dm.get_active_symbols()
-    assert calls["n"] == 3  # no cache outside cycle
+    assert calls["n"] == 1  # TTL cache: one fetch serves the burst
+
+    # Variants cache independently.
+    dm.get_active_symbols(include_recent_backtests=False)
+    assert calls["n"] == 2
+
+    # An expired TTL refetches.
+    dm._active_symbols_cache[True] = (_time.time() - 120, {"BTC-USDT"})
+    dm.get_active_symbols()
+    assert calls["n"] == 3
 
 
 def test_cycle_cache_reuses_active_timeframes(monkeypatch):
@@ -680,10 +693,15 @@ def test_cycle_cache_restores_state_on_exit(monkeypatch):
         dm.get_active_symbols()
         dm.get_active_symbols()
     assert calls["n"] == 1
-    # Outside the cycle, caching no longer applies
+    # Outside the cycle the TTL cache (not the cycle cache) applies: the fresh
+    # value is served from TTL, and expiring it forces a refetch.
+    import time as _time
+
     dm.get_active_symbols()
+    assert calls["n"] == 1
+    dm._active_symbols_cache[True] = (_time.time() - 120, {"BTC-USDT"})
     dm.get_active_symbols()
-    assert calls["n"] == 3
+    assert calls["n"] == 2
 
 
 # ---------------------------------------------------------------------------
