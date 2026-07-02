@@ -11,6 +11,7 @@
 	} from '$lib/api/diagnostics';
 	import ErrorBanner from '$lib/components/ErrorBanner.svelte';
 	import LoadingState from '$lib/components/LoadingState.svelte';
+	import NotificationsInbox from '$lib/components/diagnostics/NotificationsInbox.svelte';
 
 	// Task types that place orders / mutate external state. As of commit b008c12 these
 	// are deliberately NOT auto-resumed without a checkpoint, so a manual resume can
@@ -234,6 +235,10 @@
 	{#if loading && !snapshot}
 		<LoadingState message="Running diagnostics…" />
 	{/if}
+
+	<!-- Independent of the snapshot: the sidebar badge counts these, so the inbox
+	     must render (and be actionable) even if the health checks fail to load. -->
+	<NotificationsInbox />
 
 	{#if snapshot}
 		<div class="grid grid-cols-1 md:grid-cols-5 gap-4">

@@ -1148,6 +1148,8 @@ export async function getNotificationFeed(params: {
 	event_type?: string;
 	group_key?: string;
 	before_id?: number;
+	/** Server-side filter matching the nav-badge "actionable issues" rules. */
+	actionable?: boolean;
 } = {}): Promise<NotificationFeedResponse> {
 	const search = new URLSearchParams();
 	if (params.limit !== undefined) search.set('limit', String(params.limit));
@@ -1157,6 +1159,7 @@ export async function getNotificationFeed(params: {
 	if (params.event_type) search.set('event_type', params.event_type);
 	if (params.group_key) search.set('group_key', params.group_key);
 	if (params.before_id !== undefined) search.set('before_id', String(params.before_id));
+	if (params.actionable) search.set('actionable', 'true');
 	const query = search.toString();
 	return fetchApi(`/notifications${query ? `?${query}` : ''}`);
 }

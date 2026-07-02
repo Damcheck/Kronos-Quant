@@ -8,6 +8,7 @@
 	import { bootstrapActiveProcesses } from '$lib/stores/processTracker';
 	import { startHeartbeat, stopHeartbeat } from '$lib/stores/heartbeat';
 	import { connectForvenWs, disconnectForvenWs, forvenWsConnected } from '$lib/stores/forvenWebSocket';
+	import { startNotificationRouter, stopNotificationRouter } from '$lib/stores/notificationRouter';
 	import { shouldMarkBackendDisconnected } from '$lib/utils/connectionHealth';
 	import Sidebar from '$lib/components/Sidebar.svelte';
 	import Toast from '$lib/components/Toast.svelte';
@@ -66,7 +67,6 @@
 		'/lab': 'The Forge',
 		'/hypotheses': 'Crucibles',
 		'/agents': 'Agents',
-		'/memory': 'Memory',
 		'/tasks': 'Tasks',
 		'/approval': 'Approvals',
 		'/diagnostics': 'Diagnostics',
@@ -84,7 +84,6 @@
 		'/lab': 'Build, scan, and run the 24/7 autopilot lifecycle for strategy development.',
 		'/hypotheses': 'Track market theses, linked strategies, source artifacts, and the missing data that blocks them.',
 		'/agents': 'Review agent health, workloads, and orchestration status.',
-		'/memory': 'Explore, curate, and audit cross-source AI memory across narrative, Chroma, and workspace logs.',
 		'/tasks': 'Inspect task containers, ownership, status transitions, and execution audit trails.',
 		'/approval': 'Review Brain proposals and approve, deny, or revise execution tasks.',
 		'/diagnostics': 'Health checks, cost rollups, and resumable tasks for the Forven runtime.',
@@ -224,6 +223,7 @@
 
 	onMount(() => {
 		startWsChannel();
+		startNotificationRouter();
 		attemptHealthCheck();
 		reloadWizardSettings().then(() => {
 			if (wizardSettings?.setup_wizard_completed_at == null) {
@@ -238,6 +238,7 @@
 	onDestroy(() => {
 		stopPollers();
 		stopWsChannel();
+		stopNotificationRouter();
 		if (healthRetryTimer !== null) {
 			clearTimeout(healthRetryTimer);
 			healthRetryTimer = null;
@@ -271,9 +272,11 @@
 	</main>
 </div>
 
-<PositionAlertWidget />
-
-<Toast />
+<!-- Shared bottom-right notification stack: children must render plain flex items (no fixed positioning) so alerts and toasts stack instead of overlapping. -->
+<div class="fixed bottom-4 right-4 z-[9999] flex flex-col items-end gap-2 pointer-events-none">
+	<PositionAlertWidget />
+	<Toast />
+</div>
 
 <!-- Floating Chat Button -->
 <button

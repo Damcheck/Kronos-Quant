@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { page } from '$app/stores';
-	import { markNavIndicatorSeen } from '$lib/stores/navMetrics';
+	import { markNavIndicatorSeen, navRouteMetrics, navEventPulses } from '$lib/stores/navMetrics';
+	import NavBadge from '$lib/components/NavBadge.svelte';
 
 	export let connectionStatus: 'checking' | 'connected' | 'disconnected' | string = 'checking';
 
@@ -66,19 +67,9 @@
 			icon: 'M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z'
 		},
 		{
-			label: 'Memory',
-			href: '/memory',
-			icon: 'M6 4h12a2 2 0 012 2v12a2 2 0 01-2 2H8l-4 4V6a2 2 0 012-2zm2 3v2h8V7H8zm0 4v2h8v-2H8zm0 4v2h5v-2H8z'
-		},
-		{
 			label: 'Brain',
 			href: '/brain',
 			icon: 'M13 3a4 4 0 014 4v.18A4 4 0 0121 11v2a4 4 0 01-3 3.87V18a3 3 0 01-3 3h-1a3 3 0 01-3-3v-1H8a4 4 0 01-4-4v-2a4 4 0 014-4 4 4 0 014-4h1zm-2 4H8a2 2 0 00-2 2v4a2 2 0 002 2h3v3a1 1 0 001 1h1a1 1 0 001-1v-2h1a2 2 0 002-2v-2.18A4 4 0 0014 7.18V7a2 2 0 00-2-2h-1z'
-		},
-		{
-			label: 'Tasks',
-			href: '/tasks',
-			icon: 'M9 5h11v2H9V5zm0 6h11v2H9v-2zm0 6h11v2H9v-2zM4 6.5A1.5 1.5 0 115.5 5 1.5 1.5 0 014 6.5zm0 6A1.5 1.5 0 115.5 11 1.5 1.5 0 014 12.5zm0 6A1.5 1.5 0 115.5 17 1.5 1.5 0 014 18.5z'
 		},
 		{
 			label: 'Approvals',
@@ -127,14 +118,19 @@
 		);
 	}
 
-	$: {
-		const currentPath = $page.url.pathname;
+	// Depends on the metric/pulse stores too (not just navigation): while a
+	// route is active its indicators are seen by definition, so a heartbeat
+	// refresh must not resurrect a badge for the page the operator is already
+	// reading. markNavIndicatorSeen no-ops when already seen/clear.
+	function markActiveRouteSeen(currentPath: string, ..._deps: unknown[]): void {
 		allNavHrefs.forEach((href) => {
 			if (isRouteActive(href, currentPath)) {
 				markNavIndicatorSeen(href);
 			}
 		});
 	}
+
+	$: markActiveRouteSeen($page.url.pathname, $navRouteMetrics, $navEventPulses);
 </script>
 
 <aside class="relative z-40 w-60 flex-shrink-0 border-r border-[#222] bg-black flex flex-col">
@@ -162,6 +158,7 @@
 					<div class="min-w-0 flex-1">
 						<div class="truncate text-[11px] font-medium tracking-wide">{link.label}</div>
 					</div>
+					<NavBadge metric={$navRouteMetrics[link.href]} pulse={$navEventPulses[link.href]} active={isActive} />
 				</a>
 			{/each}
 		</div>
@@ -186,6 +183,7 @@
 						<div class="min-w-0 flex-1">
 							<div class="truncate text-[11px] font-medium tracking-wide">{link.label}</div>
 						</div>
+						<NavBadge metric={$navRouteMetrics[link.href]} pulse={$navEventPulses[link.href]} active={isActive} />
 					</a>
 				{/each}
 			</div>
@@ -208,6 +206,11 @@
 			<div class="min-w-0 flex-1">
 				<div class="truncate text-[11px] font-medium tracking-wide">{settingsLink.label}</div>
 			</div>
+			<NavBadge
+				metric={$navRouteMetrics[settingsLink.href]}
+				pulse={$navEventPulses[settingsLink.href]}
+				active={isRouteActive(settingsLink.href, $page.url.pathname)}
+			/>
 		</a>
 	</div>
 
