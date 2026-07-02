@@ -1,5 +1,28 @@
 # Edge Data Expansion — Implementation Plan (2026-07-02)
 
+> **Status 2026-07-02 (all runs SHIPPED on fable-updates; commits a4c1fca,
+> b57e730, 8a68eb7):**
+> - **Run 1** — symbol registry (inception/delist, catch-up-refreshed),
+>   research-universe planner/seeder + API, combined single-pass BV metrics
+>   (OI+LSR+taker), delisted keep-alive skip. Seed pending backend restart.
+> - **Run 2** — quality gate fail-closed in gauntlet quick_screen;
+>   data_fingerprint on every persisted backtest config; per-candidate as_of
+>   pinning (gauntlet_as_of_pin default ON); DATA_SCHEMA.md rewritten.
+> - **Run 3** — basis (premium index REST + BV deep backfill) and Deribit
+>   DVOL iv_btc/iv_eth live-verified; bucket-close shifted, NaN-not-zero;
+>   hourly scheduler jobs.
+> - **Run 4** — kernel intra-bar both-touched arbitration from the 1m path
+>   (flag `kernel_intrabar_resolution`, default OFF — flipping = re-baseline);
+>   bookDepth empirical depth artifact + /api/data/depth-calibration API
+>   (cost-model consumption deferred pending an order-size model decision).
+> - **Run 5** — HL venue series (partitioned layout) + hourly collection job
+>   + hl_divergence; source_reconciliation prefers stored venue series.
+>   Deferred: per-run backtest source=hyperliquid override (final-stage
+>   venue-fidelity backtest) — needs BacktestSubmitBody + loader threading.
+> - Operator actions outstanding: restart backend; POST
+>   /api/data/universe/seed (long download); the SINGLE combined re-baseline
+>   (perp rebuild + deep history + any flag flips).
+
 Goal: maximize the data surface available to strategy discovery (backtester +
 gauntlet) so more hypotheses can be tested on more evidence. Three levers, in
 order of statistical value:
