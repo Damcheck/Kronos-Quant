@@ -552,6 +552,33 @@ class TestLiveExecWalletRouting:
         # Wallet $5,000 x 10% = $500, NOT capital $100k x 10% = $10,000.
         assert abs(captured["notional"] - 500.0) < 1.0
 
+    def test_open_live_100pct_stays_under_book_cap(self, forven_db):
+        """At max_position=100% the sized notional must NOT exceed the wallet
+        equity (the book-budget cap = 100% of the book's own equity), or the
+        open is falsely refused at the boundary by a rounded-up size."""
+        from forven.bot_factory.live_exec import open_live
+        from forven.exchange import subaccounts
+
+        subaccounts.register_wallet("botfund", ADDR_A)
+        config = self._armed_bot_config("botfund")
+        config["capital_allocation"] = 100_000
+        config["max_position_pct"] = 100
+
+        captured: dict = {}
+
+        def _fake_budget(coin, direction, *, add_risk_usd, add_notional_usd, **kw):
+            captured["notional"] = add_notional_usd
+            return (False, "stopping the test after sizing")
+
+        with patch("forven.scanner._book_account_equity", return_value=20.0), \
+             patch("forven.scanner._get_real_account_equity", return_value=20.0), \
+             patch("forven.exchange.risk.can_open", return_value=(True, 0.0, "ok")), \
+             patch("forven.exchange.risk.check_live_portfolio_budget", _fake_budget):
+            open_live(config, ticker="ETH/USDT", direction="long", qty=999, ref_price=1704.0)
+        # A rounded-up size would land at ~$20.00001 and trip "> $20"; floored
+        # sizing keeps it at or under the wallet equity.
+        assert captured["notional"] <= 20.0
+
     def test_open_live_blocked_when_wallet_below_min_notional(self, forven_db):
         """A near-empty wallet gets a fundable block, not a doomed order."""
         from forven.bot_factory.live_exec import open_live

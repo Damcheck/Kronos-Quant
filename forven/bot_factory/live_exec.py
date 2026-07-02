@@ -25,6 +25,7 @@ gate stack behaves identically here and in the backend process.
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
 
 logger = logging.getLogger(__name__)
@@ -188,7 +189,12 @@ def open_live(
         max_pct = float(bot_config.get("max_position_pct") or 10) / 100.0
     except (TypeError, ValueError):
         max_pct = 0.10
-    qty = round((sizing_equity * max_pct) / ref_price, 6)
+    # FLOOR (not round) the size so notional never EXCEEDS the target fraction.
+    # At max_position=100% the target equals the book-budget cap (100% of the
+    # wallet's own equity); a rounded-up qty lands a hair over and the budget
+    # gate refuses the open ("adding $20 would exceed 100% of $20"). Flooring
+    # keeps it just under the cap.
+    qty = math.floor((sizing_equity * max_pct) / ref_price * 1e6) / 1e6
     add_notional = qty * ref_price
     # Hyperliquid rejects sub-minimum orders; block early with a fundable reason
     # rather than sending a doomed order that just marks a FAILED trade row.
