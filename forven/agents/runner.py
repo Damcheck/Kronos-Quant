@@ -1341,6 +1341,25 @@ async def _run_agent_task_inner(
             output["ai_trace"] = ai_trace
         if tool_trace:
             output["tool_trace"] = tool_trace
+
+        # Tools may persist structured fields onto output_data mid-run (e.g.
+        # register_strategy writes cited_skills for skill outcome closure). The
+        # completion UPDATE below replaces output_data wholesale, so carry those
+        # fields over or the citation is lost the moment the task finishes.
+        try:
+            with get_db() as conn:
+                _prior_row = conn.execute(
+                    "SELECT output_data FROM agent_tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+            _prior_output = _parse_json_object_or_empty(
+                _prior_row["output_data"] if _prior_row else None
+            )
+            _prior_cited = _prior_output.get("cited_skills")
+            if isinstance(_prior_cited, list) and _prior_cited:
+                output["cited_skills"] = _prior_cited
+        except Exception:
+            pass
+
         if task_type == "phantom_repair" and strategy_id:
             from forven.phantom_recovery import handle_phantom_repair_completion
 
@@ -1569,18 +1588,31 @@ async def _run_agent_task_inner(
             from forven.redact import redact_dict
 
             _fail_trace = getattr(e, "ai_attempts", [])
+            _fail_output: dict[str, object] = {
+                "request": redact_dict({
+                    "title": task.get("title"),
+                    "description": task.get("description"),
+                    "input_data": input_data,
+                })[0],
+                "ai_trace": _fail_trace,
+                "error_detail": _error_detail(e),
+            }
             with get_db() as conn:
+                # A task can register a strategy (persisting cited_skills onto
+                # output_data) and fail afterwards — the strategy still enters
+                # the pipeline, so the citations must survive this overwrite
+                # for skill outcome closure.
+                _prior_row = conn.execute(
+                    "SELECT output_data FROM agent_tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+                _prior_cited = _parse_json_object_or_empty(
+                    _prior_row["output_data"] if _prior_row else None
+                ).get("cited_skills")
+                if isinstance(_prior_cited, list) and _prior_cited:
+                    _fail_output["cited_skills"] = _prior_cited
                 conn.execute(
                     "UPDATE agent_tasks SET output_data=? WHERE id=?",
-                    (json.dumps({
-                        "request": redact_dict({
-                            "title": task.get("title"),
-                            "description": task.get("description"),
-                            "input_data": input_data,
-                        })[0],
-                        "ai_trace": _fail_trace,
-                        "error_detail": _error_detail(e),
-                    }), task_id),
+                    (json.dumps(_fail_output), task_id),
                 )
         except Exception:
             pass

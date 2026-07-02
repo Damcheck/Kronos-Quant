@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 log = logging.getLogger("forven.context")
 
 from forven.db import get_open_trades, get_recent_trades, get_strategies, kv_get, list_approvals
-from forven.strategy_diversity import render_strategy_diversity_guard
+from forven.strategy_diversity import render_failure_taxonomy, render_strategy_diversity_guard
 from forven.workspace import (
     read_operator_profile,
     read_workspace,
@@ -386,19 +386,27 @@ def build_agent_context(
     if diversity_guard:
         parts.append(diversity_guard)
 
+    # Structured failure taxonomy — gate_rejections aggregated by family × gate ×
+    # reason × regime. Written on every gate failure but never read back into any
+    # prompt (query_failure_taxonomy had zero callers), so generation kept
+    # re-mining regions the pipeline had already rejected.
+    failure_taxonomy = render_failure_taxonomy()
+    if failure_taxonomy:
+        parts.append(failure_taxonomy)
+
     # Learned quant skills — the curated, outcome-weighted "what works / what to
     # avoid" knowledge base. Previously extracted, versioned, and confidence-scored
     # but NEVER read back into any decision prompt (get_ideation_context had zero
     # callers), so the discovery loop couldn't reuse proven techniques or avoid
     # known anti-patterns. Injected here so every task-running agent sees it.
-    learned = _get_learned_skills_context()
+    learned = get_learned_skills_context()
     if learned:
         parts.append(learned)
 
     return "\n\n---\n\n".join(parts)
 
 
-def _get_learned_skills_context() -> str:
+def get_learned_skills_context() -> str:
     """Inject the curated quant-skills KB (regime-aware), best-effort.
 
     Uses the cached regime for tracked assets (no network/heavy detect) so this
@@ -422,7 +430,13 @@ def _get_learned_skills_context() -> str:
 
         block = get_ideation_context(regime=regime)
         if block and block.strip():
-            return f"# LEARNED KNOWLEDGE (from past outcomes)\n{block}"
+            return (
+                "# LEARNED KNOWLEDGE (from past outcomes)\n"
+                "If a skill below informs a strategy you register, cite its name via "
+                "register_strategy's cited_skills parameter — real outcomes then adjust "
+                "that skill's confidence.\n"
+                f"{block}"
+            )
     except Exception:
         pass  # skills KB unavailable — continue without it.
     return ""
