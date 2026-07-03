@@ -435,6 +435,7 @@ _AGENT_MODEL_CATALOG = [
     {"provider": "openai", "model_id": "gpt-5.2-mini", "label": "OpenAI GPT-5.2 Mini"},
     {"provider": "openai", "model_id": "gpt-5.4", "label": "OpenAI GPT-5.4"},
     {"provider": "openai", "model_id": "gpt-5.4-mini", "label": "OpenAI GPT-5.4 Mini"},
+    {"provider": "openai", "model_id": "gpt-5.5", "label": "OpenAI GPT-5.5"},
     {"provider": "openai", "model_id": "o1", "label": "OpenAI O1"},
     {"provider": "openai", "model_id": "o1-mini", "label": "OpenAI O1 Mini"},
     {"provider": "openai", "model_id": "o1-preview", "label": "OpenAI O1 Preview"},
