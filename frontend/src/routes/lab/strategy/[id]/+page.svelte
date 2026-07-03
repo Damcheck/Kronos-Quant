@@ -100,7 +100,10 @@
 
 	function startEditName(): void {
 		if (!container) return;
-		nameDraft = container.strategy.display_name ?? '';
+		// Seed with the currently displayed title so the field is editable,
+		// not blank. Falls back to the canonical name when no custom display
+		// name is set (mirrors what the label renders).
+		nameDraft = container.strategy.display_name || container.strategy.name || '';
 		editingName = true;
 	}
 
