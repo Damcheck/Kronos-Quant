@@ -49,7 +49,8 @@ _COMMON_FAMILIES = (
         "Use this to answer 'how are we doing?' / risk questions."
     ),
     input_schema={"type": "object", "properties": {}, "required": []},
-    permissions={"brain", None},
+    # risk-manager: read-only introspection for the scheduled risk audit.
+    permissions={"brain", "role:risk-manager", None},
 )
 def _tool_get_portfolio_status() -> str:
     from forven.db import get_open_trades, kv_get
@@ -129,7 +130,8 @@ def _tool_get_market_regime() -> str:
         },
         "required": ["strategy_id"],
     },
-    permissions={"brain", None},
+    # risk-manager: read-only introspection for the scheduled risk audit.
+    permissions={"brain", "role:risk-manager", None},
 )
 def _tool_get_strategy_detail(strategy_id: str) -> str:
     sid = str(strategy_id or "").strip()
@@ -400,7 +402,8 @@ def _tool_get_gate_report(strategy_id: str) -> str:
         },
         "required": [],
     },
-    permissions={"brain", None},
+    # risk-manager: read-only introspection for the scheduled risk audit.
+    permissions={"brain", "role:risk-manager", None},
 )
 def _tool_get_recent_trades(status: str = "", strategy_id: str = "", limit: int = 20) -> str:
     from forven.db import get_open_trades, get_recent_trades
@@ -628,7 +631,8 @@ def _tool_list_hypotheses(status: str = "", search: str = "", limit: int = 20) -
         "status, open positions, closed trades, realized PnL."
     ),
     input_schema={"type": "object", "properties": {}, "required": []},
-    permissions={"brain", None},
+    # risk-manager: read-only introspection for the scheduled risk audit.
+    permissions={"brain", "role:risk-manager", None},
 )
 def _tool_list_bots() -> str:
     from forven.api_domains.bot_factory import api_list_bots
