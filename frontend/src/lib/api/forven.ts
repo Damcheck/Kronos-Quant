@@ -2247,7 +2247,13 @@ export interface FactoryResetCategory {
 }
 
 export async function getSettings(): Promise<ForvenSettings> {
-	return fetchApi('/settings');
+	try {
+		return await fetchApi('/settings');
+	} catch {
+		const demo = await import('./demo');
+		demo.enableDemoMode();
+		return demo.getDemoSettings() as unknown as ForvenSettings;
+	}
 }
 
 export async function updateSettingsSection(section: string, data: Record<string, unknown>): Promise<{ status: string }> {

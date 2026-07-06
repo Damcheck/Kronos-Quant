@@ -35,8 +35,11 @@ const config = {
 					'self',
 					'http://localhost:*',
 					'http://127.0.0.1:*',
+					'https://*.onrender.com',
+					'https://*.vercel.app',
 					'ws://localhost:*',
 					'ws://127.0.0.1:*',
+					'wss://*.onrender.com',
 					'wss://stream.binance.com:9443'
 				],
 				'object-src': ['none'],

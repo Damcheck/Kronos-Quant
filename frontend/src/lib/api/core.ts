@@ -15,6 +15,13 @@ function trimTrailingSlash(value: string): string {
 }
 
 function resolveApiBase(): string {
+	// Cloud deployment: VITE_BACKEND_URL points to the Render backend
+	const backendUrl = (import.meta.env.VITE_BACKEND_URL ?? '').trim();
+	if (backendUrl) {
+		const base = trimTrailingSlash(backendUrl);
+		return base.endsWith('/api') ? base : `${base}/api`;
+	}
+
 	const configuredBase = (import.meta.env.VITE_API_BASE ?? '').trim();
 	if (configuredBase) {
 		if (configuredBase.startsWith('/')) {
@@ -425,6 +432,11 @@ export async function fetchApi<T>(endpoint: string, options?: RequestInit & { ti
 
 // Health check
 export async function checkHealth(): Promise<{ status: string;[key: string]: unknown }> {
+	// If already in demo mode, return synthetic health immediately
+	if ((await import('./demo')).isDemoMode()) {
+		return (await import('./demo')).getDemoHealthResponse();
+	}
+
 	await detectActiveApiBase();
 	const orderedCandidates = Array.from(new Set([ACTIVE_API_BASE, ...API_BASE_CANDIDATES]));
 	for (let index = 0; index < orderedCandidates.length; index += 1) {
@@ -445,12 +457,20 @@ export async function checkHealth(): Promise<{ status: string;[key: string]: unk
 			}
 			continue;
 		} catch {
-			if (isLast) throw new Error('Backend not reachable');
+			if (isLast) {
+				// Backend unreachable — activate demo mode
+				const demo = await import('./demo');
+				demo.enableDemoMode();
+				return demo.getDemoHealthResponse();
+			}
 			continue;
 		}
 	}
 
-	throw new Error('Backend not reachable');
+	// All candidates exhausted — activate demo mode
+	const demo = await import('./demo');
+	demo.enableDemoMode();
+	return demo.getDemoHealthResponse();
 }
 
 export function asRecord(value: unknown): Record<string, unknown> | null {

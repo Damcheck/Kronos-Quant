@@ -227,10 +227,13 @@
 		startWsChannel();
 		startNotificationRouter();
 		attemptHealthCheck();
-		reloadWizardSettings().then(() => {
-			if (wizardSettings?.setup_wizard_completed_at == null) {
+		reloadWizardSettings().then(async () => {
+			const { isDemoMode } = await import('$lib/api/demo');
+			if (!isDemoMode() && wizardSettings?.setup_wizard_completed_at == null) {
 				openWizard();
 			}
+		}).catch(() => {
+			// Demo mode — skip wizard
 		});
 		if (typeof window !== 'undefined') {
 			window.addEventListener('forven:reconnected', handleReconnect);
