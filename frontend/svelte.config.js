@@ -13,7 +13,8 @@ const config = {
 			? adapterStatic({ pages: 'build', assets: 'build', fallback: 'index.html', strict: false })
 			: adapterAuto(),
 		prerender: {
-			handleUnseenRoutes: 'warn'
+			handleUnseenRoutes: 'warn',
+			handleHttpError: 'warn'
 		},
 		// SECURITY (audit 2026-06-22, M5): a Content-Security-Policy is the
 		// defense-in-depth backstop for the localStorage-resident API/operator
