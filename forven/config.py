@@ -178,6 +178,20 @@ def is_beta_build() -> bool:
     return os.environ.get("FORVEN_ENV", "").strip().lower() == "beta"
 
 
+def is_forex_enabled() -> bool:
+    """True when forex/MT5 support is explicitly enabled.
+
+    Gated behind FORVEN_ENABLE_FOREX=1 (env var) or {"enable_forex": true}
+    in config.json. Off by default so existing crypto-only deployments see
+    zero behaviour change until someone opts in (brief §8.1).
+    """
+    env = os.environ.get("FORVEN_ENABLE_FOREX", "").strip()
+    if env:
+        return _parse_bool(env)
+    cfg = load_config()
+    return _parse_bool(cfg.get("enable_forex", False))
+
+
 def get_execution_mode() -> str:
     """Get execution mode: 'paper' or 'live'.
 

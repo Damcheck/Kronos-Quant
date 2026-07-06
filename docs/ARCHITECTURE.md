@@ -176,10 +176,28 @@ ChromaDB is used for memory and retrieval-style workflows. The frontend exposes 
 - Soak report: `/api/system/soak-report`
 - Live websocket: `/api/ws/live` and `/ws/live`
 
+## Trading Execution Layer (Brokers & Risk)
+
+Forven supports multi-asset execution through a unified `Broker` protocol while explicitly separating the underlying market mechanics (e.g., Crypto vs. Forex).
+
+### Broker Router
+
+The execution path uses `BrokerRouter` to dispatch trades based on the asset class of the traded symbol:
+- **Crypto:** Routed to `HyperliquidBroker` (REST/WS API, wallet-based auth).
+- **Forex:** Routed to `MT5Broker` (via MetaTrader 5 terminal, login/password auth), gated by the `FORVEN_ENABLE_FOREX` feature flag.
+
+### Risk Management
+
+To prevent systemic failures across asset classes, risk is managed on a **shared chassis but partitioned mathematically**:
+- **Budget Partitioning:** The global risk budget is split into strict fractional allocations (e.g., 70% Crypto, 30% Forex). Losses in one asset class cannot consume the other's budget.
+- **Concurrent Positions:** Maximum open position limits are tracked independently per asset class.
+- **Kill-Switches:** The daily loss limit can be configured to trigger per-broker/asset-class or globally.
+- **Cost Models:** Execution cost models are strictly separate. Crypto models standard taker/maker fees and funding rates, whereas Forex probabilistically models session-aware spreads and directional overnight swap/rollover costs (`costs_forex.py`).
+
 ## Development Rules
 
 - Use absolute Python imports
 - Keep backend routers thin
 - Add frontend API wrappers instead of raw component fetches
-- Treat `forven/exchange/` as sensitive integration code
+- Treat `forven/exchange/` as sensitive integration code (all check-then-act sequences must use the atomic `try_open_position` lock)
 - Update docs when route surfaces, startup flows, or operator behavior change

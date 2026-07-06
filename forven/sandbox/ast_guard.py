@@ -67,6 +67,7 @@ ALLOWED_IMPORTS: frozenset[str] = frozenset(
         "pandas_ta",
         "scipy",
         "sklearn",
+        "MetaTrader5",
         # Pure-computation stdlib — none of these expose a filesystem, network,
         # process, or dynamic-exec primitive.
         "math",

@@ -2345,3 +2345,78 @@ class HyperLiquidFeed:
                 pass
             self._fallback_counter += 1
             await asyncio.sleep(5)
+
+# ---------------------------------------------------------------------------
+# Broker Protocol Implementation
+# ---------------------------------------------------------------------------
+
+from forven.exchange.broker_protocol import Broker
+from typing import Any
+
+class HyperliquidBroker:
+    """Hyperliquid implementation of the Broker protocol."""
+    
+    def get_account_value(self, testnet: bool = True, **kwargs) -> dict[str, Any]:
+        return get_account_value(testnet=testnet, **kwargs)
+        
+    def place_order(
+        self,
+        symbol: str,
+        is_buy: bool,
+        size: float,
+        price: float | None = None,
+        testnet: bool = True,
+        **kwargs
+    ) -> Any:
+        # If price is provided, it's a limit order, else market.
+        if price is None:
+            return market_order(
+                asset=symbol,
+                is_buy=is_buy,
+                size=size,
+                testnet=testnet,
+                **kwargs
+            )
+        else:
+            return limit_order(
+                asset=symbol,
+                is_buy=is_buy,
+                price=price,
+                size=size,
+                testnet=testnet,
+                **kwargs
+            )
+            
+    def cancel_order(
+        self,
+        symbol: str,
+        order_id: str,
+        testnet: bool = True,
+        **kwargs
+    ) -> Any:
+        return cancel_order(asset=symbol, oid=int(order_id), testnet=testnet, **kwargs)
+        
+    def get_positions(self, testnet: bool = True, **kwargs) -> list[dict[str, Any]]:
+        # Returns raw positions list from dict format returned by get_positions()
+        raw = get_positions(testnet=testnet, **kwargs)
+        return raw.get("positions", []) if isinstance(raw, dict) else raw
+        
+    def close_position(
+        self,
+        symbol: str,
+        testnet: bool = True,
+        **kwargs
+    ) -> Any:
+        return close_position(asset=symbol, testnet=testnet, **kwargs)
+        
+    def get_current_price(
+        self,
+        symbol: str,
+        testnet: bool = True,
+        **kwargs
+    ) -> float:
+        # Retrieve the latest mid price from the mids cache or API
+        mids = _get_mids_cache_read_through(testnet=testnet)
+        if symbol not in mids:
+            raise ValueError(f"No price found for {symbol}")
+        return mids[symbol]

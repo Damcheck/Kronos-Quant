@@ -54,6 +54,7 @@ dependencies = [
 
 [project.optional-dependencies]
 discord = ["discord.py>=2.3"]
+forex = ["MetaTrader5>=5.0.0"]
 
 [project.scripts]
 forven = "forven.cli:cli"

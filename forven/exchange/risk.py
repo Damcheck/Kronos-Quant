@@ -24,7 +24,7 @@ from forven.trade_state import (
 
 log = logging.getLogger("forven.exchange.risk")
 
-_POSITION_LOCK = threading.Lock()
+_POSITION_LOCK = threading.RLock()
 _RISK_STATE_LOCK = threading.RLock()
 _KILL_SWITCH_CLOSE_MAX_ATTEMPTS = 3
 _KILL_SWITCH_CLOSE_INITIAL_BACKOFF_SECONDS = 0.25
@@ -278,6 +278,11 @@ def _is_strategy_in_loss_cooldown(strategy: str, cooldown_hours: float) -> tuple
 # Correlation groups — assets in same group are treated as one correlated pool
 CORRELATION_GROUPS = {
     "crypto_major": ["BTC", "ETH", "SOL", "BNB", "AVAX", "LINK", "MATIC"],
+    # Brief §4.3: USD-bloc majors move together against USD strength.
+    # JPY/CHF are risk-off-correlated and grouped separately.
+    "forex_usd_bloc": ["EURUSD", "GBPUSD", "AUDUSD", "NZDUSD"],
+    "forex_jpy_chf": ["USDJPY", "USDCHF"],
+    "forex_commodity": ["USDCAD", "AUDUSD", "NZDUSD"],
 }
 
 # Reverse lookup
@@ -541,6 +546,63 @@ _PORTFOLIO_BUDGET_DEFAULTS = {
     "live_hard_max_order_notional_pct": 100.0,
     "live_max_book_notional_pct": 100.0,
 }
+
+# ──────────────────────────────────────────────────────────────────────────
+# §5 DESIGN DECISIONS — Forex/MT5 Integration (decided, not implicit)
+#
+# Decision 1 (§5.1): Portfolio risk budget is PARTITIONED by asset class.
+#   Crypto and forex have different volatility/drawdown profiles; a bad week
+#   in one should not zero-out the other's risk allowance. The split is
+#   configurable via risk settings (keys below). Default: 70% crypto / 30% forex.
+#
+# Decision 2 (§5.2): Max concurrent position count is PER ASSET CLASS.
+#   Forex positions (fewer, larger relative to pip risk) should not compete
+#   for slots with crypto positions. Default: 10 crypto, 5 forex.
+#
+# Decision 3 (§5.3): Daily-loss kill-switch is PER BROKER / ASSET CLASS.
+#   MT5 and Hyperliquid are functionally separate pools of capital on
+#   different brokers. A crypto kill-switch should not halt forex trading
+#   (and vice versa), since the drawdown is broker-specific.
+# ──────────────────────────────────────────────────────────────────────────
+
+_RISK_PARTITION_DEFAULTS = {
+    # Budget partition: fraction of the total risk budget allocated to each
+    # asset class. Must sum to ≤ 1.0 (remainder is unallocated reserve).
+    "crypto_budget_fraction": 0.70,
+    "forex_budget_fraction": 0.30,
+    # Max concurrent positions per asset class
+    "crypto_max_concurrent": 10,
+    "forex_max_concurrent": 5,
+    # Per-broker kill-switch: if True, the daily-loss kill-switch is evaluated
+    # independently per asset class (Hyperliquid vs MT5). If False, a single
+    # combined kill-switch fires across all asset classes.
+    "kill_switch_per_asset_class": True,
+}
+
+
+def get_risk_partition(settings: dict | None = None) -> dict:
+    """Return the current risk-budget partition configuration.
+
+    Reads from risk settings (kv store), falling back to _RISK_PARTITION_DEFAULTS.
+    """
+    if settings is None:
+        settings = _load_risk_settings()
+    result = {}
+    for key, default in _RISK_PARTITION_DEFAULTS.items():
+        raw = settings.get(key)
+        if raw is not None:
+            try:
+                if isinstance(default, bool):
+                    result[key] = str(raw).strip().lower() in {"1", "true", "yes"}
+                elif isinstance(default, int):
+                    result[key] = int(raw)
+                else:
+                    result[key] = float(raw)
+            except (TypeError, ValueError):
+                result[key] = default
+        else:
+            result[key] = default
+    return result
 # Risk fallback for a live row with no recorded stop (should not exist — live
 # opens are refused without one; adopted/recovered rows are the edge case).
 # Mirrors sizing.DEFAULT_STOP_LOSS_PCT_FLOOR so the assumption lives in one place.
@@ -1022,6 +1084,30 @@ def _held_pair_correlations_safe(positions: list[dict], settings: dict) -> dict:
         log.debug("held-pair correlation snapshot failed", exc_info=True)
         return {}
 
+
+from contextlib import contextmanager
+
+@contextmanager
+def try_open_position(
+    asset: str, direction: str, strategy: str,
+    risk_pct: float | None = None,
+    *,
+    execution_type: str | None = None,
+    book: str | None = None,
+    enforce_risk_caps: bool = True,
+):
+    """
+    Atomic Check-and-Act block for opening a new position.
+    Yields (allowed, alloc_risk, reason) while holding the _POSITION_LOCK.
+    If allowed=True, the caller should do its DB inserts and register()
+    inside the with-block to prevent TOCTOU races.
+    """
+    with _POSITION_LOCK:
+        allowed, alloc, why = can_open(
+            asset, direction, strategy, risk_pct,
+            execution_type=execution_type, book=book, enforce_risk_caps=enforce_risk_caps
+        )
+        yield allowed, alloc, why
 
 def can_open(
     asset: str, direction: str, strategy: str,

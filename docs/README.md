@@ -16,6 +16,15 @@ Use this folder as the source of truth for onboarding and day-to-day operation.
 - [THREE_DAY_HANDS_OFF_READINESS_CHECKLIST.md](THREE_DAY_HANDS_OFF_READINESS_CHECKLIST.md): operational readiness snapshot
 - [STRATEGY_CONTAINER_MASTER_PLAN.md](STRATEGY_CONTAINER_MASTER_PLAN.md): longer-horizon strategy container planning
 
+## Multi-Asset Execution
+
+Forven operates a unified trading engine that supports multiple asset classes.
+Currently supported integrations:
+- **Crypto:** via Hyperliquid REST/WS API
+- **Forex (Opt-in):** via MetaTrader 5 (MT5)
+
+See `ARCHITECTURE.md` for details on how risk budgets, cost models, and concurrent positions are mathematically partitioned across asset classes to prevent systemic cross-market failures.
+
 ## Notes
 
 - Some files in this folder are design plans or audit snapshots rather than onboarding docs.

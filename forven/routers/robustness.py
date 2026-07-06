@@ -1440,6 +1440,14 @@ def _run_cost_stress_analysis(body: CostStressBody) -> dict:
     if baseline_error:
         raise HTTPException(400, baseline_error)
 
+    from forven.gauntlet.costs_crypto import get_crypto_stress_fees
+    stressed_fee, stressed_slippage = get_crypto_stress_fees(
+        base_fee,
+        base_slippage,
+        float(body.fee_multiplier),
+        float(body.slippage_multiplier),
+    )
+
     stressed_run = backtest_strategy(
         strategy_id=body.strategy_id,
         asset=body.symbol,
@@ -1447,8 +1455,8 @@ def _run_cost_stress_analysis(body: CostStressBody) -> dict:
         params=params,
         bars=len(candles),
         timeframe=body.timeframe,
-        fee_bps=base_fee * float(body.fee_multiplier),
-        slippage_bps=base_slippage * float(body.slippage_multiplier),
+        fee_bps=stressed_fee,
+        slippage_bps=stressed_slippage,
         persist_legacy_run=False,
         candles_df=candles,
         regime_gate=False,  # Cost-stress tests parameter sensitivity, not regime fit
