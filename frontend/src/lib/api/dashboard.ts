@@ -352,12 +352,9 @@ export async function getDashboardOverview(): Promise<DashboardOverview> {
 	try {
 		return await fetchApi('/dashboard/overview');
 	} catch (error) {
-		if (isDemoMode() || !isNotFoundError(error)) {
-			const demo = await import('./demo');
-			demo.enableDemoMode();
-			return demo.getDemoDashboardOverview() as unknown as DashboardOverview;
-		}
-		return getLegacyDashboardOverview();
+		const demo = await import('./demo');
+		demo.enableDemoMode();
+		return demo.getDemoDashboardOverview() as unknown as DashboardOverview;
 	}
 }
 
@@ -440,20 +437,8 @@ export async function getDashboardActivity(limit = 50): Promise<DashboardActivit
 			.filter((row): row is DashboardActivityItem => Boolean(row));
 	} catch (error) {
 		const demo = await import('./demo');
-		if (demo.isDemoMode()) return demo.getDemoDashboardActivity(limit) as unknown as DashboardActivityItem[];
-		if (!isNotFoundError(error)) {
-			demo.enableDemoMode();
-			return demo.getDemoDashboardActivity(limit) as unknown as DashboardActivityItem[];
-		}
-		try {
-			const rows = await fetchApi<Array<Record<string, unknown>>>(`/logs?limit=${limit}`);
-			return rows
-				.map((row, index) => normalizeDashboardActivityItem(row, index))
-				.filter((row): row is DashboardActivityItem => Boolean(row));
-		} catch {
-			demo.enableDemoMode();
-			return demo.getDemoDashboardActivity(limit) as unknown as DashboardActivityItem[];
-		}
+		demo.enableDemoMode();
+		return demo.getDemoDashboardActivity(limit) as unknown as DashboardActivityItem[];
 	}
 }
 
@@ -704,35 +689,8 @@ export async function getDashboardWinners(limit = 10): Promise<WinnerEntry[]> {
 		return normalized.slice(0, limit);
 	} catch (error) {
 		const demo = await import('./demo');
-		if (demo.isDemoMode()) return demo.getDemoDashboardWinners(limit) as unknown as WinnerEntry[];
-		if (!isNotFoundError(error)) {
-			demo.enableDemoMode();
-			return demo.getDemoDashboardWinners(limit) as unknown as WinnerEntry[];
-		}
-		try {
-			const leaderboard = await getDashboardLeaderboard({ sort_by: 'sharpe_ratio', limit: Math.max(limit, 30) });
-			return leaderboard
-				.filter((entry) => (entry.tier ?? tierFromSharpe(entry.sharpe_ratio)) !== 'weak')
-				.slice(0, limit)
-				.map((entry, idx) => ({
-					id: String(entry.id ?? `${entry.strategy_name}-${idx}`),
-					strategy_name: entry.strategy_name,
-					symbol: entry.symbol,
-					timeframe: entry.timeframe,
-					deflated_sharpe: toNumberOr(entry.deflated_sharpe, entry.sharpe_ratio),
-					total_return: toNumberOr(entry.total_return, 0),
-					monthly_return_pct: entry.monthly_return_pct ?? null,
-					annualized_return_pct: entry.annualized_return_pct ?? null,
-					max_drawdown: toNumberOr(entry.max_drawdown, 0),
-					total_trades: toNumberOr(entry.total_trades, 0),
-					tier: entry.tier ?? tierFromSharpe(entry.sharpe_ratio),
-					created_at: new Date().toISOString(),
-					scan_id: String(entry.scan_id ?? ''),
-				}));
-		} catch {
-			demo.enableDemoMode();
-			return demo.getDemoDashboardWinners(limit) as unknown as WinnerEntry[];
-		}
+		demo.enableDemoMode();
+		return demo.getDemoDashboardWinners(limit) as unknown as WinnerEntry[];
 	}
 }
 
