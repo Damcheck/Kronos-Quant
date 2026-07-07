@@ -1440,14 +1440,6 @@ def _run_cost_stress_analysis(body: CostStressBody) -> dict:
     if baseline_error:
         raise HTTPException(400, baseline_error)
 
-    from forven.gauntlet.costs_crypto import get_crypto_stress_fees
-    stressed_fee, stressed_slippage = get_crypto_stress_fees(
-        base_fee,
-        base_slippage,
-        float(body.fee_multiplier),
-        float(body.slippage_multiplier),
-    )
-
     stressed_run = backtest_strategy(
         strategy_id=body.strategy_id,
         asset=body.symbol,
@@ -1455,8 +1447,8 @@ def _run_cost_stress_analysis(body: CostStressBody) -> dict:
         params=params,
         bars=len(candles),
         timeframe=body.timeframe,
-        fee_bps=stressed_fee,
-        slippage_bps=stressed_slippage,
+        fee_bps=base_fee * float(body.fee_multiplier),
+        slippage_bps=base_slippage * float(body.slippage_multiplier),
         persist_legacy_run=False,
         candles_df=candles,
         regime_gate=False,  # Cost-stress tests parameter sensitivity, not regime fit
@@ -2515,6 +2507,39 @@ def _submit_result(
             pass
 
     return {"job_id": job_id, "status": "running", "result_id": result_id}
+
+
+@router.get("/api/robustness/walk-forward/window-recommendation/{strategy_id}")
+def get_walk_forward_window_recommendation(
+    strategy_id: str,
+    timeframe: str | None = None,
+    n_splits: int | None = None,
+    train_ratio: float | None = None,
+):
+    """Recommend a WFA window sized to the strategy's measured trade rate.
+
+    Single source of truth = forven.wfa_window (the same rule that floors the
+    canonical runner's defaulted window), so the UI default and the gauntlet
+    re-runs can never disagree about what an adequate window is. Also returns
+    concrete start/end dates for direct use by the Robustness tab.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from forven.wfa_window import recommended_wfa_window
+
+    row = _load_strategy_row(strategy_id)
+    resolved_timeframe = str(timeframe or row["timeframe"] or "1h").strip() or "1h"
+    recommendation = recommended_wfa_window(
+        strategy_id,
+        resolved_timeframe,
+        n_splits=n_splits,
+        train_ratio=train_ratio,
+    )
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=int(recommendation["window_days"]))
+    recommendation["recommended_start_date"] = start.isoformat()
+    recommendation["recommended_end_date"] = end.isoformat()
+    return recommendation
 
 
 @router.post("/api/robustness/walk-forward")

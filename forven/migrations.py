@@ -608,18 +608,6 @@ def _m_2026_07_bot_live_wallet(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE bot_configs ADD COLUMN live_wallet TEXT")
 
 
-def _m_2026_07_add_broker_asset_class(conn: sqlite3.Connection) -> None:
-    for table in ["strategies", "trades"]:
-        cols = {
-            r[1]
-            for r in conn.execute(f"PRAGMA table_info({table})").fetchall()
-        }
-        if "broker" not in cols:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN broker TEXT")
-        if "asset_class" not in cols:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN asset_class TEXT")
-
-
 # Append new migrations to the END of this list. Never reorder, rename, or
 # delete existing entries — doing so will cause migrations to re-run on
 # databases that already applied them under the old name, or to silently
@@ -671,10 +659,6 @@ MIGRATIONS: list[Migration] = [
     Migration(
         name="2026_07_bot_live_wallet",
         up=_m_2026_07_bot_live_wallet,
-    ),
-    Migration(
-        name="2026_07_add_broker_asset_class",
-        up=_m_2026_07_add_broker_asset_class,
     ),
 ]
 

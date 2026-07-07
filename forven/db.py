@@ -5,13 +5,7 @@ import logging
 import os
 import re
 import shutil
-
-db_url = os.environ.get("FORVEN_DATABASE_URL", "")
-if "postgres" in db_url.lower():
-    from forven import psycopg_wrapper as sqlite3
-else:
-    import sqlite3
-
+import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path

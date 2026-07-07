@@ -57,6 +57,9 @@ export interface PaperTrade {
 	net_pnl_pct: number | null;
 	entry_fee_bps: number;
 	exit_fee_bps: number;
+	entry_fee_usd?: number | null;
+	exit_fee_usd?: number | null;
+	slippage_usd?: number | null;
 	close_reason?: string | null;
 	close_incomplete?: boolean;
 }

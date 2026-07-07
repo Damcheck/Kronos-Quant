@@ -712,7 +712,7 @@ function Start-BackendService {
         Throw-StartAllError "Port $backendPort occupied by unkillable process and service is not healthy."
     }
     Write-Info "Starting backend on ${backendHost}:$backendPort ..."
-    $proc = Start-LoggedProcess -FilePath $python -CommandArgs @("-m","uvicorn","forven.api:app","--host",$backendHost,"--port",$backendPort.ToString(),"--workers",$backendWorkers.ToString()) `
+    $proc = Start-LoggedProcess -FilePath $python -CommandArgs @("-m","uvicorn","--app-dir",$script:RepoRoot,"forven.api:app","--host",$backendHost,"--port",$backendPort.ToString(),"--workers",$backendWorkers.ToString()) `
         -WorkingDirectory $script:RepoRoot -StdOutPath $backendLog -StdErrPath $backendErr
     if (-not (Wait-ForHttp -Url $backendHealth -Label "Backend")) {
         if (Test-Path $backendErr) { Get-Content $backendErr -Tail 120 }

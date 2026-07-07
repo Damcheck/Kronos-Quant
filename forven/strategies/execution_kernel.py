@@ -67,6 +67,50 @@ def round_trip_drag(fee_bps: float, slippage_bps: float, leverage: float) -> flo
     )
 
 
+def cost_breakdown_usd(
+    *,
+    equity_at_entry: float,
+    leverage: float,
+    size_fraction: float,
+    fee_bps: float,
+    slippage_bps: float,
+    funding_gain_pct: float = 0.0,
+    net_pnl_usd: float | None = None,
+) -> dict:
+    """Itemize, in dollars, the costs :func:`round_trip_drag` already charged inside
+    a kernel trade's net ``pnl_pct`` — for persistence into the trade's signal_data
+    so reporting can show fees/slippage/funding instead of a bare net number.
+
+    The drag is priced on the entry notional (``equity * leverage * size_fraction``)
+    at ``fee_bps`` per side. ``funding_gain_pct`` is the kernel's funding term
+    (equity fraction, positive = credit received); it is flipped to the pipeline-wide
+    cost-positive ``funding_usd`` convention. When ``net_pnl_usd`` is given,
+    ``gross_pnl_usd`` (pure price PnL before every cost) is reconstructed so that
+    net + itemized costs always sum exactly back to gross.
+    """
+    notional = (
+        max(float(equity_at_entry or 0.0), 0.0)
+        * max(float(leverage or 0.0), 0.0)
+        * max(float(size_fraction or 0.0), 0.0)
+    )
+    leg_fee = (max(float(fee_bps or 0.0), 0.0) / 10000.0) * notional
+    slippage_usd = 2.0 * (max(float(slippage_bps or 0.0), 0.0) / 10000.0) * notional
+    funding_usd = -float(funding_gain_pct or 0.0) * max(float(equity_at_entry or 0.0), 0.0)
+    breakdown = {
+        "fee_bps": max(float(fee_bps or 0.0), 0.0),
+        "entry_fee_usd": round(leg_fee, 6),
+        "exit_fee_usd": round(leg_fee, 6),
+        "total_fees_usd": round(2.0 * leg_fee, 6),
+        "slippage_usd": round(slippage_usd, 6),
+        "funding_usd": round(funding_usd, 6),
+    }
+    if net_pnl_usd is not None:
+        breakdown["gross_pnl_usd"] = round(
+            float(net_pnl_usd) + 2.0 * leg_fee + slippage_usd + funding_usd, 6
+        )
+    return breakdown
+
+
 @dataclass
 class KernelResult:
     """Output of :func:`simulate`.

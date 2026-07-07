@@ -34,6 +34,7 @@ from forven.exchange.risk import (
     sync_from_trades,
 )
 from forven.strategies import sizing as _sizing
+from forven.strategies.execution_kernel import cost_breakdown_usd as _kernel_cost_breakdown_usd
 from forven.market_cache import (
     load_price_snapshot,
     load_candle_snapshot,
@@ -5652,6 +5653,10 @@ def _kernel_open_paper_trade(strat_id: str, strat: dict, action, *, sizing_equit
         _coerce_positive_float((p.get("execution_profile") or {}).get("risk_per_trade"))
         or min(float(size_fraction), 1.0)
     )
+    # Entry-leg fee at open (fee_bps on the entry notional) so the position shows its
+    # fee immediately, like an exchange fill. The close overwrites both legs with the
+    # close-time breakdown; this stamp is display-only (the drag is charged at close).
+    _fee_bps_open = max(_scanner_float_setting("backtest_fee_bps", 4.5), 0.0)
     signal_data = {
         "kernel_managed": True,
         # Match key is ALWAYS the kernel's historical entry_time, even for a late hop-in,
@@ -5660,6 +5665,8 @@ def _kernel_open_paper_trade(strat_id: str, strat: dict, action, *, sizing_equit
         "kernel_entry_bar": int(pos.get("entry_bar") or 0),
         "kernel_size_fraction": round(float(size_fraction), 8),
         "kernel_equity_at_entry": round(float(sizing_equity), 4),
+        "fee_bps": _fee_bps_open,
+        "entry_fee_usd": round((_fee_bps_open / 10000.0) * float(sizing_equity) * float(leverage) * float(size_fraction), 6),
         "kernel_regime": pos.get("regime"),
         "price": entry_price,
         "direction": direction,
@@ -5880,6 +5887,13 @@ def _kernel_close_recorded(
                 "kernel_exit_time": trade.get("exit_time"), "kernel_managed": bool(sd.get("kernel_managed", True)),
                 "close_fill_now": fresh_exit, "close_mark_fill": mark_fill,
                 "funding_cost_pct": _funding_pct,
+                # Itemize the costs the net _pnl_eq already charged (drag + funding)
+                # so reporting can show paper fees/slippage/funding, not a bare net.
+                **_kernel_cost_breakdown_usd(
+                    equity_at_entry=equity_at_entry, leverage=_lev, size_fraction=_size_frac,
+                    fee_bps=_fee_bps, slippage_bps=_slip_bps,
+                    funding_gain_pct=_funding_pct, net_pnl_usd=_pnl_usd_eq,
+                ),
             },
             pnl_override={
                 "pnl_pct": round(_pnl_eq, 8), "net_pnl_pct": round(_pnl_eq, 8),
@@ -5899,10 +5913,32 @@ def _kernel_close_recorded(
     # pnl_override so close_trade_record writes status=CLOSED + pnl/pnl_pct/net_pnl_pct/
     # pnl_usd + closed_at + the pnl_is_equity_fraction flag in ONE atomic transaction (no
     # separate override UPDATE that a crash could tear, leaving a wrong-scale unflagged row).
+    # Itemize the drag/funding the kernel already netted out of pnl_pct: the same
+    # backtest_* settings drove this scan's simulate() call, size_fraction_raw is the
+    # exact fraction the price/funding legs used, and funding_cost_pct is the kernel's
+    # gain-positive funding term (_apply_funding_to_trades).
+    _fee_bps_f = max(_scanner_float_setting("backtest_fee_bps", 4.5), 0.0)
+    _slip_bps_f = max(_scanner_float_setting("backtest_slippage_bps", 2.0), 0.0)
+    _size_frac_f = (
+        _coerce_positive_float(trade.get("size_fraction_raw"))
+        or _coerce_positive_float(trade.get("size_fraction"))
+        or _coerce_positive_float(sd.get("kernel_size_fraction"))
+        or 1.0
+    )
     close_trade_record(
         trade_id, signal_exit_price=exit_price, exit_price=exit_price,
         close_reason=exit_reason, close_price_source="kernel", closed_at=_closed_at,
-        extra_signal_data={"kernel_exit_time": trade.get("exit_time"), "kernel_managed": True},
+        extra_signal_data={
+            "kernel_exit_time": trade.get("exit_time"), "kernel_managed": True,
+            **_kernel_cost_breakdown_usd(
+                equity_at_entry=equity_at_entry,
+                leverage=float(row.get("leverage") or 1.0),
+                size_fraction=_size_frac_f,
+                fee_bps=_fee_bps_f, slippage_bps=_slip_bps_f,
+                funding_gain_pct=float(trade.get("funding_cost_pct") or 0.0),
+                net_pnl_usd=pnl_usd,
+            ),
+        },
         pnl_override={
             "pnl_pct": round(pnl_pct_net, 8), "net_pnl_pct": round(pnl_pct_net, 8),
             "pnl_usd": pnl_usd, "equity_fraction": True,
@@ -6404,79 +6440,77 @@ def _kernel_open_live_trade(strat_id: str, strat: dict, action, *, sizing_equity
     # Keep the live safety gates (kill-switch/daily-halt/one-per-asset/cooldown),
     # scoped to the routed book; size authoritatively from the kernel
     # (enforce_risk_caps=False keeps gates, drops the cap).
-    from forven.exchange.risk import try_open_position
-    with try_open_position(asset, direction, strat_id, execution_type="live", book=open_book, enforce_risk_caps=False) as (allowed, alloc_risk, why):
-        if not allowed:
-            return f"BLOCKED {asset} live — {why}"
-        size_fraction = float(pos.get("size_fraction") or 0.0)
-        units = round(_sizing.position_units(equity=float(sizing_equity), size_fraction=size_fraction, leverage=leverage, entry_price=ref_price), 6)
-        if units <= 0:
-            return None
-        stop_price = pos.get("stop_price")
-        target_price = pos.get("target_price")
-        kernel_trail_pct = pos.get("trail_pct")
-        if stop_price is None and kernel_trail_pct:
-            # LIVE-TRAIL-1: a trailing-only profile carries no fixed stop, which the
-            # no-stop-no-open guard in _execute_direct would refuse. Its protective level
-            # DOES exist — the initial trailing level off the entry — so place the resting
-            # stop there; each refresh then ratchets it with the kernel's extreme.
-            _sgn = -1.0 if direction == "short" else 1.0
-            stop_price = round(float(ref_price) * (1.0 - _sgn * float(kernel_trail_pct)), 8)
-        # PORT-1 (precise gate): admission against the ACCOUNT-level budget with this
-        # order's actual risk (distance to its stop x units) and notional. Uses the
-        # AGGREGATE account equity, not the direction-book slice sizing_equity may have
-        # been narrowed to — the budget bounds the whole account. Not skippable by
-        # enforce_risk_caps; the coarse total-risk check in can_open covers non-kernel
-        # paths, this one owns per-asset / correlated-group net exposure.
-        from forven.exchange.risk import check_live_portfolio_budget
-        _add_notional = float(units) * float(ref_price)
-        if stop_price:
-            _add_risk = abs(float(ref_price) - float(stop_price)) * float(units)
-        else:
-            _add_risk = _add_notional * 0.03  # no stop known — conservative floor (mirrors risk._BUDGET_NO_STOP_RISK_FRAC)
-        # BOOK-BUDGET-1: the order draws on ONE wallet — pass the routed book and its
-        # balance (sizing_equity was narrowed to exactly that above) so admission is
-        # also checked against the wallet's own capacity, not just the aggregate.
-        _pb_ok, _pb_why = check_live_portfolio_budget(
-            asset, direction, add_risk_usd=_add_risk, add_notional_usd=_add_notional,
-            equity=_get_real_account_equity(),
-            book=open_book,
-            book_equity_usd=(float(sizing_equity) if (books_on and open_book) else None),
-        )
-        if not _pb_ok:
-            log.warning("[%s] BLOCKED %s live open — %s", strat_id, asset, _pb_why)
-            _notify_live_open_blocked(strat_id, asset, _pb_why, "portfolio_budget")
-            return f"BLOCKED {asset} live — {_pb_why}"
-        # GO-LIVE-1: the per-strategy notional ceiling the operator accepted at the
-        # go-live confirmation. One position per asset + asset pinned to the container
-        # means this per-order bound IS the strategy's per-asset exposure bound.
-        from forven.exchange.risk import check_live_strategy_ceiling
-        _cl_ok, _cl_why = check_live_strategy_ceiling(strat_id, _add_notional)
-        if not _cl_ok:
-            log.warning("[%s] BLOCKED %s live open — %s", strat_id, asset, _cl_why)
-            _notify_live_open_blocked(strat_id, asset, _cl_why, "go_live_ceiling")
-            return f"BLOCKED {asset} live — {_cl_why}"
-        risk_pct = float(alloc_risk) if alloc_risk else min(float(size_fraction), 1.0)
-        signal_data = {
-            "kernel_managed": True, "kernel_entry_time": action.entry_time,
-            "kernel_size_fraction": round(float(size_fraction), 8), "kernel_equity_at_entry": round(float(sizing_equity), 4),
-            "stop_loss": stop_price, "stop_loss_price": stop_price,
-            "take_profit": target_price, "take_profit_price": target_price,
-            "kernel_trail_pct": float(kernel_trail_pct) if kernel_trail_pct else None,
-            "direction": direction, "source": "scanner.kernel.live",
-        }
-        # Pass book only when direction books are active so the books-off path keeps the
-        # exact prior signature (book stays NULL = master wallet).
-        _open_extra = {"book": open_book} if open_book is not None else {}
-        try:
-            trade_id = _open_trade_db(strat_id, asset, direction, ref_price, units, risk_pct, float(leverage), signal_data, execution_type="live", **_open_extra)
-        except sqlite3.IntegrityError:
-            return None  # duplicate-open guard (concurrent scan / pending reconcile)
-        try:
-            from forven.exchange.risk import register
-            register(trade_id, asset, direction, strat_id, risk_pct, ref_price, execution_type="live", **_open_extra)
-        except Exception:
-            pass
+    allowed, alloc_risk, why = can_open(asset, direction, strat_id, execution_type="live", book=open_book, enforce_risk_caps=False)
+    if not allowed:
+        return f"BLOCKED {asset} live — {why}"
+    size_fraction = float(pos.get("size_fraction") or 0.0)
+    units = round(_sizing.position_units(equity=float(sizing_equity), size_fraction=size_fraction, leverage=leverage, entry_price=ref_price), 6)
+    if units <= 0:
+        return None
+    stop_price = pos.get("stop_price")
+    target_price = pos.get("target_price")
+    kernel_trail_pct = pos.get("trail_pct")
+    if stop_price is None and kernel_trail_pct:
+        # LIVE-TRAIL-1: a trailing-only profile carries no fixed stop, which the
+        # no-stop-no-open guard in _execute_direct would refuse. Its protective level
+        # DOES exist — the initial trailing level off the entry — so place the resting
+        # stop there; each refresh then ratchets it with the kernel's extreme.
+        _sgn = -1.0 if direction == "short" else 1.0
+        stop_price = round(float(ref_price) * (1.0 - _sgn * float(kernel_trail_pct)), 8)
+    # PORT-1 (precise gate): admission against the ACCOUNT-level budget with this
+    # order's actual risk (distance to its stop x units) and notional. Uses the
+    # AGGREGATE account equity, not the direction-book slice sizing_equity may have
+    # been narrowed to — the budget bounds the whole account. Not skippable by
+    # enforce_risk_caps; the coarse total-risk check in can_open covers non-kernel
+    # paths, this one owns per-asset / correlated-group net exposure.
+    from forven.exchange.risk import check_live_portfolio_budget
+    _add_notional = float(units) * float(ref_price)
+    if stop_price:
+        _add_risk = abs(float(ref_price) - float(stop_price)) * float(units)
+    else:
+        _add_risk = _add_notional * 0.03  # no stop known — conservative floor (mirrors risk._BUDGET_NO_STOP_RISK_FRAC)
+    # BOOK-BUDGET-1: the order draws on ONE wallet — pass the routed book and its
+    # balance (sizing_equity was narrowed to exactly that above) so admission is
+    # also checked against the wallet's own capacity, not just the aggregate.
+    _pb_ok, _pb_why = check_live_portfolio_budget(
+        asset, direction, add_risk_usd=_add_risk, add_notional_usd=_add_notional,
+        equity=_get_real_account_equity(),
+        book=open_book,
+        book_equity_usd=(float(sizing_equity) if (books_on and open_book) else None),
+    )
+    if not _pb_ok:
+        log.warning("[%s] BLOCKED %s live open — %s", strat_id, asset, _pb_why)
+        _notify_live_open_blocked(strat_id, asset, _pb_why, "portfolio_budget")
+        return f"BLOCKED {asset} live — {_pb_why}"
+    # GO-LIVE-1: the per-strategy notional ceiling the operator accepted at the
+    # go-live confirmation. One position per asset + asset pinned to the container
+    # means this per-order bound IS the strategy's per-asset exposure bound.
+    from forven.exchange.risk import check_live_strategy_ceiling
+    _cl_ok, _cl_why = check_live_strategy_ceiling(strat_id, _add_notional)
+    if not _cl_ok:
+        log.warning("[%s] BLOCKED %s live open — %s", strat_id, asset, _cl_why)
+        _notify_live_open_blocked(strat_id, asset, _cl_why, "go_live_ceiling")
+        return f"BLOCKED {asset} live — {_cl_why}"
+    risk_pct = float(alloc_risk) if alloc_risk else min(float(size_fraction), 1.0)
+    signal_data = {
+        "kernel_managed": True, "kernel_entry_time": action.entry_time,
+        "kernel_size_fraction": round(float(size_fraction), 8), "kernel_equity_at_entry": round(float(sizing_equity), 4),
+        "stop_loss": stop_price, "stop_loss_price": stop_price,
+        "take_profit": target_price, "take_profit_price": target_price,
+        "kernel_trail_pct": float(kernel_trail_pct) if kernel_trail_pct else None,
+        "direction": direction, "source": "scanner.kernel.live",
+    }
+    # Pass book only when direction books are active so the books-off path keeps the
+    # exact prior signature (book stays NULL = master wallet).
+    _open_extra = {"book": open_book} if open_book is not None else {}
+    try:
+        trade_id = _open_trade_db(strat_id, asset, direction, ref_price, units, risk_pct, float(leverage), signal_data, execution_type="live", **_open_extra)
+    except sqlite3.IntegrityError:
+        return None  # duplicate-open guard (concurrent scan / pending reconcile)
+    try:
+        register(trade_id, asset, direction, strat_id, risk_pct, ref_price, execution_type="live", **_open_extra)
+    except Exception:
+        pass
     # LIVE-1 / DIRECTION-BOOKS-2: a failed real open must NOT leave a phantom OPEN
     # trade holding a risk slot (and later book a fabricated CLOSE). Wrap the
     # exchange call and, on failure, hand it to _report_execution_failure — which

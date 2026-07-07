@@ -249,6 +249,39 @@ def _build_compat_paper_trade(trade_row: dict, strategy_name: str, symbol: str) 
             # it matches the realized close path; leverage stays in pnl_pct only.
             pnl = (exit_price - entry_price) * size * signed
 
+    # Real close costs, two provenances:
+    #  * kernel paper / bot rows persist exact DOLLAR costs in signal_data at close
+    #    (execution_kernel.cost_breakdown_usd) — their pnl_usd is already NET of
+    #    every cost and gross_pnl_usd is the reconstructed pure price PnL;
+    #  * live rows record fees_pct/net_pnl_pct as leverage-inclusive fractions of
+    #    margin (scanner._close_trade_db / risk fee-recovery) with a GROSS pnl_usd,
+    #    plus cost-positive funding_usd in signal_data.
+    margin = (entry_price * size / leverage) if (entry_price > 0 and size > 0 and leverage > 0) else 0.0
+    fees_pct = trading_domain._coerce_optional_float(trade_row.get("fees_pct"))
+    net_pnl_pct = _normalize_trade_percent_value(trade_row.get("net_pnl_pct"))
+    funding_usd = trading_domain._coerce_optional_float(
+        signal_data.get("funding_usd") if signal_data.get("funding_usd") is not None else signal_data.get("close_funding_usd")
+    ) or 0.0
+    sd_fee_bps = trading_domain._coerce_optional_float(signal_data.get("fee_bps"))
+    sd_entry_fee = trading_domain._coerce_optional_float(signal_data.get("entry_fee_usd"))
+    sd_exit_fee = trading_domain._coerce_optional_float(signal_data.get("exit_fee_usd"))
+    sd_total_fees = trading_domain._coerce_optional_float(signal_data.get("total_fees_usd"))
+    sd_slippage = trading_domain._coerce_optional_float(signal_data.get("slippage_usd")) or 0.0
+    sd_gross = trading_domain._coerce_optional_float(signal_data.get("gross_pnl_usd"))
+    if sd_gross is not None:
+        gross_pnl = sd_gross
+        fees_paid = sd_total_fees if sd_total_fees is not None else (sd_entry_fee or 0.0) + (sd_exit_fee or 0.0)
+        net_pnl = pnl
+        entry_fee_bps = exit_fee_bps = sd_fee_bps or 0.0
+    else:
+        gross_pnl = pnl
+        fees_paid = fees_pct * margin if (fees_pct is not None and margin > 0) else 0.0
+        # fees_pct models both legs at the same per-side rate (2 * fee_bps * leverage);
+        # back out the per-side bps so the UI can price each fill's fee off its own leg.
+        per_side_fee_bps = (fees_pct * 10000.0) / (2.0 * leverage) if (fees_pct is not None and leverage > 0) else 0.0
+        entry_fee_bps = exit_fee_bps = sd_fee_bps if sd_fee_bps is not None else per_side_fee_bps
+        net_pnl = pnl - fees_paid - funding_usd if pnl is not None else None
+
     return {
         "id": str(trade_row.get("id") or ""),
         "symbol": symbol,
@@ -261,13 +294,16 @@ def _build_compat_paper_trade(trade_row: dict, strategy_name: str, symbol: str) 
         "pnl": pnl,
         "pnl_pct": pnl_pct,
         "strategy_name": strategy_name,
-        "gross_pnl": pnl,
-        "fees_paid": 0.0,
-        "funding_pnl": 0.0,
-        "net_pnl": pnl,
-        "net_pnl_pct": pnl_pct,
-        "entry_fee_bps": 0.0,
-        "exit_fee_bps": 0.0,
+        "gross_pnl": gross_pnl,
+        "fees_paid": fees_paid,
+        "funding_pnl": -funding_usd,
+        "net_pnl": net_pnl,
+        "net_pnl_pct": net_pnl_pct if net_pnl_pct is not None else pnl_pct,
+        "entry_fee_bps": entry_fee_bps,
+        "exit_fee_bps": exit_fee_bps,
+        "entry_fee_usd": sd_entry_fee,
+        "exit_fee_usd": sd_exit_fee,
+        "slippage_usd": sd_slippage,
         "close_reason": close_reason,
         "close_incomplete": close_incomplete,
     }

@@ -260,23 +260,26 @@ def _validate_protective_level(kind: str, price: float, mid: float, direction: s
 # --------------------------------------------------------------------------- #
 # Close
 # --------------------------------------------------------------------------- #
-def _manual_paper_close_pnl_override(trade: dict, exit_price: float) -> dict | None:
+def _manual_paper_close_pnl_override(trade: dict, exit_price: float) -> tuple[dict | None, dict | None]:
     """Net PnL for a manual close of a KERNEL-managed paper trade, using the kernel's
     own cost convention ((price_return*sign*lev - round_trip_drag) * size_fraction).
 
     Manual closes are operator actions and stay EXCLUDED from the promotion gate (no
     pnl_is_equity_fraction flag, by design — see policy._PARITY_PNL_FILTER), but their
     pnl_usd feeds the paper sandbox equity that sizes every subsequent trade — booking
-    them cost-free (the old behaviour) silently inflated the book. Returns None for
-    non-kernel rows (close_trade_record's default computation stands)."""
+    them cost-free (the old behaviour) silently inflated the book. Returns
+    ``(pnl_override, cost_signal_data)`` — the second element itemizes the drag the
+    net PnL charged (for the trade's signal_data). ``(None, None)`` for non-kernel
+    rows (close_trade_record's default computation stands)."""
     sd = parse_trade_signal_data(trade.get("signal_data"))
     size_frac = _coerce_optional_float(sd.get("kernel_size_fraction"))
     if not size_frac:
-        return None
+        return None, None
     entry = _coerce_optional_float(trade.get("fill_entry_price")) or _coerce_optional_float(trade.get("entry_price"))
     if not entry or not exit_price or exit_price <= 0:
-        return None
+        return None, None
     from forven.db import kv_get
+    from forven.strategies.execution_kernel import cost_breakdown_usd
 
     lev = _coerce_optional_float(trade.get("leverage")) or 1.0
     sign = -1.0 if _normalize_trade_direction(trade.get("direction")) == "short" else 1.0
@@ -289,10 +292,17 @@ def _manual_paper_close_pnl_override(trade: dict, exit_price: float) -> dict | N
     drag = 2.0 * (fee_bps + slip_bps) / 10000.0 * max(lev, 0.0)
     pnl_eq = (((float(exit_price) - entry) / entry) * sign * lev - drag) * float(size_frac)
     equity_at_entry = _coerce_optional_float(sd.get("kernel_equity_at_entry")) or 10000.0
-    return {
-        "net_pnl_pct": round(pnl_eq, 8),
-        "pnl_usd": round(equity_at_entry * pnl_eq, 4),
-    }
+    pnl_usd = round(equity_at_entry * pnl_eq, 4)
+    return (
+        {
+            "net_pnl_pct": round(pnl_eq, 8),
+            "pnl_usd": pnl_usd,
+        },
+        cost_breakdown_usd(
+            equity_at_entry=equity_at_entry, leverage=lev, size_fraction=float(size_frac),
+            fee_bps=fee_bps, slippage_bps=slip_bps, net_pnl_usd=pnl_usd,
+        ),
+    )
 
 
 def close_paper_position(session_id: str, reason: str | None = None) -> dict:
@@ -303,6 +313,7 @@ def close_paper_position(session_id: str, reason: str | None = None) -> dict:
         _live_close_trade(trade, close_reason="manual_close", note=note)
     else:
         mid = _fresh_manual_mark(session, trade)
+        pnl_override, cost_signal_data = _manual_paper_close_pnl_override(trade, mid)
         closed = close_trade_record(
             str(trade["id"]),
             signal_exit_price=mid,
@@ -314,8 +325,9 @@ def close_paper_position(session_id: str, reason: str | None = None) -> dict:
                 "source": "manual",
                 "manually_closed_at": _iso_now(),
                 "manual_close_note": note,
+                **(cost_signal_data or {}),
             },
-            pnl_override=_manual_paper_close_pnl_override(trade, mid),
+            pnl_override=pnl_override,
         )
         if not closed or not closed.get("updated"):
             raise HTTPException(status_code=502, detail="Failed to close position.")
