@@ -388,7 +388,7 @@
 </script>
 
 <svelte:head>
-	<title>Crucibles | Forven</title>
+	<title>Crucibles | Kronos Quant</title>
 </svelte:head>
 
 <div class="h-full flex flex-col overflow-hidden bg-[#050505] text-gray-100">

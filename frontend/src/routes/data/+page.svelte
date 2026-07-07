@@ -644,7 +644,7 @@
 </script>
 
 <svelte:head>
-	<title>Data Manager | Forven</title>
+	<title>Data Manager | Kronos Quant</title>
 	<meta
 		name="description"
 		content="Download market data, inspect datasets, and review historical ingestion runs."

@@ -53,7 +53,7 @@
 </script>
 
 <svelte:head>
-	<title>Brain — Forven</title>
+	<title>Brain — Kronos Quant</title>
 </svelte:head>
 
 <div class="brain-page">

@@ -186,7 +186,7 @@
 </script>
 
 <svelte:head>
-	<title>Bot Factory | Forven</title>
+	<title>Bot Factory | Kronos Quant</title>
 </svelte:head>
 
 <div class="mx-auto max-w-7xl px-4 py-6">

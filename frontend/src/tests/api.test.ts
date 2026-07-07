@@ -622,7 +622,7 @@ describe('API Client', () => {
 		});
 	});
 
-	describe('Forven API Contracts', () => {
+	describe('Kronos Quant API Contracts', () => {
 		it('should submit brain chat as async task', async () => {
 			mockFetch.mockResolvedValueOnce({
 				ok: true,

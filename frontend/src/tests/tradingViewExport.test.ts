@@ -95,8 +95,8 @@ describe('TradingView export', () => {
 		expect(result.pine).toContain('strategy.close_all(comment = "SELL window end")');
 		expect(result.pine).toContain('plotshape(buy_signal, title = "BUY", text = "BUY"');
 		expect(result.pine).toContain('plotshape(sell_signal or window_forced_sell, title = "SELL", text = "SELL"');
-		expect(result.pine).toContain('alertcondition(buy_signal, title = "Forven BUY"');
-		expect(result.pine).toContain('alertcondition(sell_signal or window_forced_sell, title = "Forven SELL"');
+		expect(result.pine).toContain('alertcondition(buy_signal, title = "Kronos Quant BUY"');
+		expect(result.pine).toContain('alertcondition(sell_signal or window_forced_sell, title = "Kronos Quant SELL"');
 		expect(result.pine).toContain('//   verification   : B1001 (active)');
 	});
 

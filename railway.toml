@@ -1,0 +1,6 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "FORVEN_PORT=$PORT FORVEN_BIND_HOST=0.0.0.0 python -m forven.api"
+restartPolicyType = "on_failure"

@@ -76,7 +76,7 @@ describe('parseEnvelope', () => {
 
 	it('throws when forven_export metadata is missing', () => {
 		const text = JSON.stringify({ strategy: {}, configuration: {} });
-		expect(() => parseEnvelope(text)).toThrow(/not a Forven strategy export/i);
+		expect(() => parseEnvelope(text)).toThrow(/not a Kronos Quant strategy export/i);
 	});
 
 	it('throws on an unsupported export kind', () => {

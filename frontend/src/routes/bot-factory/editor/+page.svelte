@@ -354,7 +354,7 @@
 </script>
 
 <svelte:head>
-	<title>{editId ? 'Edit Bot' : 'New Bot'} | Bot Factory | Forven</title>
+	<title>{editId ? 'Edit Bot' : 'New Bot'} | Bot Factory | Kronos Quant</title>
 </svelte:head>
 
 <div class="mx-auto max-w-6xl px-4 py-6">

@@ -8,7 +8,7 @@ vi.mock('../lib/api/core', () => ({
 
 import { getForvenLiveWebSocketUrls } from '../lib/api/forven';
 
-describe('Forven websocket URL selection', () => {
+describe('Kronos Quant websocket URL selection', () => {
 	it('prefers the configured backend origin and avoids speculative fallbacks', () => {
 		const urls = getForvenLiveWebSocketUrls();
 

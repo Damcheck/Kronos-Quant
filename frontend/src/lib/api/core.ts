@@ -1,9 +1,9 @@
 /**
- * API client core for Forven backend
+ * API client core for Kronos Quant backend
  */
 
 /**
- * API client for Forven backend
+ * API client for Kronos Quant backend
  */
 
 const DEFAULT_API_ORIGIN = 'http://127.0.0.1:8003';

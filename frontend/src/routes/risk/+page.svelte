@@ -271,7 +271,7 @@
 </script>
 
 <svelte:head>
-	<title>Risk Command | Forven</title>
+	<title>Risk Command | Kronos Quant</title>
 	<meta name="description" content="Monitor drawdown, kill-switch state, and live portfolio risk guardrails." />
 </svelte:head>
 

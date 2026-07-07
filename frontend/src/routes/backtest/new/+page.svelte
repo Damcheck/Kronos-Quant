@@ -299,7 +299,7 @@
 </script>
 
 <svelte:head>
-	<title>Manual Backtest | Forven</title>
+	<title>Manual Backtest | Kronos Quant</title>
 </svelte:head>
 
 <div class="mx-auto max-w-7xl px-4 py-6">

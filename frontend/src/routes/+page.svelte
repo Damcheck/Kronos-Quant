@@ -168,7 +168,7 @@
 </script>
 
 <svelte:head>
-	<title>Operations | Forven</title>
+	<title>Operations | Kronos Quant</title>
 	<meta
 		name="description"
 		content="Always-on operations dashboard: system health, data integrity, pipeline flow, paper trading, and alerts."

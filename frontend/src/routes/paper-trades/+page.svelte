@@ -7,7 +7,7 @@
 </script>
 
 <svelte:head>
-	<title>Paper Trades | Forven</title>
+	<title>Paper Trades | Kronos Quant</title>
 	<meta name="description" content="Monitor paper trading sessions with manual controls, chart overlays, signals, and execution history — simulated fills only." />
 </svelte:head>
 

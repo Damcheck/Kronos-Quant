@@ -187,8 +187,8 @@
 </script>
 
 <svelte:head>
-	<title>Diagnostics | Forven</title>
-	<meta name="description" content="Health checks, 24h cost rollup, and resumable tasks for the Forven runtime." />
+	<title>Diagnostics | Kronos Quant</title>
+	<meta name="description" content="Health checks, 24h cost rollup, and resumable tasks for the Kronos Quant runtime." />
 </svelte:head>
 
 <div class="h-full overflow-y-auto p-6 space-y-6">

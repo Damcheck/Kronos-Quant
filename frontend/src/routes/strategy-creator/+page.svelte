@@ -629,7 +629,7 @@ TYPE_NAME = "my_strategy"
 	});
 </script>
 
-<svelte:head><title>Strategy Creator | Forven</title></svelte:head>
+<svelte:head><title>Strategy Creator | Kronos Quant</title></svelte:head>
 
 <div class="mx-auto max-w-7xl px-4 py-6">
 	<div>

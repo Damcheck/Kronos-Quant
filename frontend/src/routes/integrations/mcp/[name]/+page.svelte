@@ -191,7 +191,7 @@
 </script>
 
 <svelte:head>
-	<title>{name} · MCP · Forven</title>
+	<title>{name} · MCP · Kronos Quant</title>
 </svelte:head>
 
 <IntegrationTabs active="tool-servers">

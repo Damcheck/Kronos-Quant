@@ -170,7 +170,7 @@
 </script>
 
 <svelte:head>
-	<title>Integrations · Forven</title>
+	<title>Integrations · Kronos Quant</title>
 </svelte:head>
 
 <IntegrationTabs active="tool-servers">
@@ -181,8 +181,8 @@
 			<p class="text-xs text-gray-500 mt-0.5 max-w-2xl">
 				The <span class="text-gray-300">outbound</span> direction: register an external MCP server
 				(a filesystem server, web search, a ticker API, …) and its tools become callable by
-				<span class="text-gray-300">Forven's own internal agents</span> — scoped per agent via
-				grants on each agent's page. Connecting an outside assistant <em>into</em> Forven is the
+				<span class="text-gray-300">Kronos Quant's own internal agents</span> — scoped per agent via
+				grants on each agent's page. Connecting an outside assistant <em>into</em> Kronos Quant is the
 				other tab (AI Clients); most setups never need anything here.
 			</p>
 		</div>
@@ -395,8 +395,8 @@
 		<div class="bg-[#0d0d0d] border border-[#222] rounded p-6 text-center">
 			<p class="text-sm text-gray-400">No agent tool servers configured — that's the normal state.</p>
 			<p class="text-xs text-gray-500 mt-1">
-				Add one only when a Forven agent needs an external tool (e.g. web search during research).
-				To connect Claude/Cursor/Codex into Forven, use the AI Clients tab instead.
+				Add one only when a Kronos Quant agent needs an external tool (e.g. web search during research).
+				To connect Claude/Cursor/Codex into Kronos Quant, use the AI Clients tab instead.
 			</p>
 		</div>
 	{:else}

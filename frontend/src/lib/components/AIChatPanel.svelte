@@ -79,7 +79,7 @@
 			case 'brain':
 				return ['What has the Brain decided lately?', 'How does the Brain work?'];
 			case 'integrations':
-				return ['How do I connect Claude to Forven?', 'What are agent tool servers?'];
+				return ['How do I connect Claude to Kronos Quant?', 'What are agent tool servers?'];
 			case 'diagnostics':
 				return ['Is everything healthy?', 'Anything waiting on me?'];
 			case 'strategy_creator':
@@ -328,7 +328,7 @@
 		<div class="flex items-center justify-between px-4 py-3 border-b border-[#222]">
 			<div class="flex items-center gap-2 min-w-0">
 				<div class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></div>
-				<span class="text-sm font-bold text-white uppercase tracking-wider">Forven</span>
+				<span class="text-sm font-bold text-white uppercase tracking-wider">Kronos Quant</span>
 				{#if contextLabel}
 					<span class="text-[10px] text-[#666] uppercase tracking-wider truncate">· {contextLabel}</span>
 				{/if}
@@ -361,7 +361,7 @@
 				<div class="text-center text-[#555] text-xs uppercase tracking-widest mt-8">Opening…</div>
 			{:else if messages.length === 0}
 				<div class="text-center text-[#666] text-xs mt-8">
-					<div class="text-lg font-bold uppercase tracking-widest mb-2 text-white">Forven</div>
+					<div class="text-lg font-bold uppercase tracking-widest mb-2 text-white">Kronos Quant</div>
 					<div>Ask anything, or tell me what to do — I can see {contextLabel || 'this page'}.</div>
 					<div class="mt-4 flex flex-wrap justify-center gap-2">
 						{#each suggestions as suggestion}

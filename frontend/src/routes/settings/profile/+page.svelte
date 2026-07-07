@@ -189,7 +189,7 @@
 </script>
 
 <svelte:head>
-	<title>Operator profile — Forven</title>
+	<title>Operator profile — Kronos Quant</title>
 </svelte:head>
 
 <main class="container">

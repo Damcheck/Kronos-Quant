@@ -175,7 +175,7 @@
 					data-testid="strategy-import-textarea"
 					class="min-h-[160px] w-full resize-y border border-[#333] bg-black p-3 font-mono text-[11px] leading-relaxed text-[#ccc] outline-none transition-colors focus:border-white"
 					spellcheck="false"
-					placeholder="Paste a Forven strategy export here…"
+					placeholder="Paste a Kronos Quant strategy export here…"
 					value={rawText}
 					on:input={(e) => reparse((e.target as HTMLTextAreaElement).value)}
 				></textarea>

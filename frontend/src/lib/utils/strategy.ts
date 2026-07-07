@@ -1,5 +1,5 @@
 /**
- * Utility functions for strategy and metrics handling in the Forven frontend.
+ * Utility functions for strategy and metrics handling in the Kronos Quant frontend.
  */
 
 export interface ManagerRow {

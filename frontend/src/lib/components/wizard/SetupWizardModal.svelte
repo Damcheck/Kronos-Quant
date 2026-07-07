@@ -21,7 +21,7 @@
 	}
 
 	const STEPS: Step[] = [
-		{ id: 'welcome', label: 'Welcome', critical: false, description: 'Get Forven set up.' },
+		{ id: 'welcome', label: 'Welcome', critical: false, description: 'Get Kronos Quant set up.' },
 		{ id: 'trading', label: 'Trading basics', critical: true, description: 'Pick an exchange and paste API credentials.' },
 		{ id: 'ai', label: 'AI providers', critical: true, description: 'Connect at least one provider so agents can run.' },
 		{ id: 'notifications', label: 'Notifications', critical: false, description: 'Discord alerts (optional).' },
@@ -105,9 +105,9 @@
 
 	function skipMessage(s: Step): string {
 		if (s.id === 'trading') {
-			return "Skip Trading basics? Forven won't be able to place paper or live orders until you connect an exchange in Settings.";
+			return "Skip Trading basics? Kronos Quant won't be able to place paper or live orders until you connect an exchange in Settings.";
 		}
-		return "Skip AI providers? Forven won't be able to run research, propose strategies, or chat until you connect one in Settings.";
+		return "Skip AI providers? Kronos Quant won't be able to run research, propose strategies, or chat until you connect one in Settings.";
 	}
 
 	function goTo(i: number) {
@@ -124,7 +124,7 @@
 		if (unsatisfied.length > 0) {
 			const labels = unsatisfied.map((s) => s.label).join(', ');
 			const ok = window.confirm(
-				`You haven't finished: ${labels}. Forven won't run correctly until these are set up. Finish anyway?`
+				`You haven't finished: ${labels}. Kronos Quant won't run correctly until these are set up. Finish anyway?`
 			);
 			if (!ok) return;
 		}
@@ -153,7 +153,7 @@
 		if (unsatisfied.length > 0) {
 			const labels = unsatisfied.map((s) => s.label).join(', ');
 			const ok = window.confirm(
-				`Skip setup? You haven't finished: ${labels}. Forven won't run correctly until these are set up.`
+				`Skip setup? You haven't finished: ${labels}. Kronos Quant won't run correctly until these are set up.`
 			);
 			if (!ok) return;
 		}
@@ -196,7 +196,7 @@
 				{#if step.critical && !isSatisfied(step)}
 					<div class="px-6 py-3 bg-yellow-500/5 border-b border-yellow-900 text-sm text-yellow-400">
 						{#if step.id === 'trading'}
-							⚠ Without an exchange API connection, Forven can't place paper or live orders.
+							⚠ Without an exchange API connection, Kronos Quant can't place paper or live orders.
 						{:else}
 							⚠ Without an AI provider, agents can't research, propose strategies, or chat.
 						{/if}
@@ -206,7 +206,7 @@
 				<div class="flex-1 min-h-0 overflow-y-auto px-6 py-4">
 					{#if step.id === 'welcome'}
 						<p class="text-sm text-[#888] leading-relaxed">
-							This wizard walks you through the minimum setup to run Forven.
+							This wizard walks you through the minimum setup to run Kronos Quant.
 							You can skip anything and change it later in Settings.
 						</p>
 					{:else if step.id === 'trading'}

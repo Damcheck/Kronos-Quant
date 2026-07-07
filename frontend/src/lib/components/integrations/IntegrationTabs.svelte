@@ -6,13 +6,13 @@
 			id: 'ai-clients',
 			href: '/integrations',
 			label: 'AI Clients',
-			description: 'Connect outside assistants to Forven and watch Drop Zone sessions',
+			description: 'Connect outside assistants to Kronos Quant and watch Drop Zone sessions',
 		},
 		{
 			id: 'tool-servers',
 			href: '/integrations/mcp',
 			label: 'Agent Tool Servers',
-			description: 'Connect external MCP tools for Forven agents to call',
+			description: 'Connect external MCP tools for Kronos Quant agents to call',
 		},
 	] as const;
 </script>
@@ -23,8 +23,8 @@
 			<div>
 				<h1 class="text-sm font-semibold uppercase tracking-[0.22em] text-white">Integrations</h1>
 				<p class="mt-1 max-w-3xl text-[11px] leading-5 text-[#666]">
-					One MCP control room: AI clients connect into Forven, while agent tool servers let
-					Forven agents connect out to external tools.
+					One MCP control room: AI clients connect into Kronos Quant, while agent tool servers let
+					Kronos Quant agents connect out to external tools.
 				</p>
 			</div>
 

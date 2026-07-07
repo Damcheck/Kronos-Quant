@@ -104,7 +104,7 @@ function countArray(value: unknown): number {
 
 /**
  * Parse + shallow-validate an export envelope. Throws an Error with a
- * user-facing message when the payload is not a recognizable Forven export.
+ * user-facing message when the payload is not a recognizable Kronos Quant export.
  */
 export function parseEnvelope(text: string): ParsedEnvelope {
 	let raw: unknown;
@@ -120,7 +120,7 @@ export function parseEnvelope(text: string): ParsedEnvelope {
 	const env = raw as Record<string, unknown>;
 	const meta = asRecord(env.forven_export);
 	if (!env.forven_export || typeof env.forven_export !== 'object') {
-		throw new Error('Missing "forven_export" metadata — this is not a Forven strategy export.');
+		throw new Error('Missing "forven_export" metadata — this is not a Kronos Quant strategy export.');
 	}
 	const kind = String(meta.kind ?? '').trim();
 	if (kind !== EXPECTED_KIND) {

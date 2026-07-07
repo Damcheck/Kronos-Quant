@@ -209,7 +209,7 @@
 </script>
 
 <svelte:head>
-	<title>All Backtests | Forven</title>
+	<title>All Backtests | Kronos Quant</title>
 	<meta name="description" content="Sortable backtest result inventory for strategy containers." />
 </svelte:head>
 

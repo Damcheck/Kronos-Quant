@@ -1,6 +1,6 @@
 /**
- * Forven agent client (TypeScript) — a first-class typed client so the in-app
- * (Tauri) AI assistant or any browser/Node agent can drive the full Forven
+ * Kronos Quant agent client (TypeScript) — a first-class typed client so the in-app
+ * (Tauri) AI assistant or any browser/Node agent can drive the full Kronos Quant
  * strategy lifecycle over the same REST API the rest of the UI uses.
  *
  * This is the TS sibling of `forven/agent/client.py`. It reuses `fetchApi`

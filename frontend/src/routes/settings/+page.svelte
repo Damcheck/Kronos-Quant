@@ -159,7 +159,7 @@
 			class="flex items-center justify-between gap-4 border border-yellow-900 bg-yellow-500/5 text-yellow-400 px-4 py-3"
 			role="alert"
 		>
-			<span class="text-xs">Wizard incomplete — complete the onboarding wizard to finish setting up Forven.</span>
+			<span class="text-xs">Wizard incomplete — complete the onboarding wizard to finish setting up Kronos Quant.</span>
 			<button
 				type="button"
 				on:click={openWizard}

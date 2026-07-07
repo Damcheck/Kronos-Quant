@@ -250,7 +250,7 @@
 {/if}
 {#if !wsConnected}
 	<div class="bg-red-500/5 border-b border-red-900 px-4 py-1 text-[11px] uppercase tracking-wider text-red-400 font-bold">
-		Connection lost. Reconnecting to Forven websocket...
+		Connection lost. Reconnecting to Kronos Quant websocket...
 	</div>
 {/if}
 {#if $simulationActive}
@@ -285,7 +285,7 @@
 			{#if solRegime}<span class="text-[#666] ml-1">| SOL: {solRegime}</span>{/if}
 		</span>
 
-		<!-- Execution mode is display-only: Forven supports paper trading +
+		<!-- Execution mode is display-only: Kronos Quant supports paper trading +
 		     Hyperliquid testnet only. Live/mainnet is not a supported feature, so
 		     there is no in-app switch to it. -->
 		<span

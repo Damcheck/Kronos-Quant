@@ -168,7 +168,7 @@
 	onMount(load);
 </script>
 
-<svelte:head><title>Approval Modes | Forven</title></svelte:head>
+<svelte:head><title>Approval Modes | Kronos Quant</title></svelte:head>
 
 <div class="space-y-6 p-6 max-w-5xl">
 	<header class="flex items-center justify-between border-b border-[#222] pb-4">

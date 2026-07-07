@@ -140,8 +140,8 @@
 
 <aside class="relative z-40 w-60 flex-shrink-0 border-r border-[#222] bg-black flex flex-col">
 	<div class="px-3 py-4 border-b border-[#222] flex items-center justify-center gap-2">
-		<div class="w-2 h-2 bg-white shrink-0" title="forven"></div>
-		<div class="text-sm font-mono lowercase tracking-wide text-white">forven</div>
+		<div class="w-2 h-2 bg-white shrink-0" title="Kronos Quant"></div>
+		<div class="text-sm font-mono tracking-wide text-white">Kronos Quant</div>
 	</div>
 
 	<nav aria-label="Primary navigation" class="flex-1 overflow-y-auto px-2 py-4 flex flex-col gap-4">
@@ -219,15 +219,7 @@
 		</a>
 	</div>
 
-	<div class="px-3 pb-2 text-center">
-		<a
-			href="https://github.com/judder659/Forven"
-			target="_blank"
-			rel="noopener noreferrer"
-			class="text-[10px] text-[#555] hover:text-[#888] transition-colors"
-			title="Forven source code (AGPL-3.0)"
-		>Source · AGPL-3.0</a>
-	</div>
+
 
 	<div class="px-2 py-3 border-t border-[#222] flex items-center justify-center">
 		<div class="flex items-center">

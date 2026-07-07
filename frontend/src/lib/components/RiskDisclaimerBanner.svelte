@@ -6,8 +6,6 @@
 	let acknowledged = true;
 
 	const STORAGE_KEY = 'forven.risk_disclaimer.ack';
-	const DISCLAIMER_URL = 'https://github.com/judder659/Forven/blob/main/DISCLAIMER.md';
-
 	function acknowledge() {
 		acknowledged = true;
 		try {
@@ -40,12 +38,6 @@
 				Backtest and paper-trading metrics are <span class="font-semibold">simulated</span>, may be
 				inaccurate, and do not predict live results. Nothing here is financial advice — use entirely at
 				your own risk.
-				<a
-					href={DISCLAIMER_URL}
-					target="_blank"
-					rel="noopener noreferrer"
-					class="underline hover:text-yellow-300">Full disclaimer</a
-				>.
 			</div>
 		</div>
 		<button

@@ -6,7 +6,7 @@
 </script>
 
 <svelte:head>
-	<title>Live Trades | Forven</title>
+	<title>Live Trades | Kronos Quant</title>
 	<meta name="description" content="Manage live positions of deployed strategies with manual controls — actions here drive REAL exchange orders." />
 </svelte:head>
 

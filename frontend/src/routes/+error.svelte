@@ -6,8 +6,8 @@
 </script>
 
 <svelte:head>
-	<title>{status} | Forven</title>
-	<meta name="description" content="Forven encountered an unexpected route error." />
+	<title>{status} | Kronos Quant</title>
+	<meta name="description" content="Kronos Quant encountered an unexpected route error." />
 </svelte:head>
 
 <div class="h-full min-h-0 w-full flex items-center justify-center bg-black text-white p-6">

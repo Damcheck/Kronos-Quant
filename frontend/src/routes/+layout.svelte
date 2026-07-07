@@ -88,10 +88,10 @@
 		'/agents': 'Review agent health, workloads, and orchestration status.',
 		'/tasks': 'Inspect task containers, ownership, status transitions, and execution audit trails.',
 		'/approval': 'Review Brain proposals and approve, deny, or revise execution tasks.',
-		'/diagnostics': 'Health checks, cost rollups, and resumable tasks for the Forven runtime.',
-		'/integrations': 'Connect AI clients to Forven and manage external MCP tool servers for agents.',
-		'/integrations/mcp': 'Connect AI clients to Forven and manage external MCP tool servers for agents.',
-		'/settings': 'Configure execution, API keys, alerts, and platform preferences for Forven.',
+		'/diagnostics': 'Health checks, cost rollups, and resumable tasks for the Kronos Quant runtime.',
+		'/integrations': 'Connect AI clients to Kronos Quant and manage external MCP tool servers for agents.',
+		'/integrations/mcp': 'Connect AI clients to Kronos Quant and manage external MCP tool servers for agents.',
+		'/settings': 'Configure execution, API keys, alerts, and platform preferences for Kronos Quant.',
 	};
 
 	function titleCase(value: string): string {
@@ -118,11 +118,11 @@
 	function resolvePageDescription(pathname: string): string {
 		if (pathname.startsWith('/lab/strategy/')) return 'View a single strategy container dossier with lifecycle history and execution records.';
 		if (pathname.startsWith('/tasks/') && pathname !== '/tasks/') return 'Inspect a single task container with audit trail, tool calls, and execution data.';
-		if (pathname.startsWith('/integrations')) return 'Connect AI clients to Forven and manage external MCP tool servers for agents.';
-		return DESCRIPTION_OVERRIDES[pathname] ?? 'Forven trading workspace.';
+		if (pathname.startsWith('/integrations')) return 'Connect AI clients to Kronos Quant and manage external MCP tool servers for agents.';
+		return DESCRIPTION_OVERRIDES[pathname] ?? 'Kronos Quant trading workspace.';
 	}
 
-	$: pageTitle = `${resolvePageTitle($page.url.pathname)} | Forven`;
+	$: pageTitle = `${resolvePageTitle($page.url.pathname)} | Kronos Quant`;
 	$: pageDescription = resolvePageDescription($page.url.pathname);
 	$: unreadChatCountLabel = $chatUnreadCount > 9 ? '9+' : String($chatUnreadCount);
 	// Publish the current route (+ inferred page kind) to the assistant on every

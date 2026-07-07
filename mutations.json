@@ -1,0 +1,2635 @@
+{
+  "data": {
+    "__type": {
+      "fields": [
+        {
+          "name": "apiTokenCreate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "apiTokenDelete",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "baseEnvironmentOverride",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "bucketCreate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "bucketCredentialsReset",
+          "args": [
+            {
+              "name": "bucketId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "environmentId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "projectId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "redeployDependents",
+              "type": {
+                "name": "Boolean"
+              }
+            }
+          ]
+        },
+        {
+          "name": "bucketUpdate",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "canvasViewMerge",
+          "args": [
+            {
+              "name": "sourceEnvironmentId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "targetEnvironmentId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "cliAuthEventTrack",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "cliEventTrack",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "customDomainCreate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "customDomainDelete",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "customDomainIssueCertificate",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "customDomainUpdate",
+          "args": [
+            {
+              "name": "environmentId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "targetPort",
+              "type": {
+                "name": "Int"
+              }
+            }
+          ]
+        },
+        {
+          "name": "customerCreateFreePlanSubscription",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "customerTogglePayoutsToCredits",
+          "args": [
+            {
+              "name": "customerId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "deploymentApprove",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "deploymentCancel",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "deploymentInstanceExecutionCreate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "deploymentRedeploy",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "usePreviousImageTag",
+              "type": {
+                "name": "Boolean"
+              }
+            }
+          ]
+        },
+        {
+          "name": "deploymentRemove",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "deploymentRestart",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "deploymentRollback",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "deploymentStop",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "deploymentTriggerCreate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "deploymentTriggerDelete",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "deploymentTriggerUpdate",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "disableServiceCdn",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "dockerComposeImport",
+          "args": [
+            {
+              "name": "environmentId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "projectId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "skipStagingPatch",
+              "type": {
+                "name": "Boolean"
+              }
+            },
+            {
+              "name": "yaml",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "egressGatewayAssociationCreate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "egressGatewayAssociationsClear",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "egressGatewayHAMigrationPreview",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "egressGatewayRollbackFromHA",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "egressGatewayUpgradeToHA",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "emailChangeConfirm",
+          "args": [
+            {
+              "name": "nonce",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "emailChangeInitiate",
+          "args": [
+            {
+              "name": "newEmail",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "enableServiceCdn",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "environmentApplyChangeSet",
+          "args": [
+            {
+              "name": "baseConfigEtag",
+              "type": {
+                "name": "String"
+              }
+            },
+            {
+              "name": "commitMessage",
+              "type": {
+                "name": "String"
+              }
+            },
+            {
+              "name": "environmentId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "environmentCreate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "environmentDelete",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "environmentPatchCommit",
+          "args": [
+            {
+              "name": "commitMessage",
+              "type": {
+                "name": "String"
+              }
+            },
+            {
+              "name": "environmentId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "patch",
+              "type": {
+                "name": "EnvironmentConfig"
+              }
+            }
+          ]
+        },
+        {
+          "name": "environmentPatchCommitStaged",
+          "args": [
+            {
+              "name": "commitMessage",
+              "type": {
+                "name": "String"
+              }
+            },
+            {
+              "name": "environmentId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "skipDeploys",
+              "type": {
+                "name": "Boolean"
+              }
+            }
+          ]
+        },
+        {
+          "name": "environmentPreviewChangeSet",
+          "args": [
+            {
+              "name": "environmentId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "environmentRename",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "environmentStageChanges",
+          "args": [
+            {
+              "name": "environmentId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "merge",
+              "type": {
+                "name": "Boolean"
+              }
+            }
+          ]
+        },
+        {
+          "name": "environmentTriggersDeploy",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "environmentUnskipService",
+          "args": [
+            {
+              "name": "environmentId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "serviceId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "fairUseAgree",
+          "args": [
+            {
+              "name": "agree",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "featureFlagAdd",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "featureFlagRemove",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "generateShellToken",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "githubRepoDeploy",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "githubRepoUpdate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "herokuImportVariables",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "integrationCreate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "integrationDelete",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "integrationUpdate",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "inviteCodeUse",
+          "args": [
+            {
+              "name": "code",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "jobApplicationCreate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "resume",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "loginSessionAuth",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "loginSessionCancel",
+          "args": [
+            {
+              "name": "code",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "loginSessionConsume",
+          "args": [
+            {
+              "name": "code",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "loginSessionCreate",
+          "args": []
+        },
+        {
+          "name": "loginSessionVerify",
+          "args": [
+            {
+              "name": "code",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "notificationDeliveriesMarkAsRead",
+          "args": [
+            {
+              "name": "deliveryIds",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "notificationRuleCreate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "notificationRuleDelete",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "notificationRuleUpdate",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "observabilityDashboardCreate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "observabilityDashboardReset",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "observabilityDashboardUpdate",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "passkeyDelete",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "preferencesUpdate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "privateNetworkCreateOrGet",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "privateNetworkEndpointCreateOrGet",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "privateNetworkEndpointDelete",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "privateNetworkEndpointRename",
+          "args": [
+            {
+              "name": "dnsName",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "privateNetworkId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "privateNetworksForEnvironmentDelete",
+          "args": [
+            {
+              "name": "environmentId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "projectClaim",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "workspaceId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "projectCreate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "projectDelete",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "projectFeatureFlagAdd",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "projectFeatureFlagRemove",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "projectInvitationAccept",
+          "args": [
+            {
+              "name": "code",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "projectInvitationCreate",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "projectInvitationDelete",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "projectInvitationResend",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "projectInviteUser",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "projectLeave",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "projectMemberAdd",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "projectMemberRemove",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "projectMemberUpdate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "projectScheduleDelete",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "projectScheduleDeleteCancel",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "projectScheduleDeleteForce",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "projectTokenCreate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "projectTokenDelete",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "projectTransfer",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "projectId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "projectTransferConfirm",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "projectTransferInitiate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "projectUpdate",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "providerAuthRemove",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "purgeServiceCache",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "railwayDomainDnsRecordCreate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "railwayDomainDnsRecordDelete",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "railwayDomainDnsRecordUpdate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "railwayDomainNameserversSet",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "railwayDomainUpdate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "recoveryCodeGenerate",
+          "args": []
+        },
+        {
+          "name": "recoveryCodeValidate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "referralInfoUpdate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "sandboxCheckpointCreate",
+          "args": [
+            {
+              "name": "environmentId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "name",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "sandboxId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "sandboxCheckpointDelete",
+          "args": [
+            {
+              "name": "environmentId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "sandboxCheckpointRename",
+          "args": [
+            {
+              "name": "environmentId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "name",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "sandboxCreate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "sandboxDestroy",
+          "args": [
+            {
+              "name": "environmentId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "sandboxExec",
+          "args": [
+            {
+              "name": "command",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "environmentId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "timeoutSec",
+              "type": {
+                "name": "Int"
+              }
+            }
+          ]
+        },
+        {
+          "name": "sandboxHeartbeat",
+          "args": [
+            {
+              "name": "environmentId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "sandboxTemplateBuild",
+          "args": [
+            {
+              "name": "environmentId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "serviceConnect",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "serviceCreate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "serviceDelete",
+          "args": [
+            {
+              "name": "environmentId",
+              "type": {
+                "name": "String"
+              }
+            },
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "serviceDisconnect",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "serviceDomainCreate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "serviceDomainDelete",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "serviceDomainUpdate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "serviceFeatureFlagAdd",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "serviceFeatureFlagRemove",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "serviceInstanceAutoDeployUpdate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "serviceInstanceDeploy",
+          "args": [
+            {
+              "name": "commitSha",
+              "type": {
+                "name": "String"
+              }
+            },
+            {
+              "name": "environmentId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "latestCommit",
+              "type": {
+                "name": "Boolean"
+              }
+            },
+            {
+              "name": "serviceId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "serviceInstanceDeployV2",
+          "args": [
+            {
+              "name": "commitSha",
+              "type": {
+                "name": "String"
+              }
+            },
+            {
+              "name": "environmentId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "serviceId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "serviceInstanceLimitsUpdate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "serviceInstanceRedeploy",
+          "args": [
+            {
+              "name": "environmentId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "serviceId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "serviceInstanceUpdate",
+          "args": [
+            {
+              "name": "environmentId",
+              "type": {
+                "name": "String"
+              }
+            },
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "serviceId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "serviceRemoveUpstreamUrl",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "serviceUpdate",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "sessionDelete",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "setServiceUnderAttackMode",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "setupAgentEventTrack",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "sharedVariableConfigure",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "sshPublicKeyCreate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "sshPublicKeyDelete",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "sshSignupApprove",
+          "args": [
+            {
+              "name": "code",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "tcpProxyDelete",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "templateClone",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "templateDelete",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "templateDeployV2",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "templateGenerate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "templatePublish",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "templateServiceSourceEject",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "templateUnpublish",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "templateVolumeUpdate",
+          "args": [
+            {
+              "name": "serviceId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "sizeMB",
+              "type": {
+                "name": "Int"
+              }
+            },
+            {
+              "name": "templateId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "volumeId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "trustedDomainCreate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "trustedDomainDelete",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "trustedDomainRetriggerVerification",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "trustedDomainUpdate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "twoFactorInfoCreate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "twoFactorInfoDelete",
+          "args": []
+        },
+        {
+          "name": "twoFactorInfoSecret",
+          "args": []
+        },
+        {
+          "name": "twoFactorInfoValidate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "updateServiceEdgeConfig",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "upsertSlackChannel",
+          "args": [
+            {
+              "name": "workspaceId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "usageLimitRemove",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "usageLimitSet",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "userBetaLeave",
+          "args": []
+        },
+        {
+          "name": "userDelete",
+          "args": []
+        },
+        {
+          "name": "userDiscordDisconnect",
+          "args": []
+        },
+        {
+          "name": "userFlagsRemove",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "userFlagsSet",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "userProfileUpdate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "userTermsUpdate",
+          "args": []
+        },
+        {
+          "name": "variableCollectionUpsert",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "variableDelete",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "variableUpsert",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "volumeCreate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "volumeDelete",
+          "args": [
+            {
+              "name": "volumeId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "volumeInstanceBackupCreate",
+          "args": [
+            {
+              "name": "name",
+              "type": {
+                "name": "String"
+              }
+            },
+            {
+              "name": "volumeInstanceId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "volumeInstanceBackupDelete",
+          "args": [
+            {
+              "name": "volumeInstanceBackupId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "volumeInstanceId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "volumeInstanceBackupLock",
+          "args": [
+            {
+              "name": "volumeInstanceBackupId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "volumeInstanceId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "volumeInstanceBackupRestore",
+          "args": [
+            {
+              "name": "volumeInstanceBackupId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "volumeInstanceId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "volumeInstanceBackupScheduleUpdate",
+          "args": [
+            {
+              "name": "kinds",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "volumeInstanceId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "volumeInstancePITRRestore",
+          "args": [
+            {
+              "name": "newServiceName",
+              "type": {
+                "name": "String"
+              }
+            },
+            {
+              "name": "sourceRepoPath",
+              "type": {
+                "name": "String"
+              }
+            },
+            {
+              "name": "targetTimestamp",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "volumeInstanceId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "volumeInstanceUpdate",
+          "args": [
+            {
+              "name": "environmentId",
+              "type": {
+                "name": "String"
+              }
+            },
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "volumeId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "volumeUpdate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "volumeId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "webhookTest",
+          "args": [
+            {
+              "name": "payload",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "url",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "workspaceDelete",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "workspaceInviteCodeCreate",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "workspaceId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "workspaceInviteCodeUse",
+          "args": [
+            {
+              "name": "code",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "workspaceLeave",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "workspacePermissionChange",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "workspacePolicyDeploySourceAllowlistAdd",
+          "args": [
+            {
+              "name": "sourceId",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "sourceType",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "workspaceId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "workspacePolicyDeploySourceAllowlistRemove",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "workspacePolicyItemUpdate",
+          "args": [
+            {
+              "name": "enabled",
+              "type": {
+                "name": "Boolean"
+              }
+            },
+            {
+              "name": "input",
+              "type": {
+                "name": "WorkspacePolicyItemUpdateInput"
+              }
+            },
+            {
+              "name": "policy",
+              "type": {
+                "name": "WorkspacePolicyName"
+              }
+            },
+            {
+              "name": "workspaceId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "workspaceTwoFactorEnforcementUpdate",
+          "args": [
+            {
+              "name": "enabled",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "workspaceId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "workspaceUpdate",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "workspaceUpsertSlackChannel",
+          "args": [
+            {
+              "name": "id",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "workspaceUserInvite",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "workspaceId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        },
+        {
+          "name": "workspaceUserRemove",
+          "args": [
+            {
+              "name": "input",
+              "type": {
+                "name": null
+              }
+            },
+            {
+              "name": "workspaceId",
+              "type": {
+                "name": null
+              }
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

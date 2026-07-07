@@ -223,7 +223,7 @@
 	onMount(loadAgents);
 </script>
 
-<svelte:head><title>Agent Toolsets | Forven</title></svelte:head>
+<svelte:head><title>Agent Toolsets | Kronos Quant</title></svelte:head>
 
 <div class="flex h-screen overflow-hidden">
 	<aside class="w-64 border-r border-[#222] bg-[#050505] overflow-y-auto">

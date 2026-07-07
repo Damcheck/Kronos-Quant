@@ -443,7 +443,7 @@
 </script>
 
 <svelte:head>
-	<title>{bot?.name || 'Bot'} | Bot Factory | Forven</title>
+	<title>{bot?.name || 'Bot'} | Bot Factory | Kronos Quant</title>
 </svelte:head>
 
 <div class="mx-auto max-w-6xl px-4 py-6">

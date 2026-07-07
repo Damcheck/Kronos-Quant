@@ -673,7 +673,7 @@
 					<div class="flex items-center gap-1.5">
 						<div class="w-1.5 h-1.5 rounded-full {backendOk ? 'bg-emerald-400' : 'bg-red-400'}"></div>
 						<span class="text-[10px] text-gray-500">Backend</span>
-						<span class="help-tip">?<span class="help-text">Forven HTTP API at /api. If this is red, MCP tool calls will also fail — MCP proxies through this API.</span></span>
+						<span class="help-tip">?<span class="help-text">Kronos Quant HTTP API at /api. If this is red, MCP tool calls will also fail — MCP proxies through this API.</span></span>
 					</div>
 					<div class="text-[10px] text-gray-500">
 						<span class="text-gray-400">{openSessions.length}</span> open /
@@ -961,7 +961,7 @@
 				{#if !activeDetail}
 					<div class="p-6 text-center text-xs text-gray-600">
 						No session selected. Sessions open automatically when an MCP client starts working —
-						pick one above, or tell your assistant: <em class="text-gray-400">"Open a Forven session for X"</em>
+						pick one above, or tell your assistant: <em class="text-gray-400">"Open a Kronos Quant session for X"</em>
 					</div>
 				{:else}
 					<!-- Strategies -->

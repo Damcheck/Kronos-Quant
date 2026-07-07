@@ -121,7 +121,7 @@
 </script>
 
 <svelte:head>
-	<title>Data Gaps | Forven</title>
+	<title>Data Gaps | Kronos Quant</title>
 </svelte:head>
 
 <div class="h-full flex flex-col overflow-y-auto bg-[#050505] text-white">

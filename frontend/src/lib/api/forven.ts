@@ -23,7 +23,7 @@ export type ForvenProvider =
 	| 'opencode-zen'
 	| 'opencode-go';
 
-// ============== Forven Classic Compatibility ==============
+// ============== Kronos Quant Classic Compatibility ==============
 
 export interface ForvenDashboardResponse {
 	execution_mode?: 'paper' | 'live' | string;

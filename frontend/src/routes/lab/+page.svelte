@@ -879,7 +879,7 @@
 </script>
 
 <svelte:head>
-	<title>The Forge | Forven</title>
+	<title>The Forge | Kronos Quant</title>
 	<meta name="description" content="Manage all containers of the strategy type, complete with research metrics." />
 </svelte:head>
 

@@ -251,7 +251,7 @@
 	});
 </script>
 
-<svelte:head><title>Routines | Forven</title></svelte:head>
+<svelte:head><title>Routines | Kronos Quant</title></svelte:head>
 
 <div class="space-y-6 p-6">
 	<header class="flex items-center justify-between">
